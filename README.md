@@ -1,329 +1,418 @@
 # arm64viz
 
-`arm64viz` is a dependency-free ARM64 virtualization research framework. The
-current proof of concept uses a small software AArch64 backend and a toy guest
-that writes to a virtual UART through MMIO. It does not require QEMU, firmware
-images, device keys, activation material, or service impersonation.
+`arm64viz` is a no-JIT ARM64 virtualization and emulation research platform
+written in C and Swift. Its primary guest is currently a custom ARM64 Linux
+configuration with an Alpine Linux root filesystem and the Phosh mobile shell.
+The Pinecone iOS application hosts that VM, presents its serial console and
+display, and forwards keyboard, touch, storage, and network activity.
 
-The design keeps guest boot policy pluggable, but this repository only
-implements open-source or toy guest paths.
+The runtime is implemented in this repository. QEMU is not required or used by
+the build, test, or execution path.
+
+## Current Status
+
+The project can currently:
+
+- Direct-boot a custom ARM64 Linux kernel at EL1 with a generated FDT.
+- Mount a persistent Alpine Linux ext4 root filesystem through virtio-mmio.
+- Reach a BusyBox/Alpine shell on the emulated PL011 `ttyAMA0` console.
+- Start Phoc and Phosh using Pixman software rendering at a guest resolution of
+  480x800.
+- Present the guest framebuffer through Metal in the Pinecone iOS app.
+- Deliver iOS touch and keyboard events through virtio-input.
+- Expose virtio block, network, input, keyboard, and GPU devices.
+- Run Alpine commands and `apk`; networking works through the host-side network
+  bridge but is still slower and less complete than a mature slirp stack.
+- Execute the tested Linux and Phosh workload without using the legacy Swift
+  interpreter as a normal execution fallback.
+
+Phosh is functional, but first-frame time, complex compositing, and interactive
+frame rate remain active performance work. This is a research platform, not a
+production mobile-device VM.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    CLI["arm64viz CLI"] --> Adapter["GuestBootAdapter"]
-    Adapter --> VM["VirtualMachine"]
-    VM --> Backend["VirtualMachineBackend"]
-    Backend --> CPU["SoftwareARM64Backend"]
-    VM --> Memory["PhysicalMemory"]
-    VM --> Bus["MMIOBus"]
-    VM --> IRQ["InterruptController"]
-    Bus --> UART["VirtualUART"]
-    Bus --> FB["VirtualFramebuffer"]
-    Bus --> Touch["VirtualTouchInput"]
-    Bus --> Block["VirtualBlockDevice"]
-    Bus --> Net["VirtualNetworkDevice"]
-    VM --> Snapshot["VMSnapshot + DebugState"]
-    Adapter --> BootConfig["BootConfiguration / DTS"]
-    BootConfig --> FDT["Flattened Device Tree"]
+    subgraph Host["Host: macOS or iOS"]
+        CLI["arm64viz CLI"]
+        Pinecone["Pinecone iOS app"]
+        Terminal["SwiftUI ttyAMA0 terminal"]
+        Metal["Metal guest display"]
+        Input["iOS touch and keyboard"]
+        HostNet["Network.framework bridge"]
+        DiskFile["Persistent rootfs.ext4 copy"]
+    end
+
+    subgraph Core["ARM64VizCore: Swift VM and platform model"]
+        Boot["LinuxDirectBootAdapter"]
+        VM["VirtualMachine"]
+        FDT["Generated flattened device tree"]
+        MMIO["MMIO bus"]
+        IRQ["GIC and generic timer"]
+        UART["PL011 UART"]
+        VirtIO["virtio-mmio transport"]
+        Debug["Trace, counters, snapshots"]
+    end
+
+    subgraph Native["ARM64VizNative: C execution engine"]
+        Decoder["AArch64 decoder"]
+        Blocks["Block cache and superblocks"]
+        CPU["Native threaded interpreter"]
+        Memory["Guest memory and MMU fast paths"]
+        Pixels["Framebuffer and Pixman hot paths"]
+    end
+
+    subgraph Devices["Virtual devices"]
+        VBlock["virtio-block"]
+        VNet["virtio-net"]
+        VInput["virtio-input touch and keyboard"]
+        VGPU["virtio-gpu 480x800 scanout"]
+    end
+
+    subgraph Guest["ARM64 guest"]
+        Kernel["Custom Linux kernel"]
+        Initrd["Minimal Alpine initramfs"]
+        Alpine["Persistent Alpine Linux rootfs"]
+        Shell["BusyBox and apk"]
+        Session["Phoc + Phosh + mobile apps"]
+    end
+
+    CLI --> Boot
+    Pinecone --> Boot
+    Pinecone --> Terminal
+    Pinecone --> Metal
+    Input --> VInput
+    HostNet --> VNet
+    DiskFile --> VBlock
+
+    Boot --> FDT
+    Boot --> VM
+    VM --> CPU
+    CPU --> Decoder
+    Decoder --> Blocks
+    CPU --> Memory
+    VM --> MMIO
+    VM --> IRQ
+    MMIO --> UART
+    MMIO --> VirtIO
+    VirtIO --> VBlock
+    VirtIO --> VNet
+    VirtIO --> VInput
+    VirtIO --> VGPU
+    VGPU --> Pixels
+    VGPU --> Metal
+    UART --> Terminal
+    VM --> Debug
+
+    FDT --> Kernel
+    CPU --> Kernel
+    Kernel --> Initrd
+    Initrd --> Alpine
+    Alpine --> Shell
+    Alpine --> Session
+    VBlock --> Alpine
+    VNet --> Kernel
+    VInput --> Session
+    Session --> VGPU
 ```
 
-The runtime boundary is intentionally simple:
+### Execution Boundary
 
-- `VirtualMachineBackend` owns execution strategy.
-- `VirtualMachine` owns CPU state, RAM, MMIO routing, breakpoints, and snapshots.
-- `MMIODevice` implementations are address-ranged peripherals.
-- `GuestBootAdapter` loads a guest and produces a boot configuration.
-- `BootConfiguration` can render a DTS-style description for open guests.
-- `FlattenedDeviceTree` emits binary FDT blobs for native Linux handoff.
+- **ARM64VizNative** is the hot execution layer. It contains the AArch64
+  decoder and threaded interpreter, C-side block caches and superblocks, guest
+  memory primitives, MMU-related fast paths, and framebuffer operations.
+- **ARM64VizCore** owns architectural CPU state, exception routing, device
+  models, Linux loading, FDT generation, tracing, policy, and snapshots.
+- **Pinecone** is the iOS host. Swift manages application lifecycle and bridges
+  native iOS services; Linux and Phosh execute inside the ARM64 guest.
+- **The guest** is open-source ARM64 Linux and Alpine userspace. Phosh renders
+  through Phoc, wlroots, Pixman, DRM, and the virtual GPU.
 
-## Repo Structure
+The backend is an interpreter, not a JIT. The native engine caches decoded
+blocks, links hot control-flow paths, executes fused superblocks, uses direct
+guest-memory access where valid, and includes carefully validated semantic fast
+paths for common guest loops. The older Swift instruction path is retained for
+diagnostics, but unsupported native instructions are treated as implementation
+gaps rather than silently relying on it during normal Linux execution.
+
+## Virtual Machine Layout
+
+The default research machine is a single-vCPU ARM64 platform with RAM beginning
+at `0x40000000`. Its Linux-visible devices include:
+
+| Device | Guest address | Purpose |
+| --- | ---: | --- |
+| GIC | `0x08000000` | Interrupt distribution and CPU interface |
+| PL011 UART | `0x09000000` | Linux boot and interactive console |
+| virtio-block | `0x0a000000` | Persistent Alpine root filesystem |
+| virtio-net | `0x0a001000` | Host-bridged guest networking |
+| virtio-input | `0x0a002000` | Absolute touchscreen events |
+| virtio-gpu | `0x0a003000` | 480x800 DRM scanout |
+| virtio-input | `0x0a004000` | Keyboard events |
+
+The Linux boot adapter places the raw kernel `Image`, initramfs, and generated
+FDT in RAM, sets `x0` to the FDT address, enters masked EL1h, and attaches the
+ext4 image as `/dev/vda`.
+
+## Repository Structure
 
 ```text
 .
-├── Apps
-│   └── iOS
-│       └── MobileOSHost
-│           ├── MobileOSHost.xcodeproj
-│           ├── README.md
-│           ├── Sources
-│           └── project.yml
-├── Package.swift
-├── README.md
-├── arm64viz.preferences.json
-├── docs
-│   ├── architecture.md
-│   ├── proprietary-guest-boundaries.md
-│   └── roadmap.md
-├── ui
-│   ├── app.js
-│   ├── boot-lab.html
-│   ├── mobile-os.css
-│   ├── mobile-os.html
-│   ├── mobile-os.js
-│   └── styles.css
-├── Sources
-│   ├── ARM64VizCore
-│   │   ├── BootPlanning.swift
-│   │   ├── BootAdapters.swift
-│   │   ├── BootConfiguration.swift
-│   │   ├── CPUState.swift
-│   │   ├── Devices.swift
-│   │   ├── EmulatorBackend.swift
-│   │   ├── FlattenedDeviceTree.swift
-│   │   ├── LinuxBoot.swift
-│   │   ├── MachineFactory.swift
-│   │   ├── Memory.swift
-│   │   ├── MMIO.swift
-│   │   ├── MobileOSKernel.swift
-│   │   ├── ProprietaryGuestBoundary.swift
-│   │   ├── RuntimeDirection.swift
-│   │   ├── Snapshot.swift
-│   │   ├── Types.swift
-│   │   └── VirtualMachine.swift
-│   └── arm64viz
-│       └── main.swift
-└── Tests
-    └── ARM64VizCoreTests
-        └── ARM64VizCoreTests.swift
+├── Apps/iOS/MobileOSHost       Pinecone SwiftUI/Metal iOS host
+├── Sources/ARM64VizNative      C decoder, interpreter, caches, memory, pixels
+├── Sources/ARM64VizCore        VM, Linux boot, MMIO, virtio, FDT, debugging
+├── Sources/arm64viz            Desktop command-line tools
+├── Scripts                     Kernel, initramfs, Alpine and Phosh image builds
+├── Tests/ARM64VizCoreTests     CPU, MMU, device and regression tests
+├── artifacts                   Generated/downloaded guest build products
+├── docs                        Architecture, roadmap and scope documents
+├── arm64viz.preferences.json   User restrictions layered over fixed policy
+└── Package.swift               Swift Package Manager definition
 ```
 
-## Minimal Proof Of Concept
+## Requirements
 
-Run the toy guest:
+The current guest-image scripts target Apple Silicon macOS. They require:
+
+- Xcode and its command-line tools
+- Swift 5.9 or newer
+- XcodeGen when regenerating the iOS project
+- LLVM/Clang, LLD, and GNU Make
+- `libelf`, `curl`, `perl`, `awk`, and `bsdtar`
+- `mke2fs` from e2fsprogs or Android platform tools
+- `glib-compile-schemas` and `update-mime-database` for the Phosh image
+- Network access to kernel.org and Alpine Linux package repositories
+
+The kernel script currently defaults Homebrew tools to `/opt/homebrew`, though
+the relevant paths can be overridden with its environment variables.
+
+## Prepare the Alpine + Phosh Guest
+
+Guest binaries are generated locally and are not normal source files. From the
+repository root:
 
 ```sh
-swift run arm64viz run-toy
+# Fetch an Alpine ARM64 virt kernel/initramfs used as build input.
+Scripts/fetch-alpine-aarch64.sh
+
+# Build the project-specific ARM64 Linux kernel and minimal initramfs.
+Scripts/build-arm64-shell-kernel.sh
+
+# Build the persistent Alpine edge rootfs. The graphical profile defaults to Phosh.
+Scripts/build-arm64-rootfs-image.sh
 ```
 
-Expected output includes the guest string emitted through virtual UART and a
-stop reason:
+The final files consumed by Pinecone are:
 
 ```text
-arm64viz toy guest
-
-[arm64viz] backend=software-aarch64-subset
-[arm64viz] stop=halted steps=41
+artifacts/linux-shell/out/Image
+artifacts/linux-shell/out/initramfs-minimal-ttyinit.cpio
+artifacts/linux-shell/out/rootfs.ext4
 ```
 
-Prepare a native ARM64 Linux/postmarketOS handoff without QEMU:
+The rootfs builder resolves and stages Alpine edge packages for Phoc, Phosh,
+Portfolio, GNOME Calculator, Calendar, Clocks, Text Editor, Foot, and their
+runtime dependencies. Downloaded APKs are cached under
+`artifacts/alpine-packages/edge-aarch64/`.
+
+To build a smaller non-graphical rootfs:
 
 ```sh
-swift run arm64viz prepare-linux Image --postmarketos --initrd initrd.cpio.gz --disk rootfs.img --memory-mib 1024
+ARM64VIZ_GRAPHICAL_ROOTFS=0 Scripts/build-arm64-rootfs-image.sh
 ```
 
-This command loads the kernel into guest RAM, stages initrd and disk bytes,
-generates or loads a binary FDT, sets `x0` to the FDT address, and prints the
-handoff state. The direct Linux handoff enters the guest in masked EL1h. The
-current software backend can execute a small set of early ARM64 branch,
-PC-relative addressing, stack-pointer arithmetic, pair load/store, and barrier
-instructions. It also has a deterministic EL1 system-register bank and an
-initial 4 KB stage-1 page-table walker for translated instruction/data access.
-It now handles first-level synchronous exception routing for `SVC`,
-instruction/data aborts, and `ERET`. It still cannot execute a full Linux
-kernel, but the platform now has a minimal GIC-style interrupt controller,
-EL1 IRQ vectoring, ARM generic timer IRQ assertion, PL011-style UART interrupt
-registers, discoverable virtio-mmio block/net/input/display devices, and basic
-MMU access-flag/read-only/execute-never faults. Linux-grade interrupt
-priority/EOI behavior, broader MMU attributes, PL011 FIFO/control fidelity, and
-virtio descriptor-ring execution are the next native execution work.
-
-To inspect the first native execution failure without QEMU:
+Other supported staging profiles are `cage` and `phoc`:
 
 ```sh
-swift run arm64viz run-linux-trace Image --postmarketos --memory-mib 1024 --max-steps 64 --trace-depth 16
+ARM64VIZ_GRAPHICAL_PROFILE=phoc Scripts/build-arm64-rootfs-image.sh
 ```
 
-`run-linux-trace` uses the same `LinuxDirectBootAdapter`, runs the owned
-software backend for a bounded number of steps, and emits JSON with the current
-CPU state, recent fetched instructions, recent routed exceptions, the
-instruction or exception loop if one is hit, and the next backend components to
-implement.
+## Artifact Policy
 
-Build the internal ARM64 shell kernel and tty initramfs:
+Do not commit `artifacts/` as a whole. It contains downloaded packages, an
+extracted Linux tree, compiler output, experimental initramfs variants, and a
+large writable ext4 disk image. At present, the Xcode project references the
+three final files listed above directly, so they must exist before Pinecone is
+built.
+
+For shared builds or CI, publish those final guest images as versioned build
+assets with checksums, or regenerate them from `Scripts/`. Do not place the
+entire artifact workspace in ordinary Git history.
+
+## Build and Run Pinecone
+
+The checked-in Xcode project uses the application identifier
+`me.gmoran.pinecone` and requires iOS 17 or newer.
+
+Regenerate the project only after changing `project.yml`:
 
 ```sh
-scripts/build-arm64-shell-kernel.sh
+cd Apps/iOS/MobileOSHost
+xcodegen generate --spec project.yml
 ```
 
-The script emits the custom Linux `Image`, the generated FDT-compatible shell
-initramfs, and the reproducible `/init` overlay under `artifacts/linux-shell/out/`.
-The shell kernel profile includes PL011 console, virtio-mmio block, and ext4 so
-it can hand off from initramfs to a small writable root disk.
-
-Build the first persistent root filesystem image:
+Validate an unsigned device build:
 
 ```sh
-scripts/build-arm64-rootfs-image.sh artifacts/linux-shell/out/rootfs.ext4
+xcodebuild \
+  -project MobileOSHost.xcodeproj \
+  -scheme MobileOSHost \
+  -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO \
+  -derivedDataPath .DerivedData \
+  build
 ```
 
-The image is an ext4 filesystem populated from the shell initramfs plus
-`/sbin/init`. The initramfs tries to mount `/dev/vda` and `switch_root` into it;
-if no virtio disk is published, it falls back to the initramfs shell.
+For a physical iPhone, open `MobileOSHost.xcodeproj`, select a development
+team, choose the connected device, and run. Pinecone remains a normal sandboxed
+iOS application; it does not modify the phone boot chain or replace iOS.
 
-Run the Linux shell handoff:
+Pinecone copies the bundled root filesystem into Application Support and uses
+that copy as file-backed virtio storage. Guest writes therefore survive VM
+restarts. The app provides:
+
+- A scrollable `ttyAMA0` console with keyboard and paste support
+- VM reset, power, and stop controls
+- A full-screen-scaled guest display surface
+- Touch forwarding with guest-coordinate conversion
+- Incremental framebuffer presentation through Metal
+- Runtime counters for native execution, devices, display, and input latency
+
+Inside the guest, start the graphical session with:
 
 ```sh
-swift run arm64viz prepare-linux artifacts/linux-shell/out/Image \
-  --initrd artifacts/linux-shell/out/initramfs-virt-ttyinit.cpio \
+start-pinecone-phosh
+```
+
+## Desktop Tools
+
+Build and test the core:
+
+```sh
+swift build -c release
+swift test
+```
+
+Run the small UART architecture smoke test:
+
+```sh
+swift run -c release arm64viz run-toy
+```
+
+Prepare and inspect the generated Linux handoff without executing it:
+
+```sh
+swift run -c release arm64viz prepare-linux \
+  artifacts/linux-shell/out/Image \
+  --initrd artifacts/linux-shell/out/initramfs-minimal-ttyinit.cpio \
   --disk artifacts/linux-shell/out/rootfs.ext4 \
   --memory-mib 512 \
   --bootargs "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 root=/dev/vda rw rootwait rdinit=/init loglevel=7"
 ```
 
-Trace the shell canary and inject a command after `/init` opens the console:
+Run a bounded Linux trace through the native backend:
 
 ```sh
-swift run -c release arm64viz run-linux-trace artifacts/linux-shell/out/Image \
-  --initrd artifacts/linux-shell/out/initramfs-virt-ttyinit.cpio \
+swift run -c release arm64viz run-linux-trace \
+  artifacts/linux-shell/out/Image \
+  --initrd artifacts/linux-shell/out/initramfs-minimal-ttyinit.cpio \
   --disk artifacts/linux-shell/out/rootfs.ext4 \
   --memory-mib 512 \
-  --max-steps 400000000 \
+  --symbols artifacts/linux-shell/out/System.map \
   --trace-depth 256 \
-  --bootargs "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 root=/dev/vda rw rootwait rdinit=/init loglevel=7" \
-  --uart-input-after-output "arm64viz init: ttyAMA0 console ready" \
-  --uart-input-line "echo TTYINIT_OK"
-```
-
-For a quick bounded runtime smoke, stop at the first UART byte:
-
-```sh
-swift run -c release arm64viz run-linux-trace artifacts/linux-shell/out/Image \
-  --initrd artifacts/linux-shell/out/initramfs-virt-ttyinit.cpio \
-  --disk artifacts/linux-shell/out/rootfs.ext4 \
-  --memory-mib 512 \
   --max-steps 100000000 \
-  --stop-on-uart
+  --bootargs "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 root=/dev/vda rw rootwait rdinit=/init loglevel=7"
 ```
 
-Build the internal iOS hardware test host:
+Additional tools include instruction coverage auditing, differential SIMD
+tests, DTS/FDT inspection, VM snapshots, boot-adapter planning, and policy
+validation. Run `swift run arm64viz --help` for the current command list.
 
-```sh
-cd Apps/iOS/MobileOSHost
-xcodegen generate --spec project.yml
-xcodebuild -project MobileOSHost.xcodeproj -scheme MobileOSHost -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO -derivedDataPath .DerivedData build
-```
+## Networking
 
-Dump the generated boot configuration:
-
-```sh
-swift run arm64viz dump-dts
-```
-
-Export a JSON snapshot summary after running the toy guest:
-
-```sh
-swift run arm64viz snapshot
-```
-
-Validate a metadata-only proprietary guest manifest without ingesting or
-booting proprietary OS packages:
-
-```sh
-swift run arm64viz validate-manifest examples/research-guest-manifest.json --preferences arm64viz.preferences.json
-```
-
-Print the effective policy preferences:
-
-```sh
-swift run arm64viz policy-show --preferences arm64viz.preferences.json
-```
-
-List adapter descriptors:
-
-```sh
-swift run arm64viz adapters
-```
-
-Plan local boot artifacts without reading their contents:
-
-```sh
-swift run arm64viz plan-boot Image initrd.cpio.gz --preferences arm64viz.preferences.json
-```
-
-Open the drag-and-drop Boot Lab UI:
+The guest uses a static link-local-style configuration:
 
 ```text
-ui/boot-lab.html
+guest:   10.0.2.15
+gateway: 10.0.2.2
+DNS:     10.0.2.3
 ```
 
-Open the archived JavaScript MobileOS page:
+The virtio-net backend bridges guest traffic to host networking using Apple
+Network.framework. TCP and UDP flows used by Alpine package operations are the
+primary supported path. This implementation is independent of QEMU slirp and
+is still under optimization; `apk update` can be noticeably slower than on a
+native Linux machine, and ICMP behavior should not be treated as a complete
+measure of Internet connectivity.
 
-```text
-ui/mobile-os.html
-```
+## Debugging and Performance
 
-Run tests:
+The native backend exposes counters for decoded blocks, cache hits, linked
+blocks, superblocks, page translations, direct memory access, semantic fast
+paths, and unsupported instructions. Pinecone keeps guest UART output separate
+from host diagnostics.
 
-```sh
-swift test
-```
+The simulator supports opt-in diagnostic environment variables, including:
 
-## First Milestone Without QEMU
+| Variable | Effect |
+| --- | --- |
+| `PINECONE_SIMULATOR_AUTORUN_COMMAND` | Runs a guest command after shell startup |
+| `PINECONE_SIMULATOR_DUMP_UART=1` | Writes captured UART diagnostics |
+| `PINECONE_SIMULATOR_DUMP_PERFORMANCE=1` | Writes runtime performance data |
+| `PINECONE_SIMULATOR_DUMP_FRAMEBUFFER=1` | Dumps framebuffer diagnostics |
+| `PINECONE_SIMULATOR_HOT_PC_PROFILE=1` | Enables sampled native hot-PC profiling |
+| `PINECONE_GUEST_MEMORY_MB` | Overrides configured guest RAM |
 
-The first milestone is the checked-in software framework:
+Hot-PC profiling is disabled by default so diagnostics do not affect normal VM
+performance.
 
-1. Load a toy ARM64 guest through `ToyUARTGuestAdapter`.
-2. Prepare an ARM64 Linux/postmarketOS handoff through `LinuxDirectBootAdapter`.
-3. Execute a small AArch64 instruction subset in `SoftwareARM64Backend`.
-4. Route physical memory and MMIO accesses through `VirtualMachine`.
-5. Emit UART bytes through `VirtualUART`.
-6. Generate DTS/FDT boot metadata through `BootConfiguration` and
-   `FlattenedDeviceTree`.
-7. Save CPU/RAM/device-observable state through `VMSnapshot`.
-8. Classify boot artifacts and produce adapter plans without reading restricted
-   package contents.
+## Known Limitations
 
-## Native Linux Direction
+- The VM currently exposes one virtual CPU.
+- Execution is interpreted and does not use JIT compilation, HVF, or KVM.
+- AArch64 coverage is driven by Linux/Alpine/Phosh and is not yet a formal
+  implementation of every optional architectural extension.
+- Phosh software rendering is functional but still CPU-intensive and can be
+  choppy during complex redraws.
+- The host network bridge is less complete and slower than mature QEMU/UTM
+  networking.
+- Audio, cameras, sensors, telephony, suspend/resume, and hardware 3D
+  acceleration are not implemented as guest devices.
+- The root filesystem is an Alpine edge image assembled by project scripts,
+  not an official postmarketOS or distribution image.
 
-The active project direction is native ARM64 Linux/postmarketOS bring-up:
+## Scope and Guardrails
 
-- A native Linux/postmarketOS preparation path through
-  `swift run arm64viz prepare-linux`.
-- Binary FDT generation for Linux direct boot.
-- Initrd and disk-image staging.
-- A planner entry named `linux-direct`, marked loadable until CPU execution
-  support catches up.
-- An internal iOS hardware test host at `Apps/iOS/MobileOSHost` that prepares
-  a Linux handoff and reports the remaining backend work.
+This repository implements generic virtualization infrastructure and
+open-source guest support. It does not provide or request proprietary mobile OS
+images, firmware blobs, boot ROM code, device keys, certificates, secure
+processor secrets, activation material, attestation bypasses, or proprietary
+service impersonation.
 
-The JavaScript MobileOS track is disabled. Its Swift and JavaScript files remain
-as archived reference code, but `run-mobile`, `build-mobile-image`,
-`mobile-kernel-demo`, `MobileOSImageBootAdapter`, and the standalone
-`ui/mobile-os.html` shell no longer boot or build a JavaScript OS. The next
-runtime work is Linux-grade interrupt-controller/timer behavior, broader MMU
-permissions/attributes, UART console interrupts, and virtio-grade devices for
-open Linux guests.
+Guest adapters are pluggable, but the implemented boot path is for open Linux
+guests. The proprietary-guest adapter is a metadata boundary validator only; it
+does not ingest, extract, decrypt, or boot proprietary OS packages. Built-in
+prohibitions cannot be disabled by `arm64viz.preferences.json`; preferences can
+only add restrictions.
 
-The iOS host app uses the iPhone as a sandboxed test mule for ARM64VizCore and
-native Linux handoff behavior. It does not replace iOS, modify the device boot
-chain, use private entitlements, or escape the normal app sandbox.
+See:
 
-QEMU can still be useful later as an optional behavioral oracle, but it is not
-part of the build, test, or runtime path.
+- [Architecture notes](docs/architecture.md)
+- [Roadmap](docs/roadmap.md)
+- [Proprietary guest boundaries](docs/proprietary-guest-boundaries.md)
 
-## QEMU / HVF / KVM Tradeoffs
+## QEMU, HVF, and KVM
 
-- Software backend: portable, inspectable, deterministic, slow, and best for
-  early device model and boot adapter research.
-- HVF: macOS acceleration path for ARM64 guests on Apple Silicon, useful once
-  the VM model is stable, but it constrains CPU state handling to host APIs.
-- KVM: Linux acceleration path, strong for server-side ARM64 development, but
-  requires Linux hosts and kernel virtualization support.
-- QEMU: mature reference implementation and device ecosystem, but a large
-  dependency and not the runtime foundation for this repo.
+- **Current software backend:** portable, deterministic, inspectable, and able
+  to run inside an ordinary iOS app, at the cost of interpreter overhead.
+- **QEMU:** useful as an external behavioral reference, but not a dependency or
+  runtime component of arm64viz.
+- **HVF:** a possible macOS-only acceleration backend; it does not provide a
+  general App Store-compatible iOS execution path.
+- **KVM:** appropriate for a future Linux-hosted accelerated backend, requiring
+  Linux and hardware virtualization support.
 
-## Scope Boundaries
-
-This project does not provide or request proprietary mobile OS images,
-firmware blobs, boot ROM code, device keys, certificates, SEP secrets,
-activation material, attestation bypasses, or Apple service impersonation.
-See [docs/proprietary-guest-boundaries.md](docs/proprietary-guest-boundaries.md)
-for the high-level component categories a lawful proprietary guest effort would
-need to account for. The included proprietary guest adapter is a boundary-only
-validator; it does not ingest, extract, decrypt, or boot IPSW archives or other
-proprietary OS packages. `arm64viz.preferences.json` keeps those guardrails on
-by default. The preferences file can add restrictions, but the loader rejects
-attempts to remove the built-in prohibited material kinds, package suffixes, or
-service-access restrictions.
+The immediate engineering focus is native AArch64 completeness, lower guest
+CPU cost, faster Pixman compositing, reduced Phosh first-frame time, and a more
+complete host network bridge.
