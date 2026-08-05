@@ -1,0 +1,35 @@
+phosh-lockscreen label {
+  color: #ffffff;
+  opacity: 1;
+  text-shadow: none;
+}
+
+#phosh-lockscreen-clock {
+  color: #ffffff;
+  font-size: 42px;
+  font-weight: 600;
+  min-width: 240px;
+  margin: 0;
+  padding-top: 0;
+  transition: none;
+}
+
+#phosh-lockscreen-date {
+  color: #ffffff;
+  font-size: 16px;
+  min-width: 240px;
+  margin: 4px 0;
+  transition: none;
+}
+
+.phosh-lockscreen-arrow {
+  animation: none;
+  transition: none;
+}
+
+.phosh-lockscreen-arrow + label {
+  color: #ffffff;
+  font-size: 16px;
+  opacity: 1;
+  text-shadow: none;
+}

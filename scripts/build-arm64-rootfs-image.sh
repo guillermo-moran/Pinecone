@@ -1,0 +1,628 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT_DIR="${ROOT_DIR}/artifacts/linux-shell/out"
+IMAGE="${1:-${OUT_DIR}/rootfs.ext4}"
+SIZE_MIB="${ROOTFS_SIZE_MIB:-auto}"
+MINIMUM_SIZE_MIB="${ROOTFS_MIN_SIZE_MIB:-384}"
+MINIMUM_FREE_MIB="${ROOTFS_MIN_FREE_MIB:-256}"
+MKE2FS="${MKE2FS:-}"
+BUSYBOX_APPLETS=(
+  awk basename cat chgrp chmod chown chroot clear cmp cp cut date dd df dirname
+  dmesg du echo env false find free grep head hexdump hostname id ifconfig init ip kill
+  killall less ln login ls md5sum mdev mkdir mknod mount mv nslookup passwd ping
+  ping6 pgrep printf ps pwd reboot rm rmdir route sed sh sha256sum sleep sort stty sync
+  tail tar tee test touch true tty udhcpc umount uname uniq vi wc wget whoami xargs
+)
+
+if [[ -z "${MKE2FS}" ]]; then
+  if command -v mke2fs >/dev/null 2>&1; then
+    MKE2FS="$(command -v mke2fs)"
+  elif [[ -x "${HOME}/Library/Android/sdk/platform-tools/mke2fs" ]]; then
+    MKE2FS="${HOME}/Library/Android/sdk/platform-tools/mke2fs"
+  else
+    echo "mke2fs is required to build ${IMAGE}" >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -f "${OUT_DIR}/initramfs-virt-ttyinit.cpio" ]]; then
+  echo "missing ${OUT_DIR}/initramfs-virt-ttyinit.cpio; run scripts/build-arm64-shell-kernel.sh first" >&2
+  exit 1
+fi
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/arm64viz-rootfs.XXXXXX")"
+ROOTFS_DIR="${WORK_DIR}/root"
+mkdir -p "${ROOTFS_DIR}"
+
+bsdtar -C "${ROOTFS_DIR}" --exclude dev -xf "${OUT_DIR}/initramfs-virt-ttyinit.cpio"
+mkdir -p \
+  "${ROOTFS_DIR}/bin" \
+  "${ROOTFS_DIR}/dev" \
+  "${ROOTFS_DIR}/dev/pts" \
+  "${ROOTFS_DIR}/etc/apk" \
+  "${ROOTFS_DIR}/etc/init.d" \
+  "${ROOTFS_DIR}/etc/network" \
+  "${ROOTFS_DIR}/lib/apk/db" \
+  "${ROOTFS_DIR}/root" \
+  "${ROOTFS_DIR}/root/.config/foot" \
+  "${ROOTFS_DIR}/root/.config/gtk-3.0" \
+  "${ROOTFS_DIR}/sbin" \
+  "${ROOTFS_DIR}/tmp" \
+  "${ROOTFS_DIR}/usr/local/bin" \
+  "${ROOTFS_DIR}/var/cache/apk" \
+  "${ROOTFS_DIR}/var/empty" \
+  "${ROOTFS_DIR}/var/lib/apk" \
+  "${ROOTFS_DIR}/var/log" \
+  "${ROOTFS_DIR}/var/tmp"
+chmod 1777 "${ROOTFS_DIR}/tmp" "${ROOTFS_DIR}/var/tmp"
+if [[ "${ARM64VIZ_GRAPHICAL_ROOTFS:-1}" == "1" ]]; then
+  export ARM64VIZ_GRAPHICAL_PROFILE="${ARM64VIZ_GRAPHICAL_PROFILE:-phosh}"
+  "${ROOT_DIR}/scripts/stage-alpine-graphical-rootfs.sh" "${ROOTFS_DIR}"
+  SCHEMA_DIR="${ROOTFS_DIR}/usr/share/glib-2.0/schemas"
+  if [[ -d "${SCHEMA_DIR}" ]]; then
+    cat > "${SCHEMA_DIR}/99-pinecone.gschema.override" <<'EOF'
+[org.gnome.desktop.session]
+idle-delay=uint32 0
+
+[org.gnome.desktop.interface]
+enable-animations=false
+
+[sm.puri.phosh.lockscreen]
+require-unlock=false
+
+[sm.puri.phosh]
+favorites=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.TextEditor.desktop']
+force-adaptive=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.Calendar.desktop', 'org.gnome.clocks.desktop', 'org.gnome.TextEditor.desktop']
+
+[org.gnome.desktop.background]
+picture-uri=''
+picture-uri-dark=''
+color-shading-type='solid'
+primary-color='#000000'
+EOF
+    if ! command -v glib-compile-schemas >/dev/null 2>&1; then
+      echo "glib-compile-schemas is required for graphical rootfs profiles" >&2
+      exit 1
+    fi
+    glib-compile-schemas "${SCHEMA_DIR}"
+  fi
+  MIME_DIR="${ROOTFS_DIR}/usr/share/mime"
+  if [[ -d "${MIME_DIR}/packages" ]]; then
+    if ! command -v update-mime-database >/dev/null 2>&1; then
+      echo "update-mime-database is required for graphical rootfs profiles" >&2
+      exit 1
+    fi
+    update-mime-database "${MIME_DIR}"
+  fi
+
+  PHOSH_DESKTOP="${ROOTFS_DIR}/usr/share/applications/mobi.phosh.Shell.desktop"
+  if [[ -f "${PHOSH_DESKTOP}" ]]; then
+    # Phosh registers with gnome-session only after its shell managers finish
+    # initializing. That exceeds gnome-session's fixed startup-notification
+    # deadline under interpretation, even though Phosh subsequently becomes
+    # ready. Keep process supervision, but do not make readiness notification a
+    # prerequisite for the session to remain alive.
+    PHOSH_DESKTOP_TMP="${PHOSH_DESKTOP}.pinecone"
+    awk '
+      $0 == "X-GNOME-Autostart-Notify=true" {
+        print "X-GNOME-Autostart-Notify=false"
+        replaced = 1
+        next
+      }
+      { print }
+      END { if (!replaced) exit 1 }
+    ' "${PHOSH_DESKTOP}" > "${PHOSH_DESKTOP_TMP}"
+    chmod --reference="${PHOSH_DESKTOP}" "${PHOSH_DESKTOP_TMP}" 2>/dev/null || \
+      chmod 0644 "${PHOSH_DESKTOP_TMP}"
+    mv "${PHOSH_DESKTOP_TMP}" "${PHOSH_DESKTOP}"
+
+    # A required GNOME session component is subject to a fixed startup
+    # deadline even when startup notification is disabled. Phosh can exceed
+    # that deadline under interpretation, after which gnome-session marks the
+    # otherwise healthy shell as a fatal failure. Start Phosh and the OSK as
+    # ordinary supervised autostart applications in a Pinecone-specific
+    # session instead.
+    mkdir -p \
+      "${ROOTFS_DIR}/etc/xdg/autostart" \
+      "${ROOTFS_DIR}/usr/share/gnome-session/sessions"
+    # Alpine marks the packaged entry as systemd-only. Pinecone intentionally
+    # uses gnome-session's process backend because the compact guest does not
+    # run systemd, so install an explicit non-systemd autostart entry.
+    sed \
+      -e '/^X-GNOME-HiddenUnderSystemd=/d' \
+      -e 's/^X-GNOME-Autostart-Notify=true$/X-GNOME-Autostart-Notify=false/' \
+      "${PHOSH_DESKTOP}" > \
+      "${ROOTFS_DIR}/etc/xdg/autostart/mobi.phosh.Shell.desktop"
+
+    PINECONE_SESSION="${ROOTFS_DIR}/usr/share/gnome-session/sessions/pinecone-phosh.session"
+    cat > "${PINECONE_SESSION}" <<'EOF'
+[GNOME Session]
+Name=Pinecone Phosh
+# Phosh and the OSK are supervised autostart applications. Keeping this list
+# empty prevents optional GNOME daemons from becoming fatal dependencies on a
+# minimal non-systemd guest (for example, Power without UPower/logind).
+RequiredComponents=
+EOF
+
+    OSK_DESKTOP="${ROOTFS_DIR}/usr/share/applications/sm.puri.OSK0.desktop"
+    if [[ -f "${OSK_DESKTOP}" ]]; then
+      sed 's/^X-GNOME-Autostart-Notify=true$/X-GNOME-Autostart-Notify=false/' \
+        "${OSK_DESKTOP}" > \
+        "${ROOTFS_DIR}/etc/xdg/autostart/sm.puri.OSK0.desktop"
+    fi
+  fi
+
+  # Alpine's packaged Phoc profile targets an x86 QXL virtual display and
+  # forces Virtual-1 to 720x1440 at scale 2. Pinecone's virtio-gpu advertises
+  # a native 480x800 panel; using the QXL mode puts Phosh's layer surfaces on
+  # the wrong output geometry and leaves the host scanout black.
+  mkdir -p "${ROOTFS_DIR}/etc/phosh"
+  cat > "${ROOTFS_DIR}/etc/phosh/phoc.ini" <<'EOF'
+[output:Virtual-1]
+mode = 480x800
+scale = 1
+EOF
+
+  mkdir -p "${ROOTFS_DIR}/etc/udev/rules.d"
+  cat > "${ROOTFS_DIR}/etc/udev/rules.d/70-pinecone-input.rules" <<'EOF'
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pinecone Touchscreen", ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHSCREEN}="1", ENV{ID_SEAT}="seat0"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pinecone Keyboard", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEYBOARD}="1", ENV{ID_SEAT}="seat0"
+EOF
+
+  # This compact session does not run gnome-settings-daemon, so changing
+  # org.gnome.desktop.interface alone never reaches GtkSettings. Phosh and
+  # libhandy would otherwise execute their lock-screen transitions one
+  # interpreted frame at a time, exposing partially clipped damage for
+  # minutes. Apply the toolkit setting before either process starts.
+  cat > "${ROOTFS_DIR}/root/.config/gtk-3.0/settings.ini" <<'EOF'
+[Settings]
+gtk-enable-animations=false
+EOF
+  cp "${ROOT_DIR}/scripts/rootfs/pinecone-gtk.css" \
+    "${ROOTFS_DIR}/root/.config/gtk-3.0/gtk.css"
+fi
+# Alpine packages can replace top-level directory entries while unpacking.
+# Install the boot-critical init and BusyBox links after the package overlay.
+if [[ ! -e "${ROOTFS_DIR}/bin/busybox" && -e "${ROOTFS_DIR}/usr/bin/busybox" ]]; then
+  ln -sf /usr/bin/busybox "${ROOTFS_DIR}/bin/busybox"
+fi
+for applet in "${BUSYBOX_APPLETS[@]}"; do
+  ln -sf busybox "${ROOTFS_DIR}/bin/${applet}"
+done
+cp "${ROOT_DIR}/scripts/rootfs/arm64viz-root-init" "${ROOTFS_DIR}/sbin/init"
+chmod 0755 "${ROOTFS_DIR}/sbin/init"
+mkdir -p \
+  "${ROOTFS_DIR}/lib/apk/db" \
+  "${ROOTFS_DIR}/var/cache/apk" \
+  "${ROOTFS_DIR}/var/lib/apk" \
+  "${ROOTFS_DIR}/var/log"
+cat > "${ROOTFS_DIR}/etc/passwd" <<EOF
+root:x:0:0:root:/root:/bin/sh
+messagebus:x:101:101:D-Bus system message bus:/run/dbus:/sbin/nologin
+polkitd:x:102:102:PolicyKit daemon:/var/empty:/sbin/nologin
+colord:x:103:103:Color management daemon:/var/lib/colord:/sbin/nologin
+geoclue:x:104:104:Geolocation service:/var/lib/geoclue:/sbin/nologin
+nobody:x:65534:65534:nobody:/var/empty:/bin/false
+EOF
+cat > "${ROOTFS_DIR}/etc/group" <<EOF
+root:x:0:
+wheel:x:10:root
+users:x:100:
+video:x:27:root
+input:x:28:root
+messagebus:x:101:
+polkitd:x:102:
+colord:x:103:
+geoclue:x:104:
+nobody:x:65534:
+EOF
+cat > "${ROOTFS_DIR}/etc/shadow" <<EOF
+root::0:0:99999:7:::
+messagebus:!:0:0:99999:7:::
+polkitd:!:0:0:99999:7:::
+colord:!:0:0:99999:7:::
+geoclue:!:0:0:99999:7:::
+nobody:*:0:0:99999:7:::
+EOF
+chmod 0600 "${ROOTFS_DIR}/etc/shadow"
+cat > "${ROOTFS_DIR}/etc/profile" <<'EOF'
+export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin
+export PAGER=less
+export EDITOR=vi
+export TERM="${TERM:-dumb}"
+export PS1='arm64viz-root:\w# '
+alias ll='ls -la'
+EOF
+cat > "${ROOTFS_DIR}/root/.profile" <<'EOF'
+[ -f /etc/profile ] && . /etc/profile
+cd /root 2>/dev/null || true
+EOF
+cat > "${ROOTFS_DIR}/root/.config/foot/foot.ini" <<'EOF'
+[main]
+font=DejaVu Sans Mono:size=18
+dpi-aware=no
+pad=8x8
+
+[colors-dark]
+background=202020
+foreground=f2f2f2
+EOF
+cat > "${ROOTFS_DIR}/usr/local/bin/pinecone-input-test" <<'EOF'
+#!/bin/sh
+set -eu
+
+for sys_event in /sys/class/input/event*; do
+  [ -e "$sys_event" ] || continue
+  event_name="$(cat "$sys_event/device/name" 2>/dev/null || true)"
+  case "$event_name" in
+    *Pinecone*Touchscreen*)
+      event_device="/dev/input/${sys_event##*/}"
+      printf 'pinecone-input: touchscreen=%s name=%s\n' "$event_device" "$event_name" >&2
+      exec evtest "$event_device"
+      ;;
+  esac
+done
+
+printf 'pinecone-input: touchscreen event device not found\n' >&2
+exit 1
+EOF
+chmod 0755 "${ROOTFS_DIR}/usr/local/bin/pinecone-input-test"
+cat > "${ROOTFS_DIR}/etc/inittab" <<'EOF'
+::sysinit:/etc/init.d/rcS
+ttyAMA0::respawn:/sbin/getty -L ttyAMA0 115200 dumb
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
+EOF
+cat > "${ROOTFS_DIR}/etc/init.d/rcS" <<'EOF'
+#!/bin/sh
+mkdir -p /run
+if ! grep -qs ' /run ' /proc/mounts; then
+  mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null || true
+fi
+mkdir -p /run/dbus /run/user/0
+chmod 0700 /run/user/0
+/bin/ifconfig lo 127.0.0.1 up 2>/dev/null || true
+for _ in 1 2 3 4 5; do
+  [ -e /sys/class/net/eth0 ] && break
+  /bin/sleep 1
+done
+[ -e /sys/class/net/eth0 ] && /bin/ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null || true
+[ -e /sys/class/net/eth0 ] && /bin/route add default gw 10.0.2.2 eth0 2>/dev/null || true
+EOF
+chmod 0755 "${ROOTFS_DIR}/etc/init.d/rcS"
+cat > "${ROOTFS_DIR}/etc/hostname" <<EOF
+arm64viz
+EOF
+cat > "${ROOTFS_DIR}/etc/hosts" <<EOF
+127.0.0.1 localhost
+127.0.1.1 arm64viz.local arm64viz
+::1 localhost ip6-localhost
+EOF
+cat > "${ROOTFS_DIR}/etc/fstab" <<'EOF'
+proc /proc proc defaults 0 0
+sysfs /sys sysfs defaults 0 0
+devpts /dev/pts devpts defaults 0 0
+tmpfs /tmp tmpfs mode=1777 0 0
+EOF
+cat > "${ROOTFS_DIR}/etc/mdev.conf" <<'EOF'
+null root:root 666
+console root:root 600
+ttyAMA0 root:root 600
+event[0-9]+ root:input 660
+card[0-9]+ root:video 660
+renderD[0-9]+ root:video 660
+EOF
+cat > "${ROOTFS_DIR}/usr/local/bin/start-pinecone-ui" <<'EOF'
+#!/bin/sh
+set -eu
+mkdir -p /run/user/0
+chmod 0700 /run/user/0
+export XDG_RUNTIME_DIR=/run/user/0
+export WLR_BACKENDS=drm
+export WLR_RENDERER=pixman
+export WLR_LOG=1
+export XKB_DEFAULT_LAYOUT=us
+ulimit -c unlimited
+if [ -e /proc/sys/kernel/core_pattern ]; then
+  echo '/var/log/core.%e.%p' > /proc/sys/kernel/core_pattern
+fi
+export LIBSEAT_BACKEND=noop
+for sys_event in /sys/class/input/event*; do
+  [ -e "$sys_event" ] || continue
+  event_name="$(cat "$sys_event/device/name" 2>/dev/null || true)"
+  printf 'pinecone-ui: input=%s name=%s\n' "/dev/input/${sys_event##*/}" "$event_name" >&2
+done
+set +e
+cage -- foot
+CAGE_STATUS=$?
+set -e
+printf 'pinecone-ui: cage exited with status %s\n' "$CAGE_STATUS" >&2
+for CORE in /var/log/core.*; do
+  if [ -e "$CORE" ]; then
+    ls -l "$CORE" >&2
+  fi
+done
+exit "$CAGE_STATUS"
+EOF
+chmod 0755 "${ROOTFS_DIR}/usr/local/bin/start-pinecone-ui"
+cat > "${ROOTFS_DIR}/usr/local/bin/pinecone-session-env" <<'EOF'
+#!/bin/sh
+mkdir -p /run/user/0 /run/dbus
+chmod 0700 /run/user/0
+export XDG_RUNTIME_DIR=/run/user/0
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=Phosh:GNOME
+export WLR_BACKENDS=drm
+export WLR_RENDERER=pixman
+export WLR_LOG=1
+export XKB_DEFAULT_LAYOUT=us
+export LIBSEAT_BACKEND=noop
+ulimit -c unlimited
+mkdir -p /var/log
+if [ -e /proc/sys/kernel/core_pattern ]; then
+  echo '/var/log/core.%e.%p' > /proc/sys/kernel/core_pattern
+fi
+
+pinecone_start_system_bus()
+{
+  if ! command -v dbus-daemon >/dev/null 2>&1; then
+    echo 'pinecone-session: dbus-daemon is not installed' >&2
+    return 1
+  fi
+  if command -v dbus-send >/dev/null 2>&1 &&
+     dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+       / org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    return 0
+  fi
+  rm -f /run/dbus/system_bus_socket /run/dbus/pid
+  mkdir -p /run/dbus
+  dbus-daemon --system --fork --nopidfile
+}
+
+pinecone_prepare_input()
+{
+  if [ ! -x /sbin/udevd ] || [ ! -x /sbin/udevadm ]; then
+    echo 'pinecone-session: eudev is not installed' >&2
+    return 1
+  fi
+
+  mkdir -p /run/udev
+  if [ ! -s /run/udev/udevd.pid ] ||
+     ! kill -0 "$(cat /run/udev/udevd.pid 2>/dev/null)" 2>/dev/null; then
+    rm -f /run/udev/udevd.pid
+    /sbin/udevd --daemon
+  fi
+
+  # The root filesystem already inherits devtmpfs from the initramfs. Process
+  # only input add events here so libinput gets its udev tags without paying
+  # for a full interpreted-device scan on every graphical session.
+  /sbin/udevadm trigger --subsystem-match=input --action=add
+  /sbin/udevadm settle --timeout=10
+
+  for database in /run/udev/data/c13:*; do
+    [ -f "$database" ] || continue
+    if grep -q '^E:ID_INPUT_TOUCHSCREEN=1$' "$database"; then
+      return 0
+    fi
+  done
+  echo 'pinecone-session: touchscreen was not tagged for libinput' >&2
+  return 1
+}
+EOF
+chmod 0755 "${ROOTFS_DIR}/usr/local/bin/pinecone-session-env"
+cat > "${ROOTFS_DIR}/usr/local/bin/start-pinecone-phoc" <<'EOF'
+#!/bin/sh
+set -eu
+. /usr/local/bin/pinecone-session-env
+
+if ! command -v phoc >/dev/null 2>&1; then
+  echo 'pinecone-phoc: phoc is not installed; use the phoc graphical profile' >&2
+  exit 127
+fi
+
+if command -v dbus-uuidgen >/dev/null 2>&1; then
+  dbus-uuidgen --ensure 2>/dev/null || true
+fi
+pinecone_start_system_bus || \
+  echo 'pinecone-phoc: system bus unavailable; continuing with session bus' >&2
+pinecone_prepare_input || echo 'pinecone-phoc: input discovery unavailable' >&2
+
+echo 'pinecone-phoc: starting compositor at 480x800' >&2
+set +e
+dbus-run-session -- phoc -E foot
+PHOC_STATUS=$?
+set -e
+printf 'pinecone-phoc: compositor exited with status %s\n' "$PHOC_STATUS" >&2
+for CORE in /var/log/core.phoc.*; do
+  [ -e "$CORE" ] && ls -l "$CORE" >&2
+done
+exit "$PHOC_STATUS"
+EOF
+chmod 0755 "${ROOTFS_DIR}/usr/local/bin/start-pinecone-phoc"
+cat > "${ROOTFS_DIR}/usr/local/bin/start-pinecone-wayland-test" <<'EOF'
+#!/bin/sh
+set -eu
+. /usr/local/bin/pinecone-session-env
+
+if ! command -v weston-simple-shm >/dev/null 2>&1; then
+  echo 'pinecone-wayland-test: weston-simple-shm is not installed' >&2
+  exit 127
+fi
+
+echo 'pinecone-wayland-test: starting shared-memory client at 480x800' >&2
+exec dbus-run-session -- phoc -E weston-simple-shm
+EOF
+chmod 0755 "${ROOTFS_DIR}/usr/local/bin/start-pinecone-wayland-test"
+cp "${ROOT_DIR}/scripts/rootfs/pinecone-phosh-client" \
+  "${ROOTFS_DIR}/usr/local/bin/pinecone-phosh-client"
+chmod 0755 "${ROOTFS_DIR}/usr/local/bin/pinecone-phosh-client"
+cat > "${ROOTFS_DIR}/usr/local/bin/start-pinecone-phosh" <<'EOF'
+#!/bin/sh
+set -eu
+. /usr/local/bin/pinecone-session-env
+
+if ! command -v phoc >/dev/null 2>&1 ||
+   ! command -v gnome-session >/dev/null 2>&1 ||
+   [ ! -x /usr/libexec/phosh ]; then
+  echo 'pinecone-phosh: phoc, phosh, or gnome-session is not installed; use the phosh graphical profile' >&2
+  exit 127
+fi
+
+if command -v dbus-uuidgen >/dev/null 2>&1; then
+  dbus-uuidgen --ensure 2>/dev/null || true
+fi
+pinecone_start_system_bus || echo 'pinecone-phosh: system bus unavailable' >&2
+pinecone_prepare_input || echo 'pinecone-phosh: input discovery unavailable' >&2
+
+CACHE_STAMP=/var/cache/pinecone/graphical-runtime-v5
+if [ ! -e "$CACHE_STAMP" ]; then
+  echo 'pinecone-phosh: preparing required graphical metadata' >&2
+  mkdir -p /var/cache/pinecone
+  # MIME metadata is generated while constructing the image. Fontconfig and
+  # GTK can validate their package-provided caches lazily; forcing complete
+  # rebuilds here delays the first frame by billions of interpreted guest
+  # instructions. Only the loader registry is required synchronously.
+  if command -v gdk-pixbuf-query-loaders >/dev/null 2>&1; then
+    mkdir -p /usr/lib/gdk-pixbuf-2.0/2.10.0
+    gdk-pixbuf-query-loaders > /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache || true
+  fi
+  if command -v gdk-pixbuf-csource >/dev/null 2>&1 &&
+     ! gdk-pixbuf-csource \
+       /usr/share/icons/Adwaita/scalable/status/image-missing.svg \
+       >/dev/null 2>&1; then
+    echo 'pinecone-phosh: SVG image loader preflight failed' >&2
+    exit 1
+  fi
+  touch "$CACHE_STAMP"
+fi
+
+echo 'pinecone-phosh: starting mobile shell at 480x800' >&2
+if ! grep -q ' /dev/shm tmpfs ' /proc/mounts 2>/dev/null; then
+  echo 'pinecone-phosh: /dev/shm is not backed by tmpfs' >&2
+  exit 1
+fi
+SHM_PROBE="/dev/shm/.pinecone-probe.$$"
+if ! (umask 077; : > "$SHM_PROBE") 2>/dev/null; then
+  echo 'pinecone-phosh: shared-memory allocation is unavailable' >&2
+  exit 1
+fi
+rm -f "$SHM_PROBE"
+if ! find /sys/class/drm -maxdepth 1 -name 'card*' -print -quit 2>/dev/null | grep -q . &&
+   command -v modprobe >/dev/null 2>&1; then
+  modprobe virtio_gpu 2>/dev/null || true
+fi
+if ! find /sys/class/drm -maxdepth 1 -name 'card*' -print -quit 2>/dev/null | grep -q .; then
+  echo 'pinecone-phosh: no DRM scanout device is available' >&2
+  exit 1
+fi
+export WLR_BACKENDS=drm,libinput
+export WLR_LIBINPUT_NO_DEVICES=1
+export WLR_RENDERER=pixman
+export WLR_RENDERER_ALLOW_SOFTWARE=1
+export _GNOME_SESSION_ACCELERATED=1
+export _GNOME_IS_SOFTWARE_RENDERING=1
+export _GNOME_SESSION_RENDERER=pixman
+export GSK_RENDERER=cairo
+# virtio-gpu exposes a virtual connector. Phosh must treat that connector as
+# the device's built-in panel so it can select a primary mobile monitor.
+export PHOSH_DEBUG=fake-builtin
+# Pinecone composites each flushed rectangle into a persistent scanout, so
+# Phoc's partial damage is safe across rotating dumb buffers. Keep transitions
+# disabled, but do not turn small touch updates into full-screen Pixman work.
+export PHOC_DEBUG=disable-animations
+set +e
+mkdir -p /var/log/pinecone
+PHOC_INI=/usr/share/phosh/phoc.ini
+if [ -f /etc/phosh/phoc.ini ]; then
+  PHOC_INI=/etc/phosh/phoc.ini
+fi
+# Keep compositor and shell logs separate. Do not request Phoc's opaque startup
+# shield: interpreted guests can take minutes to initialize Phosh, and a shield
+# would replace otherwise valid DRM output with an indistinguishable black VM.
+dbus-run-session -- phoc -v -C "$PHOC_INI" \
+  -E /usr/local/bin/pinecone-phosh-client \
+  > /var/log/pinecone/phoc.log 2>&1
+SESSION_STATUS=$?
+cat /var/log/pinecone/phoc.log
+cat /var/log/pinecone/phosh-session.log 2>/dev/null || true
+set -e
+printf 'pinecone-phosh: session exited with status %s\n' "$SESSION_STATUS" >&2
+for CORE in /var/log/core.phoc.* /var/log/core.phosh.* /var/log/core.gnome-session.*; do
+  [ -e "$CORE" ] && ls -l "$CORE" >&2
+done
+exit "$SESSION_STATUS"
+EOF
+chmod 0755 "${ROOTFS_DIR}/usr/local/bin/start-pinecone-phosh"
+cat > "${ROOTFS_DIR}/etc/shells" <<'EOF'
+/bin/sh
+/bin/ash
+EOF
+cat > "${ROOTFS_DIR}/etc/resolv.conf" <<'EOF'
+nameserver 10.0.2.3
+options timeout:1 attempts:3
+EOF
+cat > "${ROOTFS_DIR}/etc/network/interfaces" <<'EOF'
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+	address 10.0.2.15
+	netmask 255.255.255.0
+	gateway 10.0.2.2
+EOF
+cat > "${ROOTFS_DIR}/etc/apk/repositories" <<'EOF'
+http://dl-cdn.alpinelinux.org/alpine/edge/main
+http://dl-cdn.alpinelinux.org/alpine/edge/community
+EOF
+cat > "${ROOTFS_DIR}/etc/apk/arch" <<'EOF'
+aarch64
+EOF
+touch \
+  "${ROOTFS_DIR}/lib/apk/db/installed" \
+  "${ROOTFS_DIR}/lib/apk/db/lock" \
+  "${ROOTFS_DIR}/lib/apk/db/scripts.tar" \
+  "${ROOTFS_DIR}/etc/apk/world"
+cat > "${ROOTFS_DIR}/etc/arm64viz-release" <<EOF
+NAME=arm64viz-rootfs
+ID=arm64viz
+VERSION=0.1
+EOF
+cat > "${ROOTFS_DIR}/root/README" <<EOF
+This is the first persistent arm64viz Linux root filesystem.
+
+The initramfs mounts this image from /dev/vda and switch_roots into /sbin/init.
+Files written here are backed by the virtual block device.
+EOF
+
+mkdir -p "$(dirname "${IMAGE}")"
+STAGED_KIB="$(du -sk "${ROOTFS_DIR}" | awk '{print $1}')"
+STAGED_MIB="$(( (STAGED_KIB + 1023) / 1024 ))"
+# Leave room for ext4 metadata and package downloads/installation. Graphical
+# profiles vary substantially as Alpine packages change, so a fixed image size
+# is not reliable.
+REQUIRED_MIB="$(( ((STAGED_MIB + MINIMUM_FREE_MIB) * 110 + 99) / 100 ))"
+if (( REQUIRED_MIB < MINIMUM_SIZE_MIB )); then
+  REQUIRED_MIB="${MINIMUM_SIZE_MIB}"
+fi
+if [[ "${SIZE_MIB}" == "auto" ]]; then
+  SIZE_MIB="${REQUIRED_MIB}"
+elif (( SIZE_MIB < REQUIRED_MIB )); then
+  echo "ROOTFS_SIZE_MIB=${SIZE_MIB} is too small for ${STAGED_MIB} MiB of staged files." >&2
+  echo "Use ROOTFS_SIZE_MIB=${REQUIRED_MIB} or larger." >&2
+  exit 1
+fi
+rm -f "${IMAGE}"
+truncate -s "${SIZE_MIB}M" "${IMAGE}"
+# The VM does not expose a battery-backed wall clock yet. Normalize staged
+# mtimes so fontconfig and other cache validators do not reject every cache as
+# being newer than the guest clock on each boot.
+find "${ROOTFS_DIR}" -exec touch -h -t 197001010000.00 {} +
+"${MKE2FS}" -q -t ext4 -L arm64viz-root -d "${ROOTFS_DIR}" "${IMAGE}"
+
+echo "Built root filesystem image:"
+echo "  ${IMAGE}"
+echo "  size: ${SIZE_MIB} MiB"
+echo "  staged: ${STAGED_MIB} MiB"

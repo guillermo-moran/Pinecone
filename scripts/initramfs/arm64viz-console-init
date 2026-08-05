@@ -1,0 +1,73 @@
+#!/bin/sh
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+BB=/bin/busybox
+TTY=/dev/ttyAMA0
+ROOTDEV="${ROOTDEV:-/dev/vda}"
+NEWROOT=/newroot
+
+mount_fs() {
+	"$BB" mount -t "$1" "$2" "$3" 2>/dev/null || true
+}
+
+ensure_node() {
+	path="$1"
+	mode="$2"
+	major="$3"
+	minor="$4"
+	[ -c "$path" ] || "$BB" mknod -m "$mode" "$path" c "$major" "$minor" 2>/dev/null || true
+}
+
+mount_fs proc proc /proc
+mount_fs sysfs sysfs /sys
+mount_fs devtmpfs devtmpfs /dev
+
+"$BB" mkdir -p /dev /dev/pts /proc /sys /run /tmp /root "$NEWROOT" 2>/dev/null || true
+ensure_node /dev/null 666 1 3
+ensure_node /dev/console 600 5 1
+ensure_node /dev/ttyAMA0 600 204 64
+mount_fs devpts devpts /dev/pts
+"$BB" chmod 1777 /tmp 2>/dev/null || true
+
+[ -c "$TTY" ] || TTY=/dev/console
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	if [ -b "$ROOTDEV" ]; then
+		break
+	fi
+	"$BB" sleep 1
+done
+
+if [ -b "$ROOTDEV" ]; then
+	echo "arm64viz init: mounting persistent root $ROOTDEV" >"$TTY"
+	if "$BB" mount -t ext4 -o rw "$ROOTDEV" "$NEWROOT" 2>"$TTY"; then
+		"$BB" mkdir -p "$NEWROOT"/dev "$NEWROOT"/dev/pts "$NEWROOT"/proc "$NEWROOT"/sys "$NEWROOT"/run "$NEWROOT"/tmp 2>/dev/null || true
+		"$BB" mount -o move /dev "$NEWROOT"/dev 2>/dev/null || true
+		"$BB" mount -o move /proc "$NEWROOT"/proc 2>/dev/null || true
+		"$BB" mount -o move /sys "$NEWROOT"/sys 2>/dev/null || true
+		echo "arm64viz init: switching to persistent root" >"$TTY"
+		exec "$BB" switch_root "$NEWROOT" /sbin/init
+	fi
+	echo "arm64viz init: persistent root mount failed; falling back to initramfs shell" >"$TTY"
+fi
+
+export HOME=/root
+export SHELL=/bin/sh
+export TERM=vt100
+export PS1='arm64viz:\w# '
+export TTY
+
+while true; do
+	"$BB" setsid /bin/sh -c '
+		exec <"$TTY" >"$TTY" 2>&1
+		/bin/busybox stty sane 2>/dev/null || true
+		echo
+		echo "arm64viz init: ttyAMA0 console ready"
+		exec /bin/sh -l
+	'
+	code="$?"
+	echo "arm64viz init: shell exited with status $code; restarting" >"$TTY"
+	"$BB" sleep 1
+done

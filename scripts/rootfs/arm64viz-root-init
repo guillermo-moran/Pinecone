@@ -1,0 +1,108 @@
+#!/bin/sh
+
+PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+BB=/bin/busybox
+TTY=/dev/ttyAMA0
+
+[ -c "$TTY" ] || TTY=/dev/console
+
+mount_fs() {
+	if [ -n "${4:-}" ]; then
+		"$BB" mount -t "$1" -o "$4" "$2" "$3" 2>/dev/null || true
+	else
+		"$BB" mount -t "$1" "$2" "$3" 2>/dev/null || true
+	fi
+}
+
+configure_network() {
+	"$BB" ifconfig lo 127.0.0.1 up 2>/dev/null || true
+	for _ in 1 2 3 4 5; do
+		[ -e /sys/class/net/eth0 ] && break
+		"$BB" sleep 1
+	done
+	if [ -e /sys/class/net/eth0 ]; then
+		"$BB" ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null || true
+		"$BB" route add default gw 10.0.2.2 eth0 2>/dev/null || true
+		echo "arm64viz rootfs: eth0 configured as 10.0.2.15 via 10.0.2.2" >"$TTY"
+	else
+		echo "arm64viz rootfs: eth0 not present yet; networking disabled" >"$TTY"
+	fi
+}
+
+initialize_clock() {
+	for argument in $("$BB" cat /proc/cmdline 2>/dev/null); do
+		case "$argument" in
+			pinecone.unix_time=*)
+				unix_time="${argument#pinecone.unix_time=}"
+				"$BB" date -u -s "@$unix_time" >/dev/null 2>&1 || true
+				return
+				;;
+		esac
+	done
+}
+
+write_network_config() {
+	"$BB" mkdir -p /etc /etc/apk 2>/dev/null || true
+	cat >/etc/resolv.conf <<'EOF'
+nameserver 10.0.2.3
+options timeout:1 attempts:3
+EOF
+	cat >/etc/hosts <<'EOF'
+127.0.0.1 localhost
+127.0.1.1 arm64viz.local arm64viz
+::1 localhost ip6-localhost
+EOF
+	cat >/etc/apk/repositories <<'EOF'
+http://10.0.2.2/alpine/edge/main
+http://10.0.2.2/alpine/edge/community
+EOF
+}
+
+ensure_node() {
+	path="$1"
+	mode="$2"
+	major="$3"
+	minor="$4"
+	[ -c "$path" ] || "$BB" mknod -m "$mode" "$path" c "$major" "$minor" 2>/dev/null || true
+}
+
+"$BB" mkdir -p /dev /dev/pts /dev/shm /proc /sys /run /tmp /root /var/log /var/tmp 2>/dev/null || true
+ensure_node /dev/null 666 1 3
+ensure_node /dev/console 600 5 1
+ensure_node /dev/ttyAMA0 600 204 64
+mount_fs proc proc /proc
+mount_fs sysfs sysfs /sys
+mount_fs devpts devpts /dev/pts
+mount_fs tmpfs tmpfs /run mode=0755,nosuid,nodev
+mount_fs tmpfs tmpfs /dev/shm mode=1777,nosuid,nodev
+initialize_clock
+"$BB" hostname -F /etc/hostname 2>/dev/null || "$BB" hostname arm64viz 2>/dev/null || true
+# The initramfs already mounted devtmpfs and moved it into this root. A second
+# full mdev scan is redundant and prohibitively expensive under interpretation.
+echo "arm64viz rootfs: using mounted devtmpfs" >"$TTY"
+"$BB" chmod 1777 /dev/shm /tmp /var/tmp 2>/dev/null || true
+write_network_config
+configure_network
+
+export HOME=/root
+export SHELL=/bin/sh
+export TERM=dumb
+export TTY
+
+[ -f /etc/profile ] && . /etc/profile
+
+echo "arm64viz rootfs: persistent /dev/vda is mounted as /" >"$TTY"
+echo "arm64viz rootfs: write files under /root and reboot to test persistence" >"$TTY"
+
+while true; do
+	"$BB" setsid /bin/sh -c '
+		exec <"$TTY" >"$TTY" 2>&1
+		/bin/busybox stty sane 2>/dev/null || true
+		exec /bin/sh -l
+	'
+	code="$?"
+	echo "arm64viz rootfs: shell exited with status $code; restarting" >"$TTY"
+	"$BB" sleep 1
+done

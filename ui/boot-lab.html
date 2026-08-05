@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>arm64viz Boot Lab</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="workspace" aria-label="Boot planner">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">arm64viz</p>
+          <h1>Boot Lab</h1>
+        </div>
+        <div class="policy-pill" id="policyState">metadata-only policy</div>
+      </header>
+
+      <section class="drop-zone" id="dropZone">
+        <input id="fileInput" class="file-input" type="file" multiple>
+        <div class="drop-mark" aria-hidden="true">
+          <svg viewBox="0 0 64 64" role="img">
+            <path d="M16 44h32a10 10 0 0 0 1.8-19.8A18 18 0 0 0 14.6 28 8.5 8.5 0 0 0 16 44Z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+            <path d="M32 41V22m0 0-8 8m8-8 8 8" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div>
+          <h2>Drop Boot Artifacts</h2>
+          <p>Names and sizes only. Package contents stay untouched.</p>
+        </div>
+        <button class="icon-button" id="pickButton" type="button" title="Choose files" aria-label="Choose files">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </section>
+
+      <section class="content-grid">
+        <div class="panel artifacts-panel">
+          <div class="panel-head">
+            <h2>Artifacts</h2>
+            <button class="text-button" id="clearButton" type="button">Clear</button>
+          </div>
+          <div class="empty-state" id="emptyState">No artifacts staged.</div>
+          <table class="artifact-table" id="artifactTable" aria-label="Artifact classification">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Kind</th>
+                <th>Size</th>
+                <th>Policy</th>
+              </tr>
+            </thead>
+            <tbody id="artifactRows"></tbody>
+          </table>
+        </div>
+
+        <div class="panel machine-panel">
+          <div class="panel-head">
+            <h2>Virtual Machine</h2>
+            <span id="machineStatus">idle</span>
+          </div>
+          <canvas id="machineCanvas" width="760" height="360" aria-label="Virtual machine boot plan visualization"></canvas>
+        </div>
+      </section>
+
+      <section class="panel boot-session-panel" aria-label="Boot session">
+        <div class="panel-head">
+          <h2>Alpine Shell Target</h2>
+          <span id="bootSessionStatus">blocked</span>
+        </div>
+        <div class="boot-session-grid">
+          <div class="session-meta" id="sessionMeta"></div>
+          <div class="terminal-frame" aria-label="Alpine boot terminal">
+            <div class="terminal-titlebar">
+              <span>ttyAMA0</span>
+              <span>/bin/sh target</span>
+            </div>
+            <pre id="terminalOutput"></pre>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <aside class="sidebar" aria-label="Adapter plans">
+      <div class="sidebar-head">
+        <h2>Adapters</h2>
+        <span id="adapterCount">0</span>
+      </div>
+      <div class="adapter-list" id="adapterList"></div>
+    </aside>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+#!/bin/sh
+set -u
+
+LOG_DIR=/var/log/pinecone
+SESSION_LOG="${LOG_DIR}/phosh-session.log"
+CONSOLE=/dev/ttyAMA0
+mkdir -p "$LOG_DIR"
+: > "$SESSION_LOG"
+
+printf '%s\n' 'pinecone-phosh: starting Phosh shell' | \
+  tee -a "$SESSION_LOG" > "$CONSOLE"
+
+# Phoc sets WAYLAND_DISPLAY before executing this supervisor. Propagate that
+# final compositor environment to services activated by the session bus.
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+  dbus-update-activation-environment \
+    WAYLAND_DISPLAY \
+    XDG_CURRENT_DESKTOP \
+    XDG_RUNTIME_DIR \
+    XDG_SESSION_TYPE \
+    2>>"$SESSION_LOG" || true
+fi
+
+if command -v gsettings >/dev/null 2>&1; then
+  gsettings set org.gnome.desktop.session idle-delay 0 2>>"$SESSION_LOG" || true
+  gsettings set org.gnome.desktop.screensaver lock-enabled false \
+    2>>"$SESSION_LOG" || true
+  gsettings set sm.puri.phosh.lockscreen require-unlock false \
+    2>>"$SESSION_LOG" || true
+  gsettings set org.gnome.desktop.interface enable-animations false \
+    2>>"$SESSION_LOG" || true
+  gsettings set org.gnome.desktop.background picture-uri '' \
+    2>>"$SESSION_LOG" || true
+  gsettings set org.gnome.desktop.background picture-uri-dark '' \
+    2>>"$SESSION_LOG" || true
+  gsettings set org.gnome.desktop.background primary-color '#000000' \
+    2>>"$SESSION_LOG" || true
+fi
+
+if [ -f /usr/share/pinecone/phosh-ui/lockscreen.ui ]; then
+  export G_RESOURCE_OVERLAYS=/mobi/phosh/ui=/usr/share/pinecone/phosh-ui
+fi
+
+OSK_PID=
+if command -v squeekboard >/dev/null 2>&1; then
+  squeekboard >>"$SESSION_LOG" 2>&1 &
+  OSK_PID=$!
+fi
+
+set -o pipefail 2>/dev/null || true
+/usr/libexec/phosh 2>&1 | tee -a "$SESSION_LOG" > "$CONSOLE"
+status=$?
+
+if [ -n "$OSK_PID" ]; then
+  kill "$OSK_PID" 2>/dev/null || true
+  wait "$OSK_PID" 2>/dev/null || true
+fi
+
+printf 'pinecone-phosh: shell exited with status %s\n' "$status" | \
+  tee -a "$SESSION_LOG" > "$CONSOLE"
+exit "$status"

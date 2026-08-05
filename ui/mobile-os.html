@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>arm64viz MobileOS Archived</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #101820;
+      color: #e8f3f1;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background:
+        linear-gradient(135deg, rgba(32, 82, 92, 0.9), rgba(16, 24, 32, 0.98)),
+        #101820;
+    }
+
+    main {
+      width: min(720px, 100%);
+      border: 1px solid rgba(232, 243, 241, 0.18);
+      border-radius: 8px;
+      padding: 28px;
+      background: rgba(12, 20, 28, 0.78);
+      box-shadow: 0 24px 72px rgba(0, 0, 0, 0.28);
+    }
+
+    p {
+      color: #b9cac7;
+      line-height: 1.55;
+    }
+
+    code {
+      display: block;
+      margin-top: 18px;
+      padding: 14px;
+      border-radius: 6px;
+      background: #071014;
+      color: #bff5e7;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>JavaScript MobileOS Disabled</h1>
+    <p>The JavaScript MobileOS shell is archived. The active direction is native ARM64 Linux/postmarketOS bring-up through the owned VM, FDT, initrd, and block-device path.</p>
+    <code>swift run arm64viz prepare-linux Image --postmarketos --initrd initrd.cpio.gz --disk rootfs.img --memory-mib 1024</code>
+  </main>
+</body>
+</html>

@@ -1,0 +1,42 @@
+{
+  "audit" : {
+    "logMaterialIdentifiersOnly" : true,
+    "requireHumanReviewBeforeNewGuestAdapter" : true,
+    "requirePolicyReport" : true
+  },
+  "proprietaryGuests" : {
+    "allowExternalServiceAccess" : false,
+    "boundaryMode" : "metadataOnly",
+    "deniedIdentifierSuffixes" : [
+      ".ipsw",
+      ".im4p",
+      ".im4m",
+      ".img4",
+      ".bbfw"
+    ],
+    "deniedIdentifierTerms" : [
+      "ipsw",
+      "secure enclave",
+      "sep secret",
+      "activation",
+      "attestation",
+      "apns",
+      "imessage"
+    ],
+    "deniedMaterialKinds" : [
+      "firmwareBlob",
+      "bootROMCode",
+      "bootloaderCode",
+      "deviceKey",
+      "certificate",
+      "secureEnclaveSecret",
+      "activationMaterial",
+      "attestationMaterial",
+      "ipswArchive"
+    ],
+    "requireAuthorizationSummary" : true,
+    "requireLawfulSourceDescription" : true,
+    "requireResearchPurpose" : true
+  },
+  "schemaVersion" : 1
+}

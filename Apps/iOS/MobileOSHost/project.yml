@@ -1,0 +1,49 @@
+name: MobileOSHost
+options:
+  bundleIdPrefix: dev.arm64viz
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  ARM64Viz:
+    path: ../../..
+targets:
+  MobileOSHost:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+      - path: ../../../artifacts/linux-shell/out/Image
+        type: file
+        buildPhase: resources
+      - path: ../../../artifacts/linux-shell/out/initramfs-minimal-ttyinit.cpio
+        type: file
+        buildPhase: resources
+      - path: ../../../artifacts/linux-shell/out/rootfs.ext4
+        type: file
+        buildPhase: resources
+    dependencies:
+      - package: ARM64Viz
+        product: ARM64VizCore
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UIApplicationSupportsIndirectInputEvents: true
+        UIRequiresFullScreen: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: me.gmoran.pinecone
+        PRODUCT_NAME: Pinecone
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
