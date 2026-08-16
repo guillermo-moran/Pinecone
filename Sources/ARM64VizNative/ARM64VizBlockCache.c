@@ -2,6 +2,7 @@
 
 #include <limits.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 enum {
@@ -35,6 +36,7 @@ struct AVZNativeDecodedBlock {
     const uint64_t
         *code_page_generation_tokens[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
     uint64_t code_page_generations[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
+    uint64_t shared_code_page_generations[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
 };
 
 typedef struct {
@@ -81,6 +83,7 @@ struct AVZNativeBlockCache {
     uint64_t mutation_epoch;
     uint64_t code_mutation_epoch;
     uint64_t reset_epoch;
+    AVZGuestMemory *guest_memory;
     AVZNativeBlockCacheStatistics statistics;
 };
 
@@ -306,14 +309,37 @@ static int avz_block_code_pages_are_current(
     return 1;
 }
 
+static int avz_block_shared_code_pages_are_current(
+    const AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *block
+) {
+    if (cache == NULL || block == NULL || cache->guest_memory == NULL) {
+        return 1;
+    }
+    for (size_t slot = 0; slot < block->code_page_count; slot++) {
+        if (avz_guest_memory_page_write_generation(
+                cache->guest_memory,
+                block->physical_code_pages[slot],
+                cache->ram_base
+            ) != block->shared_code_page_generations[slot]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int avz_entry_code_is_current(
     AVZNativeBlockCache *cache,
     AVZBlockCacheEntry *entry
 ) {
+    if (!avz_block_shared_code_pages_are_current(cache, &entry->block)) {
+        return 0;
+    }
     if (entry->validated_code_mutation_epoch == cache->code_mutation_epoch) {
         return 1;
     }
-    if (!avz_block_code_pages_are_current(&entry->block)) {
+    if (!avz_block_code_pages_are_current(&entry->block) ||
+        !avz_block_shared_code_pages_are_current(cache, &entry->block)) {
         return 0;
     }
     entry->validated_code_mutation_epoch = cache->code_mutation_epoch;
@@ -410,6 +436,7 @@ static int avz_native_kind_uses_vector_state(uint16_t kind) {
     case AVZ_NATIVE_OP_SIMD_ADD_ACROSS_VECTOR:
     case AVZ_NATIVE_OP_SIMD_COMPARE_EQUAL_VECTOR:
     case AVZ_NATIVE_OP_SIMD_COUNT_SET_BITS:
+    case AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS:
     case AVZ_NATIVE_OP_SIMD_UNSIGNED_MAX_PAIRWISE:
     case AVZ_NATIVE_OP_SIMD_REVERSE_ELEMENTS:
     case AVZ_NATIVE_OP_SIMD_EXTRACT_VECTOR:
@@ -585,6 +612,12 @@ static void avz_index_entry(AVZNativeBlockCache *cache, size_t entry_index) {
             block->code_page_generation_tokens[slot] == NULL
                 ? 0
                 : *block->code_page_generation_tokens[slot];
+        block->shared_code_page_generations[slot] =
+            avz_guest_memory_page_write_generation(
+                cache->guest_memory,
+                pages[slot],
+                cache->ram_base
+            );
     }
     block->code_page_count = (uint8_t)page_count;
 }
@@ -808,6 +841,17 @@ int avz_native_block_cache_bind_physical_memory(
     cache->ram_base = physical_address;
     cache->ram_size = byte_count;
     return 1;
+}
+
+void avz_native_block_cache_set_guest_memory(
+    AVZNativeBlockCache *cache,
+    AVZGuestMemory *memory
+) {
+    if (cache == NULL || cache->guest_memory == memory) {
+        return;
+    }
+    cache->guest_memory = memory;
+    avz_native_block_cache_clear(cache);
 }
 
 void avz_native_block_cache_invalidate_decode_window(
@@ -1290,6 +1334,7 @@ int avz_native_block_cache_validate_block(
     return entry != NULL && entry->valid && serial != 0 &&
         entry->serial == serial &&
         avz_block_code_pages_are_current(&entry->block) &&
+        avz_block_shared_code_pages_are_current(cache, &entry->block) &&
         (key == NULL || avz_block_keys_equal(&entry->block.key, key));
 }
 

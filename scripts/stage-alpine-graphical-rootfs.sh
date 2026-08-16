@@ -20,7 +20,8 @@ case "${PROFILE}" in
       elogind
       phoc
       phosh
-      polkit
+      polkit-elogind
+      util-linux-login
       weston-clients
       portfolio
       gnome-calculator
@@ -44,9 +45,10 @@ mkdir -p "${CACHE_DIR}" "${DESTINATION}"
 for repository in main community; do
   archive="${CACHE_DIR}/${repository}-APKINDEX.tar.gz"
   index="${CACHE_DIR}/${repository}-APKINDEX"
-  if [[ ! -s "${archive}" ]]; then
-    curl -fL --retry 3 -o "${archive}" "${BASE_URL}/${repository}/aarch64/APKINDEX.tar.gz"
-  fi
+  archive_staging="${archive}.staging.$$"
+  curl -fL --retry 3 -o "${archive_staging}" \
+    "${BASE_URL}/${repository}/aarch64/APKINDEX.tar.gz"
+  mv "${archive_staging}" "${archive}"
   bsdtar -xOf "${archive}" APKINDEX > "${index}"
 done
 
@@ -108,7 +110,9 @@ package_dependencies() {
 
 selected_file="${CACHE_DIR}/selected-graphical-packages-${PROFILE}.txt"
 if [[ "${ARM64VIZ_REUSE_GRAPHICAL_PACKAGE_SELECTION:-0}" != "1" || ! -s "${selected_file}" ]]; then
-  : > "${selected_file}"
+  selected_file_staging="${selected_file}.staging.$$"
+  rm -f "${selected_file_staging}"
+  : > "${selected_file_staging}"
   queue=("${TARGETS[@]}")
   cursor=0
 
@@ -122,8 +126,8 @@ if [[ "${ARM64VIZ_REUSE_GRAPHICAL_PACKAGE_SELECTION:-0}" != "1" || ! -s "${selec
       exit 1
     fi
     IFS='|' read -r repository package version <<<"${record}"
-    grep -q "^[^|]*|${package}|" "${selected_file}" && continue
-    printf '%s|%s|%s\n' "${repository}" "${package}" "${version}" >> "${selected_file}"
+    grep -q "^[^|]*|${package}|" "${selected_file_staging}" && continue
+    printf '%s|%s|%s\n' "${repository}" "${package}" "${version}" >> "${selected_file_staging}"
 
     dependency_line="$(package_dependencies "${package}" "${repository}")"
     if [[ -n "${dependency_line}" ]]; then
@@ -131,6 +135,7 @@ if [[ "${ARM64VIZ_REUSE_GRAPHICAL_PACKAGE_SELECTION:-0}" != "1" || ! -s "${selec
       queue+=("${dependencies[@]}")
     fi
   done
+  mv "${selected_file_staging}" "${selected_file}"
 fi
 
 while IFS='|' read -r repository package version; do

@@ -1,23 +1,28 @@
 import ARM64VizCore
 import Combine
+import Darwin
 import Foundation
 
 private func linuxConsoleBootArguments() -> String {
-    [
+    var arguments = [
         "console=ttyAMA0",
-        "console=tty0",
-        "earlycon=pl011,mmio32,0x9000000",
         "root=/dev/vda",
         "rw",
         "rootwait",
         "rdinit=/init",
-        "loglevel=7",
-        "ignore_loglevel",
+        "loglevel=4",
         "printk.time=1",
-        "print-fatal-signals=1",
-        "consoleblank=0",
         "pinecone.unix_time=\(Int64(Date().timeIntervalSince1970))"
-    ].joined(separator: " ")
+    ]
+    if ProcessInfo.processInfo.environment["PINECONE_VERBOSE_BOOT"] == "1" {
+        arguments.append(contentsOf: [
+            "earlycon=pl011,mmio32,0x9000000",
+            "loglevel=7",
+            "ignore_loglevel",
+            "print-fatal-signals=1"
+        ])
+    }
+    return arguments.joined(separator: " ")
 }
 
 @MainActor
@@ -48,6 +53,7 @@ final class MobileOSHostModel: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var lastStopReason: String?
     @Published private(set) var displayTouchLog: [String] = []
+    @Published private(set) var isPhoshReady = false
     let displayFeed = GuestDisplayFeed()
     let performanceFeed = HostPerformanceFeed()
 
@@ -60,7 +66,7 @@ final class MobileOSHostModel: ObservableObject {
     private var runIdentifier: UInt64 = 0
     private var cleanupIdentifier: UInt64 = 0
     private var filesystemLoadingMessagePrinted = false
-    private var simulatorAutorunCommandSent = false
+    private var phoshLaunchCommandSent = false
     private var pendingTerminalControlBytes: [UInt8] = []
 
     private static let terminalLimit = 64_000
@@ -68,10 +74,10 @@ final class MobileOSHostModel: ObservableObject {
     private static let bootRunSliceSteps = 20_000
     private static let interactiveRunSliceSteps = 80_000
     private static let idleRunSliceSteps = 4_000
-    private static let pendingInputRunSliceSteps = 8_000
+    private static let pendingInputRunSliceSteps = 80_000
     private static let bootProgressIntervalNanoseconds: UInt64 = 250_000_000
-    private static let interactiveProgressIntervalNanoseconds: UInt64 = 500_000_000
-    private static let displayPublishIntervalNanoseconds: UInt64 = 16_666_667
+    private static let interactiveProgressIntervalNanoseconds: UInt64 = 2_000_000_000
+    private static let displayPublicationIntervalNanoseconds: UInt64 = 16_666_667
     private static let cursorPositionQuery = Array("\u{001B}[6n".utf8)
     private static let cursorPositionReply = Array("\u{001B}[1;1R".utf8)
 
@@ -134,12 +140,13 @@ final class MobileOSHostModel: ObservableObject {
         if let uartLogURL = Self.simulatorUARTLogURL {
             try? FileManager.default.removeItem(at: uartLogURL)
         }
-        if let performanceLogURL = Self.simulatorPerformanceLogURL {
+#endif
+        if let performanceLogURL = Self.performanceLogURL {
             try? FileManager.default.removeItem(at: performanceLogURL)
         }
-#endif
         filesystemLoadingMessagePrinted = false
-        simulatorAutorunCommandSent = false
+        phoshLaunchCommandSent = false
+        isPhoshReady = false
         pendingTerminalControlBytes.removeAll(keepingCapacity: true)
         displayTouchLog.removeAll(keepingCapacity: false)
         displayFeed.reset()
@@ -246,6 +253,7 @@ final class MobileOSHostModel: ObservableObject {
             }
 
             if let runtime {
+                runtime.stopExecution()
                 do {
                     try runtime.persistDiskImageIfNeeded()
                 } catch {
@@ -360,7 +368,7 @@ final class MobileOSHostModel: ObservableObject {
                     let pc = runtime.pc
 
                     switch result.stopReason {
-                    case .maxSteps:
+                    case .maxSteps, .yielded:
                         let now = DispatchTime.now().uptimeNanoseconds
                         let progressIntervalNanoseconds = runtime.hasSeenShellPrompt
                             ? interactiveProgressIntervalNanoseconds
@@ -388,6 +396,7 @@ final class MobileOSHostModel: ObservableObject {
                         )
                         await self?.recordRunnerStopped(runIdentifier: runIdentifier)
 
+                        runtime.stopExecution()
                         do {
                             try runtime.persistDiskImageIfNeeded()
                         } catch {
@@ -405,6 +414,7 @@ final class MobileOSHostModel: ObservableObject {
                         traceTail: traceTail
                     )
 
+                    runtime.stopExecution()
                     do {
                         try runtime.persistDiskImageIfNeeded()
                     } catch {
@@ -442,25 +452,26 @@ final class MobileOSHostModel: ObservableObject {
         _ runtime: LinuxConsoleRuntime,
         runIdentifier: UInt64
     ) {
-        let minimumInterval = Self.displayPublishIntervalNanoseconds
+        let displayPublicationIntervalNanoseconds =
+            Self.displayPublicationIntervalNanoseconds
         displayTask = Task.detached(priority: .userInitiated) { [weak self, runtime] in
             var publishedGeneration: UInt64?
-            var lastPublishNanoseconds: UInt64 = 0
+            var nextPublicationNanoseconds: UInt64 = 0
 
             while !Task.isCancelled {
-                let commit = runtime.displayCommitSnapshot
+                var commit = runtime.displayCommitSnapshot
                 if commit.generation == 0 || commit.generation == publishedGeneration {
                     await runtime.waitForDisplayCommit(after: commit.generation)
                     continue
                 }
 
                 let now = DispatchTime.now().uptimeNanoseconds
-                if lastPublishNanoseconds != 0,
-                   now - lastPublishNanoseconds < minimumInterval {
+                if nextPublicationNanoseconds > now {
                     try? await Task.sleep(
-                        nanoseconds: minimumInterval - (now - lastPublishNanoseconds)
+                        nanoseconds: nextPublicationNanoseconds - now
                     )
-                    if Task.isCancelled { break }
+                    guard !Task.isCancelled else { return }
+                    commit = runtime.displayCommitSnapshot
                 }
 
                 guard let metadata = runtime.displayFrameMetadata(
@@ -475,7 +486,8 @@ final class MobileOSHostModel: ObservableObject {
                     publishedAtNanoseconds: publishedAt
                 )
                 publishedGeneration = metadata.generation
-                lastPublishNanoseconds = publishedAt
+                nextPublicationNanoseconds = publishedAt &+
+                    displayPublicationIntervalNanoseconds
                 await self?.recordDisplayMetadata(
                     runIdentifier: runIdentifier,
                     metadata: metadata
@@ -504,13 +516,11 @@ final class MobileOSHostModel: ObservableObject {
         }
         lastStopReason = "\(stopReason) pc=\(Self.hex(pc))"
         performanceFeed.update(steps: steps, summary: performance)
-#if targetEnvironment(simulator)
-        writeSimulatorPerformanceSnapshot(
+        writePerformanceSnapshot(
             steps: steps,
             stopReason: stopReason,
             performance: performance
         )
-#endif
     }
 
     private func recordRunnerStopped(runIdentifier: UInt64) {
@@ -586,7 +596,10 @@ final class MobileOSHostModel: ObservableObject {
 #if targetEnvironment(simulator)
         appendSimulatorUARTLog(bytes)
 #endif
-        sendSimulatorAutorunCommandIfNeeded()
+        launchPhoshIfNeeded()
+        if !isPhoshReady, runtime?.hasInteractiveWorkloadReady == true {
+            isPhoshReady = true
+        }
     }
 
     private func consumeTerminalControlQueries(_ bytes: [UInt8]) -> [UInt8] {
@@ -636,29 +649,6 @@ final class MobileOSHostModel: ObservableObject {
         return cachesURL.appendingPathComponent("pinecone-uart.log")
     }
 
-    private static var simulatorPerformanceLogURL: URL? {
-        guard ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1",
-              let cachesURL = FileManager.default.urls(
-                for: .cachesDirectory,
-                in: .userDomainMask
-              ).first else {
-            return nil
-        }
-        return cachesURL.appendingPathComponent("pinecone-performance.log")
-    }
-
-    private func writeSimulatorPerformanceSnapshot(
-        steps: Int,
-        stopReason: String,
-        performance: String
-    ) {
-        guard let performanceLogURL = Self.simulatorPerformanceLogURL else {
-            return
-        }
-        let snapshot = "steps=\(steps) stop=\(stopReason)\n\(performance)\n"
-        try? Data(snapshot.utf8).write(to: performanceLogURL, options: .atomic)
-    }
-
     private func appendSimulatorUARTLog(_ bytes: [UInt8]) {
         guard let uartLogURL = Self.simulatorUARTLogURL else {
             return
@@ -679,17 +669,36 @@ final class MobileOSHostModel: ObservableObject {
     }
 #endif
 
-    private func sendSimulatorAutorunCommandIfNeeded() {
-#if targetEnvironment(simulator)
-        guard !simulatorAutorunCommandSent,
-              hasShellPrompt,
-              let command = ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_AUTORUN_COMMAND"],
-              !command.isEmpty else {
+    private static var performanceLogURL: URL? {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["PINECONE_DUMP_PERFORMANCE"] == "1" ||
+                environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1",
+              let cachesURL = FileManager.default.urls(
+                for: .cachesDirectory,
+                in: .userDomainMask
+              ).first else {
+            return nil
+        }
+        return cachesURL.appendingPathComponent("pinecone-performance.log")
+    }
+
+    private func writePerformanceSnapshot(
+        steps: Int,
+        stopReason: String,
+        performance: String
+    ) {
+        guard let performanceLogURL = Self.performanceLogURL else { return }
+        let snapshot = "steps=\(steps) stop=\(stopReason)\n\(performance)\n"
+        try? Data(snapshot.utf8).write(to: performanceLogURL, options: .atomic)
+    }
+
+    private func launchPhoshIfNeeded() {
+        guard !phoshLaunchCommandSent, hasShellPrompt else {
             return
         }
-        simulatorAutorunCommandSent = true
-        sendTerminalInput(command)
-#endif
+        phoshLaunchCommandSent = true
+        runtime?.beginInteractiveWorkloadProfile()
+        sendTerminalInput("start-pinecone-phosh")
     }
 
     private func appendFilesystemLoadingMessageIfNeeded() {
@@ -778,7 +787,11 @@ final class MobileOSHostModel: ObservableObject {
 
             let stagingURL = diskDirectory.appendingPathComponent("rootfs.staging.ext4")
             try? fileManager.removeItem(at: stagingURL)
-            try fileManager.copyItem(at: bundledDiskURL, to: stagingURL)
+            try cloneOrCopyDiskImage(
+                from: bundledDiskURL,
+                to: stagingURL,
+                fileManager: fileManager
+            )
 
             if fileManager.fileExists(atPath: writableDiskURL.path) {
                 _ = try fileManager.replaceItemAt(
@@ -801,11 +814,47 @@ final class MobileOSHostModel: ObservableObject {
     }
 
     nonisolated private static func diskFingerprint(forResourceAt url: URL) throws -> String {
+        if let identityURL = Bundle.main.url(
+            forResource: "rootfs.ext4",
+            withExtension: "sha256"
+        ),
+        let identity = try? String(contentsOf: identityURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+        !identity.isEmpty {
+            return identity
+        }
+
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         let byteCount = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        let modificationDate = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        let bundleVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
-        return "\(bundleVersion)-\(byteCount)-\(UInt64(max(0, modificationDate)))"
+        return "size-\(byteCount)"
+    }
+
+    nonisolated private static func cloneOrCopyDiskImage(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        fileManager: FileManager
+    ) throws {
+        let cloneResult: Int32 = sourceURL.withUnsafeFileSystemRepresentation { sourcePath in
+            destinationURL.withUnsafeFileSystemRepresentation { destinationPath in
+                guard let sourcePath, let destinationPath else {
+                    errno = EINVAL
+                    return -1
+                }
+                return clonefile(sourcePath, destinationPath, 0)
+            }
+        }
+        if cloneResult == 0 {
+            return
+        }
+
+        let cloneError = errno
+        do {
+            try fileManager.copyItem(at: sourceURL, to: destinationURL)
+        } catch {
+            throw VMError.deviceError(
+                "failed to provision persistent rootfs (clone errno \(cloneError)): \(error)"
+            )
+        }
     }
 
     nonisolated private static func makeLinuxReport(
@@ -924,6 +973,11 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private static let maximumPendingInputBytes = 64 * 1024
     private static let maximumPendingTouchEvents = 256
     private static let maximumPendingKeyboardEvents = 4_096
+    private static var virtualCPUCount: Int {
+        let requested = ProcessInfo.processInfo.environment["PINECONE_VCPU_COUNT"]
+            .flatMap(Int.init)
+        return min(max(requested ?? 2, 1), 8)
+    }
     private static let touchInteractionWatchdogNanoseconds: UInt64 = 2_000_000_000
     private static let touchLatencySampleLimit = 64
 #if targetEnvironment(simulator)
@@ -944,9 +998,12 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     let diskPersistenceURL: URL?
 
     private let machine: ResearchMachine
+    private let graphicsAccelerator: PineconeMetalGraphicsAccelerator?
     private let networkBridge: LinkLocalVirtIONetworkBackend
     private let hostWakeSignal: HostWakeSignal
+    private let inputPreemptionSignal: InputPreemptionSignal
     private let displayCommitSignal: DisplayCommitSignal
+    private let performanceTimeline = VMPerformanceTimeline()
     private let uartOutputBuffer: LockedByteBuffer
     private let onUART: @Sendable ([UInt8]) -> Void
     private let lock = NSLock()
@@ -974,10 +1031,12 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private var touchDeviceToFrameSamples: [UInt64] = []
     private var touchFrameToPublishSamples: [UInt64] = []
     private var touchEndToEndSamples: [UInt64] = []
+    private var wrotePresentedFrameMetrics = false
     private var shellPromptSeen = false
     private var lastRunSliceObservedWFI = false
     private var displayContentVisible = false
     private var displayBlankedAfterShell = false
+    private var interactiveWorkloadReady = false
     private var uartPromptTail = ""
 #if targetEnvironment(simulator)
     private var lastFramebufferDumpNanoseconds: UInt64 = 0
@@ -995,18 +1054,22 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             memorySize: Self.guestMemorySize,
             blockStorageSize: max(1024 * 1024, diskByteCount),
             blockStorage: fileBackedStorage,
+            virtualCPUCount: Self.virtualCPUCount,
+            parallelVCPUExecution: Self.virtualCPUCount > 1,
             publishedDevices: diskByteCount == 0 ? .linuxConsole : .full
         )
-#if targetEnvironment(simulator)
-        let hotPCProfilingEnabled =
-            ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_HOT_PC_PROFILE"] == "1"
+        let environment = ProcessInfo.processInfo.environment
+        let hotPCProfilingEnabled = environment["PINECONE_HOT_PC_PROFILE"] == "1" ||
+            environment["PINECONE_SIMULATOR_HOT_PC_PROFILE"] == "1"
         (machine.vm.backend as? SoftwareARM64Backend)?
             .setNativeHotPCProfilingEnabled(hotPCProfilingEnabled)
-#endif
         let networkBridge = LinkLocalVirtIONetworkBackend()
+        let graphicsAccelerator = PineconeMetalGraphicsAccelerator()
         let hostWakeSignal = HostWakeSignal()
+        let inputPreemptionSignal = InputPreemptionSignal()
         let displayCommitSignal = DisplayCommitSignal()
         machine.virtioNetwork.attachNetworkBackend(networkBridge)
+        machine.virtioDisplay.attachGraphicsAccelerator(graphicsAccelerator)
         networkBridge.onFramesAvailable = { [weak networkDevice = machine.virtioNetwork, weak hostWakeSignal] in
             networkDevice?.pumpNetworkReceiveQueue()
             hostWakeSignal?.signal()
@@ -1024,10 +1087,21 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
 
         machine.vm.timerCyclesPerInstruction = 1
         machine.vm.wallClockRunBudgetNanoseconds = 20_000_000
+        machine.vm.nativeCheckpointBlockInterval = 512
+        machine.vm.hostPreemptionGenerationProvider = { [weak inputPreemptionSignal] in
+            inputPreemptionSignal?.currentGeneration ?? 0
+        }
         if let backend = machine.vm.backend as? SoftwareARM64Backend {
             backend.enableBasicBlockExecution = true
-            backend.fallbackInterpreterPolicy = .alwaysAllow
+            backend.fallbackInterpreterPolicy = .nativeOnly
         }
+        machine.parallelVCPUCluster?.configureExecution(
+            timerCyclesPerInstruction: machine.vm.timerCyclesPerInstruction,
+            wallClockRunBudgetNanoseconds: machine.vm.wallClockRunBudgetNanoseconds,
+            nativeCheckpointBlockInterval: machine.vm.nativeCheckpointBlockInterval,
+            hostPreemptionGenerationProvider: machine.vm.hostPreemptionGenerationProvider,
+            fallbackInterpreterPolicy: .nativeOnly
+        )
         machine.vm.exceptionStormThreshold = 0
         machine.vm.systemRegisterTraceCapacity = 0
         machine.vm.systemRegisterReadTraceCapacity = 0
@@ -1038,14 +1112,24 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
 
         self.machine = machine
+        self.graphicsAccelerator = graphicsAccelerator
         self.networkBridge = networkBridge
         self.hostWakeSignal = hostWakeSignal
+        self.inputPreemptionSignal = inputPreemptionSignal
         self.displayCommitSignal = displayCommitSignal
         self.uartOutputBuffer = uartOutputBuffer
         self.onUART = onUART
         self.loadResult = result
         self.backendName = machine.vm.backend.name
         self.diskPersistenceURL = diskPersistenceURL
+    }
+
+    deinit {
+        stopExecution()
+    }
+
+    func stopExecution() {
+        machine.parallelVCPUCluster?.stop()
     }
 
     var pc: UInt64 {
@@ -1074,6 +1158,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
         lock.unlock()
         if appendedInput {
+            inputPreemptionSignal.signal()
             hostWakeSignal.signal()
         }
     }
@@ -1125,6 +1210,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         latestTouchDeliveredNanoseconds = nil
 
         lock.unlock()
+        inputPreemptionSignal.signal()
         hostWakeSignal.signal()
     }
 
@@ -1141,6 +1227,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         pendingKeyboardEvents.append(contentsOf: events.suffix(Self.maximumPendingKeyboardEvents))
         lastHostActivityNanoseconds = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
+        inputPreemptionSignal.signal()
         hostWakeSignal.signal()
     }
 
@@ -1156,6 +1243,13 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     var hasSeenShellPrompt: Bool {
         lock.lock()
         let result = shellPromptSeen
+        lock.unlock()
+        return result
+    }
+
+    var hasInteractiveWorkloadReady: Bool {
+        lock.lock()
+        let result = interactiveWorkloadReady
         lock.unlock()
         return result
     }
@@ -1229,6 +1323,15 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
         let touches = drainTouches()
         if !touches.isEmpty {
+#if targetEnvironment(simulator)
+            if touches.contains(where: \.isDown),
+               ProcessInfo.processInfo.environment[
+                   "PINECONE_SIMULATOR_RESET_HOT_PC_ON_TOUCH"
+               ] == "1" {
+                (machine.vm.backend as? SoftwareARM64Backend)?
+                    .resetNativeHotPCProfile()
+            }
+#endif
             let injectionTime = DispatchTime.now().uptimeNanoseconds
             let baselineGeneration = machine.virtioDisplay.displayGeneration ?? 0
             lock.lock()
@@ -1280,6 +1383,13 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
                 return RunResult(steps: totalSteps, stopReason: result.stopReason, lastException: lastException)
             }
             stepsRemaining -= result.steps
+            if hasPendingInput {
+                return RunResult(
+                    steps: totalSteps,
+                    stopReason: .maxSteps(totalSteps),
+                    lastException: lastException
+                )
+            }
         }
 
         return RunResult(steps: totalSteps, stopReason: .maxSteps(maxSteps), lastException: lastException)
@@ -1299,7 +1409,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
 
         guard shouldIdle,
               !networkBridge.hasPendingAsynchronousTraffic,
-              machine.vm.interruptController.peekPending() == nil else {
+              !machine.vm.hasPendingInterruptForAnyVirtualCPU else {
             return nil
         }
         return generation
@@ -1391,7 +1501,12 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         } ?? ""
         let hotPCs = softwareBackend?
             .nativeHotPCSnapshot(limit: 3)
-            .map { "\(Self.hex($0.pc))/\($0.samples)" }
+            .map {
+                let words = $0.instructions
+                    .map { String(format: "%08x", $0) }
+                    .joined(separator: ".")
+                return "\(Self.hex($0.pc))/\($0.samples)/\(words)"
+            }
             .joined(separator: ",") ?? ""
         let hotPCTrace = hotPCs.isEmpty ? "" : " hpc=\(hotPCs)"
         let network = " net=tx\(networkBridge.transmittedFrameCount)" +
@@ -1400,9 +1515,31 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             "/tcp\(networkBridge.activeTCPConnectionCount)"
         let displayDiagnostics = machine.virtioDisplay.displayDiagnostics
         let display = displayDiagnostics.isEmpty ? "" : " \(displayDiagnostics)"
+        let metalDiagnostics = graphicsAccelerator?.diagnosticsSummary ?? ""
+        let metal = metalDiagnostics.isEmpty ? "" : " \(metalDiagnostics)"
         let presentation = displayCommitSignal.diagnosticsSummary
         let latencyText = latency.map { " input=\(String(format: "%.1f", $0))ms" } ?? ""
         let touch = touchPipelineDiagnostics()
+        let interruptDiagnostics: String
+#if targetEnvironment(simulator)
+        if ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1" {
+            let controller = machine.vm.interruptController
+            let diagnostics = controller.diagnostics()
+            let pending = diagnostics.pendingLines.contains(33) ? 1 : 0
+            let active = diagnostics.activeLines.contains(33) ? 1 : 0
+            let enabled = diagnostics.enabledLines.contains(33) ? 1 : 0
+            interruptDiagnostics =
+                " uart=rx\(machine.uart.receiveFIFOCount)" +
+                "/raw\(String(machine.uart.rawInterruptStatusValue, radix: 16))" +
+                "/mask\(String(machine.uart.interruptMaskValue, radix: 16))" +
+                "/t\(String(controller.targetMask(line: 33), radix: 16))" +
+                "/p\(pending)/a\(active)/e\(enabled)"
+        } else {
+            interruptDiagnostics = ""
+        }
+#else
+        interruptDiagnostics = ""
+#endif
         let translationDiagnostics: String
 #if targetEnvironment(simulator)
         if ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1" {
@@ -1443,10 +1580,47 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
 #else
         translationDiagnostics = ""
 #endif
-        return "\(throughputText)\(fallback)\(unsupported)\(latencyText)" +
-            " pc=\(Self.hex(machine.vm.cpu.pc))\(network)\(display)\(presentation)" +
-            "\(touch)\(trace)\(generic)\(semanticFastPath)\(hotPCTrace)" +
-            "\(translationDiagnostics)"
+        let virtualCPUDetails: String
+#if targetEnvironment(simulator)
+        if ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1" {
+            virtualCPUDetails = machine.vm.virtualCPUStates.map { state in
+                let lifecycle = String(state.lifecycle.rawValue.prefix(1))
+                return "\(state.id):\(lifecycle)@\(Self.hex(state.cpu.pc))" +
+                    "/sp\(Self.hex(state.cpu.sp))/el\(state.cpu.currentExceptionLevel)"
+            }.joined(separator: ",")
+        } else {
+            virtualCPUDetails = ""
+        }
+#else
+        virtualCPUDetails = ""
+#endif
+        let virtualCPUs = " vcpu=\(machine.vm.activeVCPUID + 1)/\(machine.vm.virtualCPUCount)" +
+            "/w\(machine.vm.waitingVirtualCPUCount)" +
+            (virtualCPUDetails.isEmpty ? "" : "[\(virtualCPUDetails)]")
+        let parallelVCPUs = machine.parallelVCPUCluster?.diagnosticsSummary ?? ""
+        let timelineSnapshot = performanceTimeline.snapshot()
+        let shellMilliseconds = timelineSnapshot.elapsedMilliseconds[
+            VMPerformanceMilestone.shellPrompt.rawValue
+        ]
+        let frameMilliseconds = timelineSnapshot.elapsedMilliseconds[
+            VMPerformanceMilestone.firstVisibleFrame.rawValue
+        ]
+        let workloadStartMilliseconds = timelineSnapshot.elapsedMilliseconds[
+            VMPerformanceMilestone.interactiveWorkloadStarted.rawValue
+        ]
+        let workloadReadyMilliseconds = timelineSnapshot.elapsedMilliseconds[
+            VMPerformanceMilestone.interactiveWorkloadReady.rawValue
+        ]
+        let bootTimeline = " boot=" +
+            (shellMilliseconds.map { String(format: "%.0f", $0) } ?? "-") + "/" +
+            (frameMilliseconds.map { String(format: "%.0f", $0) } ?? "-") + "ms"
+        let workloadTimeline = " workload=" +
+            (workloadStartMilliseconds.map { String(format: "%.0f", $0) } ?? "-") + "/" +
+            (workloadReadyMilliseconds.map { String(format: "%.0f", $0) } ?? "-") + "ms"
+        return "\(throughputText)\(fallback)\(unsupported)\(latencyText)\(virtualCPUs)\(parallelVCPUs)" +
+            " pc=\(Self.hex(machine.vm.cpu.pc))\(network)\(display)\(metal)\(presentation)" +
+            "\(touch)\(interruptDiagnostics)\(trace)\(generic)\(semanticFastPath)\(hotPCTrace)" +
+            "\(translationDiagnostics)\(bootTimeline)\(workloadTimeline)"
     }
 
     var displayCommitSnapshot: DisplayCommitSignal.Snapshot {
@@ -1490,6 +1664,12 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             metadata: metadata,
             timestampNanoseconds: publishedAtNanoseconds
         )
+        performanceTimeline.recordFramePublished(
+            generation: metadata.generation,
+            committedAtNanoseconds: metadata.commitTimestampNanoseconds,
+            publishedAtNanoseconds: publishedAtNanoseconds,
+            damagedByteCount: metadata.damagedByteCount
+        )
 
         lock.lock()
         let latencySensitive = isTouchLatencySensitiveLocked(now: publishedAtNanoseconds)
@@ -1512,12 +1692,15 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             to: &touchFrameToPublishSamples
         )
         if let queued = latestTouchQueuedNanoseconds {
+            let endToEnd = publishedAtNanoseconds &- queued
             Self.appendLatencySampleLocked(
-                publishedAtNanoseconds &- queued,
+                endToEnd,
                 to: &touchEndToEndSamples
             )
+            performanceTimeline.recordTouchLatency(nanoseconds: endToEnd)
         }
         lock.unlock()
+        writePerformanceMetricsIfRequested()
     }
 
     func recordDisplayPresented(
@@ -1530,6 +1713,28 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             uploadedBytes: uploadedBytes,
             timestampNanoseconds: presentedAtNanoseconds
         )
+        performanceTimeline.recordFramePresented(
+            generation: generation,
+            presentedAtNanoseconds: presentedAtNanoseconds,
+            uploadedByteCount: uploadedBytes
+        )
+        lock.lock()
+        let shouldWriteMetrics = !wrotePresentedFrameMetrics
+        wrotePresentedFrameMetrics = true
+        lock.unlock()
+        if shouldWriteMetrics {
+            writePerformanceMetricsIfRequested()
+        }
+    }
+
+    func beginInteractiveWorkloadProfile() {
+        _ = performanceTimeline.mark(.interactiveWorkloadStarted)
+#if targetEnvironment(simulator)
+        if ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_HOT_PC_PROFILE"] == "1" {
+            (machine.vm.backend as? SoftwareARM64Backend)?.resetNativeHotPCProfile()
+        }
+#endif
+        writePerformanceMetricsIfRequested()
     }
 
     private func noteVisibleDisplayContent(metadata: VirtualFramebufferFrameMetadata) {
@@ -1598,6 +1803,9 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         lock.lock()
         displayContentVisible = true
         lock.unlock()
+        if performanceTimeline.mark(.firstVisibleFrame) {
+            writePerformanceMetricsIfRequested()
+        }
     }
 
 #if targetEnvironment(simulator)
@@ -1785,22 +1993,47 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
 
     private func recordShellPromptIfNeeded(_ bytes: [UInt8]) {
         lock.lock()
-        defer { lock.unlock() }
-        guard !shellPromptSeen else {
-            return
-        }
-
         uartPromptTail += String(decoding: bytes, as: UTF8.self)
-        if uartPromptTail.count > 512 {
-            uartPromptTail.removeFirst(uartPromptTail.count - 512)
+        if uartPromptTail.count > 1_024 {
+            uartPromptTail.removeFirst(uartPromptTail.count - 1_024)
         }
-        let foundPrompt = uartPromptTail.contains("arm64viz-root:~#") ||
-            uartPromptTail.contains("arm64viz-root #")
+        let foundPrompt = !shellPromptSeen && (
+            uartPromptTail.contains("arm64viz-root:~#") ||
+                uartPromptTail.contains("arm64viz-root #")
+        )
+        let foundWorkloadReady = uartPromptTail.contains("Phosh ready after")
         if foundPrompt {
             shellPromptSeen = true
             displayContentVisible = false
             displayBlankedAfterShell = false
         }
+        if foundWorkloadReady {
+            interactiveWorkloadReady = true
+        }
+        lock.unlock()
+        if foundPrompt, performanceTimeline.mark(.shellPrompt) {
+            writePerformanceMetricsIfRequested()
+        }
+        if foundWorkloadReady, performanceTimeline.mark(.interactiveWorkloadReady) {
+            writePerformanceMetricsIfRequested()
+        }
+    }
+
+    private func writePerformanceMetricsIfRequested() {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["PINECONE_WRITE_PERFORMANCE_METRICS"] == "1" ||
+                environment["PINECONE_SIMULATOR_WRITE_PERFORMANCE_METRICS"] == "1",
+        let cacheDirectory = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first,
+        let data = try? JSONEncoder().encode(performanceTimeline.snapshot()) else {
+            return
+        }
+        try? data.write(
+            to: cacheDirectory.appendingPathComponent("pinecone-performance.json"),
+            options: .atomic
+        )
     }
 
     private var shouldUseFrequentNetworkPumps: Bool {
@@ -1859,6 +2092,24 @@ private final class HostWakeSignal: @unchecked Sendable {
         let continuation = waiters.removeValue(forKey: identifier)
         lock.unlock()
         continuation?.resume()
+    }
+}
+
+private final class InputPreemptionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    var currentGeneration: UInt64 {
+        lock.lock()
+        let value = generation
+        lock.unlock()
+        return value
+    }
+
+    func signal() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
     }
 }
 

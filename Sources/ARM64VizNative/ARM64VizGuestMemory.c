@@ -1,6 +1,7 @@
 #include "ARM64VizNative.h"
 
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/mman.h>
 
@@ -44,9 +45,13 @@ typedef struct {
 struct AVZGuestMemory {
     uint8_t *bytes;
     size_t size;
-    uint64_t *page_epochs;
+    _Atomic uint64_t *page_epochs;
+    _Atomic uint64_t *page_write_generations;
     size_t page_count;
-    uint64_t current_epoch;
+    _Atomic uint64_t current_epoch;
+    _Atomic uint64_t current_write_generation;
+    _Atomic uint64_t translation_epoch;
+    atomic_flag write_lock;
 };
 
 struct AVZNativeMemoryFastPath {
@@ -80,12 +85,14 @@ struct AVZNativeMemoryFastPath {
     uint8_t write_replacement[AVZ_FAST_TLB_SET_COUNT];
     uint8_t instruction_replacement[AVZ_FAST_TLB_SET_COUNT];
     AVZNativeThreadRegisterState thread_registers;
+    AVZNativeArchitecturalState architectural_state;
     AVZNativeStage1TranslationState translation_state;
     uint64_t low_translation_context_tag;
     uint64_t high_translation_context_tag;
     uint64_t low_translation_context_hash;
     uint64_t high_translation_context_hash;
     uint64_t translation_generation;
+    uint64_t observed_shared_translation_epoch;
     uint8_t native_translation_enabled;
     uint8_t translation_fault_pending;
     AVZNativeMemoryFastPathStatistics statistics;
@@ -110,10 +117,24 @@ static uint16_t avz_system_register_key(uint32_t instruction) {
     ))
 
 enum {
+    AVZ_SYSREG_SPSR_EL1 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 4, 0, 0),
+    AVZ_SYSREG_ELR_EL1 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 4, 0, 1),
+    AVZ_SYSREG_SP_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 4, 1, 0),
+    AVZ_SYSREG_ESR_EL1 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 5, 2, 0),
+    AVZ_SYSREG_FAR_EL1 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 6, 0, 0),
+    AVZ_SYSREG_VBAR_EL1 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 12, 0, 0),
     AVZ_SYSREG_CONTEXTIDR_EL1 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 13, 0, 1),
     AVZ_SYSREG_TPIDR_EL1 = AVZ_SYSTEM_REGISTER_KEY(3, 0, 13, 0, 4),
     AVZ_SYSREG_TPIDR_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 13, 0, 2),
-    AVZ_SYSREG_TPIDRRO_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 13, 0, 3)
+    AVZ_SYSREG_TPIDRRO_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 13, 0, 3),
+    AVZ_SYSREG_CNTPCT_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 0, 1),
+    AVZ_SYSREG_CNTVCT_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 0, 2),
+    AVZ_SYSREG_CNTP_TVAL_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 2, 0),
+    AVZ_SYSREG_CNTP_CTL_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 2, 1),
+    AVZ_SYSREG_CNTP_CVAL_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 2, 2),
+    AVZ_SYSREG_CNTV_TVAL_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 3, 0),
+    AVZ_SYSREG_CNTV_CTL_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 3, 1),
+    AVZ_SYSREG_CNTV_CVAL_EL0 = AVZ_SYSTEM_REGISTER_KEY(3, 3, 14, 3, 2)
 };
 
 AVZGuestMemory *avz_guest_memory_create(size_t size) {
@@ -149,7 +170,20 @@ AVZGuestMemory *avz_guest_memory_create(size_t size) {
         free(memory);
         return 0;
     }
-    memory->current_epoch = 1;
+    memory->page_write_generations = calloc(
+        memory->page_count,
+        sizeof(*memory->page_write_generations)
+    );
+    if (memory->page_write_generations == NULL) {
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    atomic_init(&memory->current_epoch, 1);
+    atomic_init(&memory->current_write_generation, 1);
+    atomic_init(&memory->translation_epoch, 1);
+    atomic_flag_clear(&memory->write_lock);
     return memory;
 }
 
@@ -161,7 +195,68 @@ void avz_guest_memory_destroy(AVZGuestMemory *memory) {
         munmap(memory->bytes, memory->size);
     }
     free(memory->page_epochs);
+    free(memory->page_write_generations);
     free(memory);
+}
+
+void avz_guest_memory_note_write(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return;
+    }
+    avz_guest_memory_mark_dirty(memory, offset, byte_count);
+    uint64_t generation = atomic_fetch_add_explicit(
+        &memory->current_write_generation,
+        1,
+        memory_order_acq_rel
+    ) + 1;
+    if (generation == 0) {
+        generation = 1;
+        atomic_store_explicit(
+            &memory->current_write_generation,
+            generation,
+            memory_order_release
+        );
+    }
+    const size_t first_page = offset >> AVZ_FAST_PAGE_SHIFT;
+    const size_t last_page =
+        (offset + byte_count - 1u) >> AVZ_FAST_PAGE_SHIFT;
+    for (size_t page = first_page; page <= last_page; page++) {
+        atomic_store_explicit(
+            &memory->page_write_generations[page],
+            generation,
+            memory_order_release
+        );
+    }
+}
+
+void avz_guest_memory_invalidate_translations(AVZGuestMemory *memory) {
+    if (memory == NULL) {
+        return;
+    }
+    uint64_t epoch = atomic_fetch_add_explicit(
+        &memory->translation_epoch,
+        1,
+        memory_order_acq_rel
+    ) + 1;
+    if (epoch == 0) {
+        atomic_store_explicit(
+            &memory->translation_epoch,
+            1,
+            memory_order_release
+        );
+    }
+}
+
+uint64_t avz_guest_memory_translation_epoch(const AVZGuestMemory *memory) {
+    return memory == NULL ? 0 : atomic_load_explicit(
+        &memory->translation_epoch,
+        memory_order_acquire
+    );
 }
 
 uint8_t *avz_guest_memory_bytes(AVZGuestMemory *memory) {
@@ -184,10 +279,16 @@ void avz_guest_memory_mark_dirty(
     const size_t first_page = offset >> AVZ_FAST_PAGE_SHIFT;
     const size_t last_page =
         (offset + byte_count - 1u) >> AVZ_FAST_PAGE_SHIFT;
+    const uint64_t current_epoch = atomic_load_explicit(
+        &memory->current_epoch,
+        memory_order_relaxed
+    );
     for (size_t page = first_page; page <= last_page; page++) {
-        if (memory->page_epochs[page] != memory->current_epoch) {
-            memory->page_epochs[page] = memory->current_epoch;
-        }
+        atomic_store_explicit(
+            &memory->page_epochs[page],
+            current_epoch,
+            memory_order_release
+        );
     }
 }
 
@@ -195,9 +296,18 @@ uint64_t avz_guest_memory_advance_dirty_epoch(AVZGuestMemory *memory) {
     if (memory == NULL) {
         return 0;
     }
-    const uint64_t completed_epoch = memory->current_epoch;
-    if (memory->current_epoch != UINT64_MAX) {
-        memory->current_epoch++;
+    uint64_t completed_epoch = atomic_load_explicit(
+        &memory->current_epoch,
+        memory_order_acquire
+    );
+    while (completed_epoch != UINT64_MAX &&
+           !atomic_compare_exchange_weak_explicit(
+               &memory->current_epoch,
+               &completed_epoch,
+               completed_epoch + 1,
+               memory_order_acq_rel,
+               memory_order_acquire
+           )) {
     }
     return completed_epoch;
 }
@@ -224,7 +334,10 @@ size_t avz_guest_memory_dirty_ranges(
     size_t range_count = 0;
     size_t page = first_page;
     while (page <= last_page) {
-        const uint64_t epoch = memory->page_epochs[page];
+        const uint64_t epoch = atomic_load_explicit(
+            &memory->page_epochs[page],
+            memory_order_acquire
+        );
         if (epoch <= after_epoch || epoch > through_epoch) {
             page++;
             continue;
@@ -236,7 +349,10 @@ size_t avz_guest_memory_dirty_ranges(
             if (page > last_page) {
                 break;
             }
-            const uint64_t next_epoch = memory->page_epochs[page];
+            const uint64_t next_epoch = atomic_load_explicit(
+                &memory->page_epochs[page],
+                memory_order_acquire
+            );
             if (next_epoch <= after_epoch || next_epoch > through_epoch) {
                 break;
             }
@@ -276,7 +392,7 @@ static void avz_fast_mark_dirty(
     if (offset > SIZE_MAX) {
         return;
     }
-    avz_guest_memory_mark_dirty(
+    avz_guest_memory_note_write(
         fast_path->guest_memory,
         (size_t)offset,
         byte_count
@@ -308,6 +424,23 @@ static void avz_fast_clear_tlbs(AVZNativeMemoryFastPath *fast_path) {
     fast_path->read_hot.valid = 0;
     fast_path->write_hot.valid = 0;
     fast_path->instruction_hot.valid = 0;
+}
+
+static void avz_fast_synchronize_shared_translation_epoch(
+    AVZNativeMemoryFastPath *fast_path
+) {
+    if (fast_path == NULL || fast_path->guest_memory == NULL) {
+        return;
+    }
+    const uint64_t epoch = atomic_load_explicit(
+        &fast_path->guest_memory->translation_epoch,
+        memory_order_acquire
+    );
+    if (epoch == fast_path->observed_shared_translation_epoch) {
+        return;
+    }
+    avz_fast_clear_tlbs(fast_path);
+    fast_path->observed_shared_translation_epoch = epoch;
 }
 
 static int avz_stage1_translation_state_equal(
@@ -422,7 +555,15 @@ static int avz_stage1_read_descriptor(
         sizeof(*descriptor) > fast_path->ram_size - offset) {
         return 0;
     }
-    memcpy(descriptor, fast_path->ram + offset, sizeof(*descriptor));
+    const uint8_t *host_address = fast_path->ram + offset;
+    if (((uintptr_t)host_address & (sizeof(*descriptor) - 1u)) == 0) {
+        *descriptor = __atomic_load_n(
+            (const uint64_t *)host_address,
+            __ATOMIC_ACQUIRE
+        );
+    } else {
+        memcpy(descriptor, host_address, sizeof(*descriptor));
+    }
     return 1;
 }
 
@@ -650,6 +791,7 @@ static int avz_fast_translate(
         !avz_fast_width_supported(width)) {
         return 0;
     }
+    avz_fast_synchronize_shared_translation_epoch(fast_path);
     uint64_t page_offset = virtual_address & (AVZ_FAST_PAGE_SIZE - 1u);
     if (page_offset + width > AVZ_FAST_PAGE_SIZE) {
         return 0;
@@ -785,6 +927,37 @@ static uint64_t avz_fast_load(
     const uint8_t *host_address,
     uint8_t width
 ) {
+    const uintptr_t address = (uintptr_t)host_address;
+    switch (width) {
+    case 1:
+        return __atomic_load_n(host_address, __ATOMIC_ACQUIRE);
+    case 2:
+        if ((address & 1u) == 0) {
+            return __atomic_load_n(
+                (const uint16_t *)host_address,
+                __ATOMIC_ACQUIRE
+            );
+        }
+        break;
+    case 4:
+        if ((address & 3u) == 0) {
+            return __atomic_load_n(
+                (const uint32_t *)host_address,
+                __ATOMIC_ACQUIRE
+            );
+        }
+        break;
+    case 8:
+        if ((address & 7u) == 0) {
+            return __atomic_load_n(
+                (const uint64_t *)host_address,
+                __ATOMIC_ACQUIRE
+            );
+        }
+        break;
+    default:
+        break;
+    }
     uint64_t value = 0;
     memcpy(&value, host_address, width);
     return value;
@@ -803,6 +976,7 @@ static int avz_fast_translate_instruction(
         (virtual_address & 3u) != 0) {
         return 0;
     }
+    avz_fast_synchronize_shared_translation_epoch(fast_path);
 
     uint64_t page_offset = virtual_address & (AVZ_FAST_PAGE_SIZE - 1u);
     if (page_offset > AVZ_FAST_PAGE_SIZE - sizeof(uint32_t)) {
@@ -933,7 +1107,26 @@ static void avz_fast_store(
     uint8_t width,
     uint64_t value
 ) {
-    memcpy(host_address, &value, width);
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    if (memory != NULL) {
+        while (atomic_flag_test_and_set_explicit(
+            &memory->write_lock,
+            memory_order_acquire
+        )) {
+        }
+    }
+    const uintptr_t address = (uintptr_t)host_address;
+    if (width == 1) {
+        __atomic_store_n(host_address, (uint8_t)value, __ATOMIC_RELEASE);
+    } else if (width == 2 && (address & 1u) == 0) {
+        __atomic_store_n((uint16_t *)host_address, (uint16_t)value, __ATOMIC_RELEASE);
+    } else if (width == 4 && (address & 3u) == 0) {
+        __atomic_store_n((uint32_t *)host_address, (uint32_t)value, __ATOMIC_RELEASE);
+    } else if (width == 8 && (address & 7u) == 0) {
+        __atomic_store_n((uint64_t *)host_address, value, __ATOMIC_RELEASE);
+    } else {
+        memcpy(host_address, &value, width);
+    }
     avz_fast_mark_dirty(fast_path, physical_address, width);
     if (fast_path->block_cache != 0) {
         avz_native_block_cache_invalidate_physical_range(
@@ -942,6 +1135,326 @@ static void avz_fast_store(
             width
         );
     }
+    if (memory != NULL) {
+        atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    }
+}
+
+static uint64_t avz_guest_memory_write_generation(
+    const AVZGuestMemory *memory,
+    uint64_t physical_address,
+    uint64_t ram_base,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || physical_address < ram_base) {
+        return 0;
+    }
+    const uint64_t raw_offset = physical_address - ram_base;
+    if (raw_offset > SIZE_MAX || (size_t)raw_offset >= memory->size ||
+        byte_count > memory->size - (size_t)raw_offset) {
+        return 0;
+    }
+    const size_t offset = (size_t)raw_offset;
+    const size_t first_page = offset >> AVZ_FAST_PAGE_SHIFT;
+    const size_t last_page =
+        (offset + byte_count - 1u) >> AVZ_FAST_PAGE_SHIFT;
+    uint64_t generation = 0;
+    for (size_t page = first_page; page <= last_page; page++) {
+        const uint64_t candidate = atomic_load_explicit(
+            &memory->page_write_generations[page],
+            memory_order_acquire
+        );
+        if (candidate > generation) {
+            generation = candidate;
+        }
+    }
+    return generation;
+}
+
+uint64_t avz_guest_memory_page_write_generation(
+    const AVZGuestMemory *memory,
+    uint64_t physical_page,
+    uint64_t ram_base
+) {
+    return avz_guest_memory_write_generation(
+        memory,
+        physical_page,
+        ram_base,
+        AVZ_FAST_PAGE_SIZE
+    );
+}
+
+int avz_native_fast_memory_reservation_generation(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *generation
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t physical_address = 0;
+    uint8_t *host_address = NULL;
+    if (generation == NULL || fast_path == NULL ||
+        fast_path->guest_memory == NULL ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address,
+            width,
+            0,
+            &physical_address,
+            &host_address
+        ) != AVZ_FAST_TRANSLATION_RAM) {
+        return 0;
+    }
+    *generation = avz_guest_memory_write_generation(
+        fast_path->guest_memory,
+        physical_address,
+        fast_path->ram_base,
+        width
+    );
+    return 1;
+}
+
+int avz_native_fast_memory_exclusive_read(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *value,
+    uint64_t *generation
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t physical_address = 0;
+    uint8_t *host_address = NULL;
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        value == NULL || generation == NULL ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address,
+            width,
+            0,
+            &physical_address,
+            &host_address
+        ) != AVZ_FAST_TRANSLATION_RAM) {
+        return 0;
+    }
+
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    while (atomic_flag_test_and_set_explicit(
+        &memory->write_lock,
+        memory_order_acquire
+    )) {
+    }
+    *value = avz_fast_load(host_address, width);
+    *generation = avz_guest_memory_write_generation(
+        memory,
+        physical_address,
+        fast_path->ram_base,
+        width
+    );
+    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    return 1;
+}
+
+int avz_native_fast_memory_exclusive_read_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *first_value,
+    uint64_t *second_value,
+    uint64_t *generation
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t first_physical = 0;
+    uint64_t second_physical = 0;
+    uint8_t *first_host = NULL;
+    uint8_t *second_host = NULL;
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        first_value == NULL || second_value == NULL || generation == NULL ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address,
+            width,
+            0,
+            &first_physical,
+            &first_host
+        ) != AVZ_FAST_TRANSLATION_RAM ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address + width,
+            width,
+            0,
+            &second_physical,
+            &second_host
+        ) != AVZ_FAST_TRANSLATION_RAM) {
+        return 0;
+    }
+
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    while (atomic_flag_test_and_set_explicit(
+        &memory->write_lock,
+        memory_order_acquire
+    )) {
+    }
+    *first_value = avz_fast_load(first_host, width);
+    *second_value = avz_fast_load(second_host, width);
+    const uint64_t first_generation = avz_guest_memory_write_generation(
+        memory,
+        first_physical,
+        fast_path->ram_base,
+        width
+    );
+    const uint64_t second_generation = avz_guest_memory_write_generation(
+        memory,
+        second_physical,
+        fast_path->ram_base,
+        width
+    );
+    *generation = first_generation > second_generation
+        ? first_generation
+        : second_generation;
+    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    return 1;
+}
+
+int avz_native_fast_memory_exclusive_write(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t value,
+    uint64_t expected_generation
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t physical_address = 0;
+    uint8_t *host_address = NULL;
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address,
+            width,
+            1,
+            &physical_address,
+            &host_address
+        ) != AVZ_FAST_TRANSLATION_RAM) {
+        return -1;
+    }
+
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    while (atomic_flag_test_and_set_explicit(
+        &memory->write_lock,
+        memory_order_acquire
+    )) {
+    }
+    const uint64_t current_generation = avz_guest_memory_write_generation(
+        memory,
+        physical_address,
+        fast_path->ram_base,
+        width
+    );
+    if (current_generation != expected_generation) {
+        atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+        return 0;
+    }
+
+    const uintptr_t address = (uintptr_t)host_address;
+    if (width == 1) {
+        __atomic_store_n(host_address, (uint8_t)value, __ATOMIC_RELEASE);
+    } else if (width == 2 && (address & 1u) == 0) {
+        __atomic_store_n((uint16_t *)host_address, (uint16_t)value, __ATOMIC_RELEASE);
+    } else if (width == 4 && (address & 3u) == 0) {
+        __atomic_store_n((uint32_t *)host_address, (uint32_t)value, __ATOMIC_RELEASE);
+    } else if (width == 8 && (address & 7u) == 0) {
+        __atomic_store_n((uint64_t *)host_address, value, __ATOMIC_RELEASE);
+    } else {
+        memcpy(host_address, &value, width);
+    }
+    avz_fast_mark_dirty(fast_path, physical_address, width);
+    if (fast_path->block_cache != NULL) {
+        avz_native_block_cache_invalidate_physical_range(
+            fast_path->block_cache,
+            physical_address,
+            width
+        );
+    }
+    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    return 1;
+}
+
+int avz_native_fast_memory_exclusive_write_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t first_value,
+    uint64_t second_value,
+    uint64_t expected_generation
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t first_physical = 0;
+    uint64_t second_physical = 0;
+    uint8_t *first_host = NULL;
+    uint8_t *second_host = NULL;
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address,
+            width,
+            1,
+            &first_physical,
+            &first_host
+        ) != AVZ_FAST_TRANSLATION_RAM ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address + width,
+            width,
+            1,
+            &second_physical,
+            &second_host
+        ) != AVZ_FAST_TRANSLATION_RAM) {
+        return -1;
+    }
+
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    while (atomic_flag_test_and_set_explicit(
+        &memory->write_lock,
+        memory_order_acquire
+    )) {
+    }
+    const uint64_t first_generation = avz_guest_memory_write_generation(
+        memory,
+        first_physical,
+        fast_path->ram_base,
+        width
+    );
+    const uint64_t second_generation = avz_guest_memory_write_generation(
+        memory,
+        second_physical,
+        fast_path->ram_base,
+        width
+    );
+    const uint64_t current_generation = first_generation > second_generation
+        ? first_generation
+        : second_generation;
+    if (current_generation != expected_generation) {
+        atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+        return 0;
+    }
+
+    memcpy(first_host, &first_value, width);
+    memcpy(second_host, &second_value, width);
+    avz_fast_mark_dirty(fast_path, first_physical, width);
+    avz_fast_mark_dirty(fast_path, second_physical, width);
+    if (fast_path->block_cache != NULL) {
+        avz_native_block_cache_invalidate_physical_range(
+            fast_path->block_cache,
+            first_physical,
+            width
+        );
+        avz_native_block_cache_invalidate_physical_range(
+            fast_path->block_cache,
+            second_physical,
+            width
+        );
+    }
+    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    return 1;
 }
 
 AVZNativeMemoryFastPath *avz_native_memory_fast_path_create(
@@ -1037,6 +1550,11 @@ int avz_native_memory_fast_path_set_guest_memory(
         return 0;
     }
     fast_path->guest_memory = memory;
+    fast_path->observed_shared_translation_epoch = atomic_load_explicit(
+        &memory->translation_epoch,
+        memory_order_acquire
+    );
+    avz_native_block_cache_set_guest_memory(fast_path->block_cache, memory);
     return 1;
 }
 
@@ -1163,6 +1681,87 @@ void avz_native_memory_fast_path_get_thread_registers(
     *state = fast_path == 0
         ? (AVZNativeThreadRegisterState){0}
         : fast_path->thread_registers;
+}
+
+void avz_native_memory_fast_path_set_architectural_state(
+    AVZNativeMemoryFastPath *fast_path,
+    const AVZNativeArchitecturalState *state
+) {
+    if (fast_path == NULL || state == NULL)
+        return;
+    fast_path->architectural_state = *state;
+    fast_path->architectural_state.dirty_mask = 0;
+}
+
+void avz_native_memory_fast_path_get_architectural_state(
+    const AVZNativeMemoryFastPath *fast_path,
+    AVZNativeArchitecturalState *state
+) {
+    if (state == NULL)
+        return;
+    *state = fast_path == NULL
+        ? (AVZNativeArchitecturalState){0}
+        : fast_path->architectural_state;
+}
+
+static int avz_native_timer_asserted(
+    uint64_t control,
+    uint64_t compare,
+    uint64_t counter
+) {
+    return (control & 1u) != 0 && (control & 2u) == 0 && counter >= compare;
+}
+
+static uint64_t avz_native_timer_control(
+    uint64_t control,
+    uint64_t compare,
+    uint64_t counter
+) {
+    return (control & 3u) | (counter >= compare ? 4u : 0u);
+}
+
+static uint64_t avz_native_timer_value(uint64_t compare, uint64_t counter) {
+    return (uint64_t)(uint32_t)(compare - counter);
+}
+
+static uint64_t avz_native_timer_compare_from_value(
+    uint64_t value,
+    uint64_t counter
+) {
+    int64_t offset = (int64_t)(int32_t)(uint32_t)value;
+    return counter + (uint64_t)offset;
+}
+
+int avz_native_memory_fast_path_advance_time(
+    AVZNativeMemoryFastPath *fast_path,
+    uint64_t instruction_count,
+    uint64_t pstate
+) {
+    if (fast_path == NULL)
+        return 0;
+    AVZNativeArchitecturalState *state = &fast_path->architectural_state;
+    state->counter_ticks +=
+        instruction_count * state->timer_cycles_per_instruction;
+    if ((pstate & 0x80u) != 0)
+        return 0;
+    return state->pending_irq ||
+        avz_native_timer_asserted(
+            state->cntp_ctl_el0, state->cntp_cval_el0, state->counter_ticks) ||
+        avz_native_timer_asserted(
+            state->cntv_ctl_el0, state->cntv_cval_el0, state->counter_ticks);
+}
+
+static void avz_native_fast_set_current_el(
+    AVZNativeMemoryFastPath *fast_path,
+    uint64_t pstate
+) {
+    uint8_t current_el = (uint8_t)((pstate >> 2) & 3u);
+    if (fast_path == NULL ||
+        fast_path->translation_state.current_el == current_el)
+        return;
+    fast_path->translation_state.current_el = current_el;
+    avz_fast_refresh_translation_context_tags(fast_path);
+    fast_path->instruction_hot.valid = 0;
 }
 
 int avz_native_fast_memory_read(
@@ -1601,7 +2200,26 @@ int avz_native_fast_read_system_register(
 ) {
     AVZNativeMemoryFastPath *fast_path = context;
     if (fast_path != 0 && value != 0) {
+        AVZNativeArchitecturalState *state = &fast_path->architectural_state;
         switch (avz_system_register_key(instruction)) {
+        case AVZ_SYSREG_SPSR_EL1:
+            *value = state->spsr_el1;
+            break;
+        case AVZ_SYSREG_ELR_EL1:
+            *value = state->elr_el1;
+            break;
+        case AVZ_SYSREG_SP_EL0:
+            *value = (pstate & 1u) == 0 ? sp : state->sp_el0;
+            break;
+        case AVZ_SYSREG_ESR_EL1:
+            *value = state->esr_el1;
+            break;
+        case AVZ_SYSREG_FAR_EL1:
+            *value = state->far_el1;
+            break;
+        case AVZ_SYSREG_VBAR_EL1:
+            *value = state->vbar_el1;
+            break;
         case AVZ_SYSREG_TPIDR_EL0:
             *value = fast_path->thread_registers.tpidr_el0;
             break;
@@ -1613,6 +2231,36 @@ int avz_native_fast_read_system_register(
             break;
         case AVZ_SYSREG_CONTEXTIDR_EL1:
             *value = fast_path->thread_registers.contextidr_el1;
+            break;
+        case AVZ_SYSREG_CNTPCT_EL0:
+        case AVZ_SYSREG_CNTVCT_EL0:
+            *value = state->counter_ticks;
+            break;
+        case AVZ_SYSREG_CNTP_TVAL_EL0:
+            *value = avz_native_timer_value(
+                state->cntp_cval_el0, state->counter_ticks);
+            break;
+        case AVZ_SYSREG_CNTP_CTL_EL0:
+            *value = avz_native_timer_control(
+                state->cntp_ctl_el0,
+                state->cntp_cval_el0,
+                state->counter_ticks);
+            break;
+        case AVZ_SYSREG_CNTP_CVAL_EL0:
+            *value = state->cntp_cval_el0;
+            break;
+        case AVZ_SYSREG_CNTV_TVAL_EL0:
+            *value = avz_native_timer_value(
+                state->cntv_cval_el0, state->counter_ticks);
+            break;
+        case AVZ_SYSREG_CNTV_CTL_EL0:
+            *value = avz_native_timer_control(
+                state->cntv_ctl_el0,
+                state->cntv_cval_el0,
+                state->counter_ticks);
+            break;
+        case AVZ_SYSREG_CNTV_CVAL_EL0:
+            *value = state->cntv_cval_el0;
             break;
         default:
             goto slow_path;
@@ -1644,7 +2292,36 @@ int avz_native_fast_write_system_register(
 ) {
     AVZNativeMemoryFastPath *fast_path = context;
     if (fast_path != 0) {
+        AVZNativeArchitecturalState *state = &fast_path->architectural_state;
         switch (avz_system_register_key(instruction)) {
+        case AVZ_SYSREG_SPSR_EL1:
+            state->spsr_el1 = value;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_SPSR_EL1;
+            break;
+        case AVZ_SYSREG_ELR_EL1:
+            state->elr_el1 = value;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_ELR_EL1;
+            break;
+        case AVZ_SYSREG_SP_EL0:
+            if ((*pstate & 1u) == 0) {
+                *sp = value;
+            } else {
+                state->sp_el0 = value;
+            }
+            state->dirty_mask |= AVZ_NATIVE_ARCH_SP_EL0;
+            break;
+        case AVZ_SYSREG_ESR_EL1:
+            state->esr_el1 = value;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_ESR_EL1;
+            break;
+        case AVZ_SYSREG_FAR_EL1:
+            state->far_el1 = value;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_FAR_EL1;
+            break;
+        case AVZ_SYSREG_VBAR_EL1:
+            state->vbar_el1 = value;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_VBAR_EL1;
+            break;
         case AVZ_SYSREG_TPIDR_EL0:
             fast_path->thread_registers.tpidr_el0 = value;
             fast_path->thread_registers.dirty_mask |=
@@ -1664,6 +2341,32 @@ int avz_native_fast_write_system_register(
             fast_path->thread_registers.contextidr_el1 = value;
             fast_path->thread_registers.dirty_mask |=
                 AVZ_NATIVE_THREAD_REGISTER_CONTEXTIDR_EL1;
+            break;
+        case AVZ_SYSREG_CNTP_TVAL_EL0:
+            state->cntp_cval_el0 = avz_native_timer_compare_from_value(
+                value, state->counter_ticks);
+            state->dirty_mask |= AVZ_NATIVE_ARCH_CNTP_CVAL_EL0;
+            break;
+        case AVZ_SYSREG_CNTP_CTL_EL0:
+            state->cntp_ctl_el0 = value & 3u;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_CNTP_CTL_EL0;
+            break;
+        case AVZ_SYSREG_CNTP_CVAL_EL0:
+            state->cntp_cval_el0 = value;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_CNTP_CVAL_EL0;
+            break;
+        case AVZ_SYSREG_CNTV_TVAL_EL0:
+            state->cntv_cval_el0 = avz_native_timer_compare_from_value(
+                value, state->counter_ticks);
+            state->dirty_mask |= AVZ_NATIVE_ARCH_CNTV_CVAL_EL0;
+            break;
+        case AVZ_SYSREG_CNTV_CTL_EL0:
+            state->cntv_ctl_el0 = value & 3u;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_CNTV_CTL_EL0;
+            break;
+        case AVZ_SYSREG_CNTV_CVAL_EL0:
+            state->cntv_cval_el0 = value;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_CNTV_CVAL_EL0;
             break;
         default:
             goto slow_path;
@@ -1707,6 +2410,23 @@ int avz_native_fast_exception_return(
     uint64_t *pc
 ) {
     AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path != NULL && pstate != NULL && sp != NULL && pc != NULL) {
+        AVZNativeArchitecturalState *state = &fast_path->architectural_state;
+        uint64_t old_pstate = *pstate;
+        uint64_t new_pstate = state->spsr_el1;
+        if ((old_pstate & 1u) == 0) {
+            state->sp_el0 = *sp;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_SP_EL0;
+        } else {
+            state->sp_el1 = *sp;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_SP_EL1;
+        }
+        *sp = (new_pstate & 1u) == 0 ? state->sp_el0 : state->sp_el1;
+        *pstate = new_pstate;
+        *pc = state->elr_el1;
+        avz_native_fast_set_current_el(fast_path, new_pstate);
+        return 1;
+    }
     return fast_path != 0 && fast_path->slow_exception_return != 0
         ? fast_path->slow_exception_return(
             fast_path->slow_context,
@@ -1720,15 +2440,45 @@ int avz_native_fast_exception_return(
 int avz_native_fast_synchronous_exception(
     void *context,
     uint32_t instruction,
+    uint64_t *x31,
     uint64_t *pstate,
     uint64_t *sp,
     uint64_t *pc
 ) {
     AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path != NULL && x31 != NULL && pstate != NULL &&
+        sp != NULL && pc != NULL &&
+        (instruction & 0xffe0001fu) == 0xd4000001u) {
+        AVZNativeArchitecturalState *state = &fast_path->architectural_state;
+        uint64_t previous_pstate = *pstate;
+        uint64_t current_el = (previous_pstate >> 2) & 3u;
+        uint64_t vector_offset = current_el == 0
+            ? 0x400u
+            : ((previous_pstate & 1u) == 0 ? 0u : 0x200u);
+        if ((previous_pstate & 1u) == 0) {
+            state->sp_el0 = *sp;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_SP_EL0;
+        } else {
+            state->sp_el1 = *sp;
+            state->dirty_mask |= AVZ_NATIVE_ARCH_SP_EL1;
+        }
+        state->spsr_el1 = previous_pstate;
+        state->elr_el1 = *pc + 4u;
+        state->esr_el1 = (UINT64_C(0x15) << 26) |
+            ((instruction >> 5) & 0xffffu);
+        state->dirty_mask |= AVZ_NATIVE_ARCH_SPSR_EL1 |
+            AVZ_NATIVE_ARCH_ELR_EL1 | AVZ_NATIVE_ARCH_ESR_EL1;
+        *sp = state->sp_el1;
+        *pstate = UINT64_C(0x3c5);
+        *pc = state->vbar_el1 + vector_offset;
+        avz_native_fast_set_current_el(fast_path, *pstate);
+        return 1;
+    }
     return fast_path != 0 && fast_path->slow_synchronous_exception != 0
         ? fast_path->slow_synchronous_exception(
             fast_path->slow_context,
             instruction,
+            x31,
             pstate,
             sp,
             pc

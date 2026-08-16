@@ -1,0 +1,300 @@
+--- a/drivers/gpu/drm/virtio/virtgpu_submit.c
++++ b/drivers/gpu/drm/virtio/virtgpu_submit.c
+@@ -19,6 +19,183 @@
+ 
+ #include "virtgpu_drv.h"
+ 
++#define PINECONE_2D_MAGIC 0x504e3244U
++#define PINECONE_2D_VERSION 3U
++#define PINECONE_2D_BATCH_VERSION 4U
++#define PINECONE_2D_EXACT_COMPOSITE_VERSION 5U
++#define PINECONE_2D_PAYLOAD_SIZE 64U
++#define PINECONE_2D_BATCH_HEADER_SIZE 16U
++#define PINECONE_2D_MAX_BATCH_COMMANDS 64U
++#define PINECONE_2D_SOURCE_CONTAINS_ALPHA BIT(0)
++#define PINECONE_2D_FILTER_BILINEAR BIT(1)
++#define PINECONE_2D_HAS_MASK BIT(2)
++#define PINECONE_2D_MASK_IS_SOLID BIT(3)
++#define PINECONE_2D_SOURCE_IS_SOLID BIT(4)
++#define PINECONE_2D_MASK_COMPONENT_ALPHA BIT(5)
++#define PINECONE_2D_MASK_PACKED_A8 BIT(6)
++#define PINECONE_2D_LEGACY_FLAGS (PINECONE_2D_SOURCE_CONTAINS_ALPHA | \
++				 PINECONE_2D_FILTER_BILINEAR | \
++				 PINECONE_2D_HAS_MASK | PINECONE_2D_MASK_IS_SOLID)
++#define PINECONE_2D_SUPPORTED_FLAGS (PINECONE_2D_SOURCE_CONTAINS_ALPHA | \
++				    PINECONE_2D_FILTER_BILINEAR | \
++				    PINECONE_2D_HAS_MASK | \
++				    PINECONE_2D_MASK_IS_SOLID | \
++				    PINECONE_2D_SOURCE_IS_SOLID | \
++				    PINECONE_2D_MASK_COMPONENT_ALPHA | \
++				    PINECONE_2D_MASK_PACKED_A8)
++
++struct pinecone_2d_payload {
++	__le32 magic;
++	__le16 version;
++	__le16 operation;
++	__le32 flags;
++	__le32 source_resource_id;
++	__le32 destination_resource_id;
++	__le32 source_x;
++	__le32 source_y;
++	__le32 destination_x;
++	__le32 destination_y;
++	__le32 width;
++	__le32 height;
++	__le32 color;
++	__le32 source_width;
++	__le32 source_height;
++	__le32 mask_resource_id;
++	__le32 mask_alpha;
++};
++
++struct pinecone_2d_batch_header {
++	__le32 magic;
++	__le16 version;
++	__le16 command_count;
++	__le16 record_size;
++	__le16 flags;
++	__le32 byte_count;
++};
++
++static bool pinecone_2d_validate_payload(struct pinecone_2d_payload *payload,
++					 u32 handle_count, bool slots)
++{
++	u32 flags, operation, expected_handles, version;
++	u32 source = le32_to_cpu(payload->source_resource_id);
++	u32 destination = le32_to_cpu(payload->destination_resource_id);
++	u32 mask = le32_to_cpu(payload->mask_resource_id);
++
++	version = le16_to_cpu(payload->version);
++	if (le32_to_cpu(payload->magic) != PINECONE_2D_MAGIC ||
++	    (version != PINECONE_2D_VERSION &&
++	     version != PINECONE_2D_EXACT_COMPOSITE_VERSION) ||
++	    (le32_to_cpu(payload->flags) &
++	     ~(version == PINECONE_2D_VERSION ? PINECONE_2D_LEGACY_FLAGS :
++	       PINECONE_2D_SUPPORTED_FLAGS)))
++		return false;
++	flags = le32_to_cpu(payload->flags);
++	operation = le16_to_cpu(payload->operation);
++	if (!destination || (slots && destination > handle_count))
++		return false;
++	if ((flags & PINECONE_2D_MASK_IS_SOLID) &&
++	    !(flags & PINECONE_2D_HAS_MASK))
++		return false;
++	if ((flags & (PINECONE_2D_MASK_COMPONENT_ALPHA |
++		      PINECONE_2D_MASK_PACKED_A8)) &&
++	    (!(flags & PINECONE_2D_HAS_MASK) ||
++	     (flags & PINECONE_2D_MASK_IS_SOLID)))
++		return false;
++	if (flags & PINECONE_2D_HAS_MASK) {
++		if (flags & PINECONE_2D_MASK_IS_SOLID) {
++			if (mask || le32_to_cpu(payload->mask_alpha) > 255U)
++				return false;
++		} else if (!mask || payload->mask_alpha ||
++			   (slots && (mask > handle_count || mask == destination))) {
++			return false;
++		}
++	} else if (mask || payload->mask_alpha) {
++		return false;
++	}
++	expected_handles = 1U;
++	if ((flags & PINECONE_2D_HAS_MASK) &&
++	    !(flags & PINECONE_2D_MASK_IS_SOLID))
++		expected_handles++;
++
++	if (version == PINECONE_2D_VERSION && (operation == 1 || operation == 2))
++		return source && (!slots ||
++		       (source <= handle_count && source != destination && source != mask)) &&
++		       (slots || handle_count == expected_handles + 1U) &&
++		       payload->source_width && payload->source_height;
++	if (version == PINECONE_2D_VERSION && (operation == 3 || operation == 4))
++		return !source && (slots || handle_count == expected_handles) &&
++		       !(flags & (PINECONE_2D_SOURCE_CONTAINS_ALPHA |
++				  PINECONE_2D_FILTER_BILINEAR)) &&
++		       !payload->source_width && !payload->source_height;
++	if (version != PINECONE_2D_EXACT_COMPOSITE_VERSION ||
++	    (operation != 0 && operation != 1 && operation != 2 &&
++	     operation != 3 && operation != 12))
++		return false;
++	if (operation == 0 || operation == 2)
++		return !source && !(flags & PINECONE_2D_SOURCE_IS_SOLID) &&
++		       (slots || handle_count == expected_handles) &&
++		       !payload->source_width && !payload->source_height;
++	if (flags & PINECONE_2D_SOURCE_IS_SOLID)
++		return !source && (slots || handle_count == expected_handles) &&
++		       !(flags & (PINECONE_2D_SOURCE_CONTAINS_ALPHA |
++				  PINECONE_2D_FILTER_BILINEAR)) &&
++		       !payload->source_width && !payload->source_height;
++	return source && (!slots || (source <= handle_count &&
++	       source != destination && source != mask)) &&
++	       (slots || handle_count == expected_handles + 1U) &&
++	       payload->source_width && payload->source_height;
++}
++
++static bool virtio_gpu_is_pinecone_2d(struct drm_virtgpu_execbuffer *exbuf)
++{
++	struct pinecone_2d_batch_header header;
++	struct pinecone_2d_payload *payloads;
++	u32 command_count, expected_size, i;
++
++	if (exbuf->size < sizeof(header) ||
++	    copy_from_user(&header, u64_to_user_ptr(exbuf->command), sizeof(header)) ||
++	    le32_to_cpu(header.magic) != PINECONE_2D_MAGIC)
++		return false;
++
++	if (le16_to_cpu(header.version) == PINECONE_2D_VERSION ||
++	    le16_to_cpu(header.version) == PINECONE_2D_EXACT_COMPOSITE_VERSION) {
++		struct pinecone_2d_payload payload;
++
++		if (exbuf->size != sizeof(payload) ||
++		    copy_from_user(&payload, u64_to_user_ptr(exbuf->command),
++				   sizeof(payload)))
++			return false;
++		return pinecone_2d_validate_payload(
++			&payload, exbuf->num_bo_handles, false);
++	}
++	if (le16_to_cpu(header.version) != PINECONE_2D_BATCH_VERSION ||
++	    le16_to_cpu(header.flags) != 0 ||
++	    le16_to_cpu(header.record_size) != PINECONE_2D_PAYLOAD_SIZE)
++		return false;
++	command_count = le16_to_cpu(header.command_count);
++	if (!command_count || command_count > PINECONE_2D_MAX_BATCH_COMMANDS)
++		return false;
++	expected_size = PINECONE_2D_BATCH_HEADER_SIZE +
++		command_count * PINECONE_2D_PAYLOAD_SIZE;
++	if (exbuf->size != expected_size ||
++	    le32_to_cpu(header.byte_count) != expected_size ||
++	    !exbuf->num_bo_handles ||
++	    exbuf->num_bo_handles > PINECONE_2D_MAX_BATCH_COMMANDS * 3U)
++		return false;
++	payloads = memdup_user(
++		u64_to_user_ptr(exbuf->command + PINECONE_2D_BATCH_HEADER_SIZE),
++		command_count * sizeof(*payloads));
++	if (IS_ERR(payloads))
++		return false;
++	for (i = 0; i < command_count; i++) {
++		if (!pinecone_2d_validate_payload(
++				&payloads[i], exbuf->num_bo_handles, true))
++			break;
++	}
++	kvfree(payloads);
++	return i == command_count;
++}
++
+ struct virtio_gpu_submit_post_dep {
+ 	struct drm_syncobj *syncobj;
+ 	struct dma_fence_chain *chain;
+@@ -348,10 +525,87 @@
+ 
+ 	if (submit->sync_file)
+ 		fput(submit->sync_file->file);
++}
++
++static void pinecone_2d_translate_slot(struct virtio_gpu_submit *submit,
++				       __le32 *slot)
++{
++	u32 index = le32_to_cpu(*slot);
++	struct virtio_gpu_object *object;
++
++	if (!index)
++		return;
++	object = gem_to_virtio_gpu_obj(submit->buflist->objs[index - 1U]);
++	*slot = cpu_to_le32(object->hw_res_handle);
+ }
+ 
+ static void virtio_gpu_submit(struct virtio_gpu_submit *submit)
+ {
++	if (!submit->vgdev->has_virgl_3d) {
++		struct pinecone_2d_payload *payload = submit->buf;
++		struct pinecone_2d_batch_header *header = submit->buf;
++		struct virtio_gpu_object *source;
++		struct virtio_gpu_object *mask;
++		struct virtio_gpu_object *destination;
++		u32 flags;
++		u16 operation;
++		u32 index = 0;
++
++		if (le16_to_cpu(header->version) == PINECONE_2D_BATCH_VERSION) {
++			u32 command_count = le16_to_cpu(header->command_count);
++			u32 command_index;
++
++			payload = (void *)((u8 *)submit->buf +
++				PINECONE_2D_BATCH_HEADER_SIZE);
++			for (command_index = 0; command_index < command_count;
++			     command_index++) {
++				pinecone_2d_translate_slot(
++					submit, &payload[command_index].source_resource_id);
++				pinecone_2d_translate_slot(
++					submit, &payload[command_index].mask_resource_id);
++				pinecone_2d_translate_slot(
++					submit, &payload[command_index].destination_resource_id);
++			}
++			virtio_gpu_cmd_submit(
++				submit->vgdev, submit->buf, submit->exbuf->size, 0,
++				submit->buflist, submit->out_fence);
++			virtio_gpu_notify(submit->vgdev);
++			return;
++		}
++
++		flags = le32_to_cpu(payload->flags);
++		operation = le16_to_cpu(payload->operation);
++
++		if ((le16_to_cpu(payload->version) == PINECONE_2D_VERSION &&
++		     (operation == 1 || operation == 2)) ||
++		    (le16_to_cpu(payload->version) ==
++		     PINECONE_2D_EXACT_COMPOSITE_VERSION &&
++		     operation != 0 && operation != 2 &&
++		     !(flags & PINECONE_2D_SOURCE_IS_SOLID))) {
++			source = gem_to_virtio_gpu_obj(submit->buflist->objs[index++]);
++			payload->source_resource_id =
++				cpu_to_le32(source->hw_res_handle);
++		} else {
++			payload->source_resource_id = 0;
++		}
++		if ((flags & PINECONE_2D_HAS_MASK) &&
++		    !(flags & PINECONE_2D_MASK_IS_SOLID)) {
++			mask = gem_to_virtio_gpu_obj(submit->buflist->objs[index++]);
++			payload->mask_resource_id =
++				cpu_to_le32(mask->hw_res_handle);
++		} else {
++			payload->mask_resource_id = 0;
++		}
++		destination = gem_to_virtio_gpu_obj(submit->buflist->objs[index]);
++		payload->destination_resource_id =
++			cpu_to_le32(destination->hw_res_handle);
++		virtio_gpu_cmd_submit(submit->vgdev, submit->buf,
++				      PINECONE_2D_PAYLOAD_SIZE, 0,
++				      submit->buflist, submit->out_fence);
++		virtio_gpu_notify(submit->vgdev);
++		return;
++	}
++
+ 	virtio_gpu_cmd_submit(submit->vgdev, submit->buf, submit->exbuf->size,
+ 			      submit->vfpriv->ctx_id, submit->buflist,
+ 			      submit->out_fence);
+@@ -482,9 +736,13 @@
+ 	struct virtio_gpu_submit submit;
+ 	u32 ring_idx = 0;
+ 	int ret = -EINVAL;
++	bool pinecone_2d = false;
+ 
+-	if (!vgdev->has_virgl_3d)
+-		return -ENOSYS;
++	if (!vgdev->has_virgl_3d) {
++		pinecone_2d = virtio_gpu_is_pinecone_2d(exbuf);
++		if (!pinecone_2d)
++			return -ENOSYS;
++	}
+ 
+ 	if (exbuf->flags & ~VIRTGPU_EXECBUF_FLAGS)
+ 		return ret;
+@@ -500,7 +758,8 @@
+ 		ring_idx = exbuf->ring_idx;
+ 	}
+ 
+-	virtio_gpu_create_context(dev, file);
++	if (!pinecone_2d)
++		virtio_gpu_create_context(dev, file);
+ 
+ 	ret = virtio_gpu_init_submit(&submit, exbuf, dev, file,
+ 				     fence_ctx, ring_idx);

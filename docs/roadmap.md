@@ -15,8 +15,9 @@
 - Keep the JavaScript MobileOS track disabled as archived reference code.
 - Add decode/execute coverage for more AArch64 integer, branch, load/store, and
   system instructions.
-- Add exception levels, vector table routing, timer registers, and PSCI-style
-  CPU lifecycle hooks for open guests.
+- Extend the implemented exception levels, vector routing, banked timer state,
+  PSCI v1.1 CPU lifecycle, and cooperative SMP scheduler toward host-parallel
+  vCPU execution after memory and MMIO synchronization is complete.
 - Harden binary FDT generation and Linux handoff validation.
 - Expand the initial instruction trace support with memory watchpoints and
   coverage maps.

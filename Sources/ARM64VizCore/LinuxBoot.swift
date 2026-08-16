@@ -106,7 +106,9 @@ public struct LinuxDirectBootAdapter: GuestBootAdapter {
 
         let configuration = BootConfiguration(
             machineName: profile == .postmarketOS ? "arm64viz-postmarketos" : "arm64viz-linux-direct",
-            cpuCount: 1,
+            cpuCount: vm.virtualCPUCount,
+            cpuEnableMethod: vm.virtualCPUCount > 1 ? "psci" : nil,
+            psciMethod: vm.virtualCPUCount > 1 ? "hvc" : nil,
             entryPoint: kernelLoadAddress,
             ramBase: vm.memory.base,
             ramSize: UInt64(vm.memory.size),

@@ -42,6 +42,18 @@ if [[ ! -d "${SRC_DIR}" ]]; then
   tar -C "${WORK_DIR}" -xf "${TARBALL}"
 fi
 
+PINECONE_GPU_PATCH="${ROOT_DIR}/scripts/patches/linux-virtio-gpu-pinecone-2d.patch"
+PINECONE_GPU_PATCH_STAMP="${SRC_DIR}/.pinecone-gpu-patch.sha256"
+PINECONE_GPU_PATCH_SHA256="$(shasum -a 256 "${PINECONE_GPU_PATCH}" | awk '{print $1}')"
+APPLIED_PINECONE_GPU_PATCH_SHA256="$(cat "${PINECONE_GPU_PATCH_STAMP}" 2>/dev/null || true)"
+if [[ "${APPLIED_PINECONE_GPU_PATCH_SHA256}" != "${PINECONE_GPU_PATCH_SHA256}" ]]; then
+  tar -xOf "${TARBALL}" \
+    "linux-${VERSION}/drivers/gpu/drm/virtio/virtgpu_submit.c" \
+    > "${SRC_DIR}/drivers/gpu/drm/virtio/virtgpu_submit.c"
+  patch -d "${SRC_DIR}" -p1 < "${PINECONE_GPU_PATCH}"
+  printf '%s\n' "${PINECONE_GPU_PATCH_SHA256}" > "${PINECONE_GPU_PATCH_STAMP}"
+fi
+
 perl -0pi -e 's#sed -i '\''s/\\x00\\\+\$\$/\\x00/g'\'' \$@;#perl -0pi -e '\''s/\\x00+\\z/\\x00/'\'' \$@;#' \
   "${SRC_DIR}/scripts/Makefile.vmlinux"
 
@@ -250,6 +262,8 @@ done < "${SRC_DIR}/arch/arm64/configs/virt.config"
   --enable NETDEVICES \
   --enable ETHERNET \
   --enable VIRTIO_NET \
+  --enable SMP \
+  --set-val NR_CPUS 2 \
   --enable HZ_100 \
   --enable RD_GZIP \
   --enable RD_XZ \
@@ -293,6 +307,11 @@ done < "${SRC_DIR}/arch/arm64/configs/virt.config"
   --disable CRYPTO_MANAGER \
   --disable CRYPTO_TEST \
   --disable DEBUG_INFO \
+  --disable DEBUG_KERNEL \
+  --disable DEBUG_BUGVERBOSE \
+  --disable DEBUG_MISC \
+  --disable DEBUG_MEMORY_INIT \
+  --disable KALLSYMS \
   --disable AIO \
   --disable AUTOFS_FS \
   --disable BTRFS_FS \
@@ -334,7 +353,6 @@ done < "${SRC_DIR}/arch/arm64/configs/virt.config"
   --disable PINCTRL \
   --disable PM \
   --disable SCHED_AUTOGROUP \
-  --disable SMP \
   --disable HZ_250 \
   --disable SCSI \
   --disable SCSI_LOWLEVEL \
@@ -359,6 +377,21 @@ done < "${SRC_DIR}/arch/arm64/configs/virt.config"
 for symbol in ATA AUTOFS_FS BTRFS_FS CGROUPS CONFIGFS_FS DEBUG_FS FUSE_FS GENERIC_PHY GPIOLIB HIBERNATION IO_URING IPMI_HANDLER MMC OVERLAY_FS PCI PINCTRL PSTORE SCSI SND SOUND SQUASHFS UBIFS_FS USB XEN; do
   if grep -q "^CONFIG_${symbol}=y" "${BUILD_DIR}/.config"; then
     echo "Refusing oversized shell kernel config: CONFIG_${symbol}=y" >&2
+    exit 1
+  fi
+done
+
+grep -q '^CONFIG_SMP=y$' "${BUILD_DIR}/.config" || {
+  echo 'Refusing kernel config without CONFIG_SMP=y' >&2
+  exit 1
+}
+grep -q '^CONFIG_NR_CPUS=2$' "${BUILD_DIR}/.config" || {
+  echo 'Refusing kernel config without CONFIG_NR_CPUS=2' >&2
+  exit 1
+}
+for symbol in BPF_JIT BPF_SYSCALL KALLSYMS; do
+  if grep -q "^CONFIG_${symbol}=y" "${BUILD_DIR}/.config"; then
+    echo "Refusing debug-heavy kernel config: CONFIG_${symbol}=y" >&2
     exit 1
   fi
 done

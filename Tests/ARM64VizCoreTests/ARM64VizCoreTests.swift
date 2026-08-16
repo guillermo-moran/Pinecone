@@ -3,6 +3,24 @@ import Foundation
 import XCTest
 @testable import ARM64VizCore
 
+private final class SequencedHostGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+
+    func read() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        reads += 1
+        return reads == 1 ? 0 : 1
+    }
+
+    var readCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return reads
+    }
+}
+
 final class ARM64VizCoreTests: XCTestCase {
     func testInstructionCoverageScannerReadsOnlyARM64ExecutableSections() throws {
         var bytes = [UInt8](repeating: 0, count: 208)
@@ -1958,7 +1976,12 @@ final class ARM64VizCoreTests: XCTestCase {
 
         let firstFrame = try XCTUnwrap(machine.virtioDisplay.displaySnapshot())
         XCTAssertEqual(firstFrame.damage, [
-            VirtualFramebufferDamage(x: 0, y: 0, width: 480, height: 800)
+            VirtualFramebufferDamage(
+                x: 0,
+                y: 0,
+                width: ARM64VizMachineLayout.framebufferWidth,
+                height: ARM64VizMachineLayout.framebufferHeight
+            )
         ])
         XCTAssertGreaterThan(firstFrame.commitTimestampNanoseconds, 0)
         XCTAssertEqual(Array(firstFrame.pixels[0..<8]), [0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff])
@@ -2361,6 +2384,22 @@ final class ARM64VizCoreTests: XCTestCase {
             XCTAssertEqual(try storage.read(at: 4096, count: 32), Array(repeating: 0xa5, count: 32))
 
             try storage.write(Array(repeating: 0x3c, count: 1024), at: 16 * 1024)
+            let firstWrite = Array(repeating: UInt8(0x17), count: 257)
+            let secondWrite = Array(repeating: UInt8(0x29), count: 511)
+            try firstWrite.withUnsafeBytes { first in
+                try secondWrite.withUnsafeBytes { second in
+                    try storage.write(from: [first, second], at: 20 * 1024)
+                }
+            }
+            var firstRead = Array(repeating: UInt8(0), count: firstWrite.count)
+            var secondRead = Array(repeating: UInt8(0), count: secondWrite.count)
+            try firstRead.withUnsafeMutableBytes { first in
+                try secondRead.withUnsafeMutableBytes { second in
+                    try storage.read(into: [first, second], at: 20 * 1024)
+                }
+            }
+            XCTAssertEqual(firstRead, firstWrite)
+            XCTAssertEqual(secondRead, secondWrite)
             try storage.zero(at: 32 * 1024, count: 64 * 1024)
             try machine.virtioBlock.flushStorage()
         }
@@ -2611,10 +2650,21 @@ final class ARM64VizCoreTests: XCTestCase {
         try machine.vm.writePhysical(base + 0x100, width: .byte, value: 0x12)
         try machine.vm.writePhysical(base + 0x101, width: .byte, value: 0)
         XCTAssertEqual(try machine.vm.readPhysical(base + 0x102, width: .byte), 20)
-        XCTAssertEqual(try machine.vm.readPhysical(base + 0x108 + 4, width: .word), 479)
+        XCTAssertEqual(
+            try machine.vm.readPhysical(base + 0x108 + 4, width: .word),
+            UInt64(ARM64VizMachineLayout.framebufferWidth - 1)
+        )
         try machine.vm.writePhysical(base + 0x101, width: .byte, value: 1)
-        XCTAssertEqual(try machine.vm.readPhysical(base + 0x108 + 4, width: .word), 799)
-        for (axis, maximum) in [(47, 0), (53, 479), (54, 799), (57, Int(UInt16.max))] {
+        XCTAssertEqual(
+            try machine.vm.readPhysical(base + 0x108 + 4, width: .word),
+            UInt64(ARM64VizMachineLayout.framebufferHeight - 1)
+        )
+        for (axis, maximum) in [
+            (47, 0),
+            (53, ARM64VizMachineLayout.framebufferWidth - 1),
+            (54, ARM64VizMachineLayout.framebufferHeight - 1),
+            (57, Int(UInt16.max))
+        ] {
             try machine.vm.writePhysical(base + 0x101, width: .byte, value: UInt64(axis))
             XCTAssertEqual(try machine.vm.readPhysical(base + 0x102, width: .byte), 20)
             XCTAssertEqual(
@@ -6279,6 +6329,52 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.vm.cpu.x[4], 0x2222_2222_2222_2222)
         XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
         XCTAssertEqual(backend.decodedBasicBlockSteps, 0)
+    }
+
+    func testHostGenerationChangePreemptsNativeChainWithoutFallback() throws {
+        let backend = SoftwareARM64Backend()
+        backend.fallbackInterpreterPolicy = .nativeOnly
+        let machine = try MachineFactory.makeResearchMachine(backend: backend)
+        let table0 = ARM64VizMachineLayout.ramBase + 0x1000
+        let table1 = ARM64VizMachineLayout.ramBase + 0x2000
+        let table2 = ARM64VizMachineLayout.ramBase + 0x3000
+        let table3 = ARM64VizMachineLayout.ramBase + 0x4000
+        let codeVirtual: GuestAddress = 0x1000
+        let codePhysical = ARM64VizMachineLayout.toyEntryPoint
+        let program = littleEndianWords([
+            0x9100_0400, // add x0, x0, #1
+            0x17ff_ffff  // b #-4
+        ])
+
+        try machine.vm.memory.write64(table1 | 0x3, at: table0)
+        try machine.vm.memory.write64(table2 | 0x3, at: table1)
+        try machine.vm.memory.write64(table3 | 0x3, at: table2)
+        try machine.vm.memory.write64(codePhysical | 0x403, at: table3 + 8)
+        try machine.vm.loadBinary(program, at: codePhysical)
+        machine.vm.reset(entryPoint: codeVirtual)
+        try writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0, into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.tcrEL1, value: 16, into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1, into: machine.vm)
+        machine.vm.systemRegisterTraceCapacity = 0
+        machine.vm.systemRegisterReadTraceCapacity = 0
+        machine.vm.disableInstructionTrace()
+        machine.vm.enableMMIOTrace(capacity: 0)
+        machine.vm.enableGuestMemoryTrace(capacity: 0)
+        machine.vm.timerCyclesPerInstruction = 0
+        machine.vm.nativeCheckpointBlockInterval = 1
+        let generation = SequencedHostGeneration()
+        machine.vm.hostPreemptionGenerationProvider = { generation.read() }
+
+        let result = try machine.vm.run(maxSteps: 100_000)
+
+        XCTAssertGreaterThan(generation.readCount, 1)
+        XCTAssertEqual(result.stopReason, .maxSteps(100_000))
+        XCTAssertGreaterThan(result.steps, 0)
+        XCTAssertLessThan(result.steps, 100_000)
+        XCTAssertGreaterThan(machine.vm.cpu.x[0], 0)
+        XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
+        XCTAssertEqual(backend.decodedBasicBlockSteps, 0)
+        XCTAssertTrue(backend.unsupportedInstructionCounts.isEmpty)
     }
 
     func testNativeMemorySessionRetainsTLBAcrossRunsAndHonorsHostInvalidation() throws {

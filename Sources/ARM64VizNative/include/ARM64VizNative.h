@@ -12,7 +12,14 @@ enum {
     AVZ_NATIVE_STATUS_OUTSIDE_BLOCK = 0,
     AVZ_NATIVE_STATUS_HALTED = 1,
     AVZ_NATIVE_STATUS_UNSUPPORTED = 2,
-    AVZ_NATIVE_STATUS_MAX_STEPS = 3
+    AVZ_NATIVE_STATUS_MAX_STEPS = 3,
+    AVZ_NATIVE_STATUS_YIELDED = 4
+};
+
+enum {
+    AVZ_NATIVE_WAIT_UNSUPPORTED = 0,
+    AVZ_NATIVE_WAIT_CONTINUE = 1,
+    AVZ_NATIVE_WAIT_YIELD = 2
 };
 
 enum {
@@ -120,7 +127,8 @@ enum {
     AVZ_NATIVE_OP_FP_RECIPROCAL_ESTIMATE = 102,
     AVZ_NATIVE_OP_FP_RECIPROCAL_STEP = 103,
     AVZ_NATIVE_OP_SIMD_FP_CONVERT_TO_INTEGER = 104,
-    AVZ_NATIVE_OP_COUNT = 105
+    AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS = 105,
+    AVZ_NATIVE_OP_COUNT = 106
 };
 
 typedef struct {
@@ -137,6 +145,7 @@ typedef struct {
     uint64_t fpcr;
     uint64_t fpsr;
     uint64_t exclusive_address;
+    uint64_t exclusive_generation;
     uint8_t exclusive_size;
     uint8_t exclusive_valid;
     uint8_t halted;
@@ -191,6 +200,24 @@ typedef struct AVZGuestMemory AVZGuestMemory;
 typedef struct AVZNativeMemoryFastPath AVZNativeMemoryFastPath;
 typedef struct AVZNativeExecutionContext AVZNativeExecutionContext;
 
+typedef struct {
+    void *base;
+    size_t length;
+} AVZBlockIOSegment;
+
+int64_t avz_block_io_preadv(
+    int file_descriptor,
+    const AVZBlockIOSegment *segments,
+    size_t segment_count,
+    uint64_t offset
+);
+int64_t avz_block_io_pwritev(
+    int file_descriptor,
+    const AVZBlockIOSegment *segments,
+    size_t segment_count,
+    uint64_t offset
+);
+
 typedef int (*AVZNativeInstructionFetchCallback)(
     void *context,
     uint64_t virtual_address,
@@ -239,6 +266,11 @@ typedef struct {
 typedef struct {
     uint64_t pc;
     uint64_t samples;
+    uint32_t instruction0;
+    uint32_t instruction1;
+    uint32_t instruction2;
+    uint32_t instruction3;
+    uint8_t instruction_count;
 } AVZNativeHotPC;
 
 typedef uint64_t (*AVZNativeChainCheckpointCallback)(
@@ -264,6 +296,10 @@ int avz_native_block_cache_bind_physical_memory(
     uint8_t *ram,
     uint64_t physical_address,
     uint64_t byte_count
+);
+void avz_native_block_cache_set_guest_memory(
+    AVZNativeBlockCache *cache,
+    AVZGuestMemory *memory
 );
 void avz_native_block_cache_invalidate_decode_window(
     AVZNativeBlockCache *cache
@@ -422,6 +458,7 @@ typedef int (*AVZNativeExceptionReturnCallback)(
 typedef int (*AVZNativeSynchronousExceptionCallback)(
     void *context,
     uint32_t instruction,
+    uint64_t *x31,
     uint64_t *pstate,
     uint64_t *sp,
     uint64_t *pc
@@ -499,10 +536,47 @@ typedef struct {
     uint32_t dirty_mask;
 } AVZNativeThreadRegisterState;
 
+enum {
+    AVZ_NATIVE_ARCH_SP_EL0 = 1u << 0,
+    AVZ_NATIVE_ARCH_SP_EL1 = 1u << 1,
+    AVZ_NATIVE_ARCH_SPSR_EL1 = 1u << 2,
+    AVZ_NATIVE_ARCH_ELR_EL1 = 1u << 3,
+    AVZ_NATIVE_ARCH_ESR_EL1 = 1u << 4,
+    AVZ_NATIVE_ARCH_FAR_EL1 = 1u << 5,
+    AVZ_NATIVE_ARCH_VBAR_EL1 = 1u << 6,
+    AVZ_NATIVE_ARCH_CNTP_CTL_EL0 = 1u << 7,
+    AVZ_NATIVE_ARCH_CNTP_CVAL_EL0 = 1u << 8,
+    AVZ_NATIVE_ARCH_CNTV_CTL_EL0 = 1u << 9,
+    AVZ_NATIVE_ARCH_CNTV_CVAL_EL0 = 1u << 10
+};
+
+typedef struct {
+    uint64_t sp_el0;
+    uint64_t sp_el1;
+    uint64_t spsr_el1;
+    uint64_t elr_el1;
+    uint64_t esr_el1;
+    uint64_t far_el1;
+    uint64_t vbar_el1;
+    uint64_t counter_ticks;
+    uint64_t cntp_ctl_el0;
+    uint64_t cntp_cval_el0;
+    uint64_t cntv_ctl_el0;
+    uint64_t cntv_cval_el0;
+    uint64_t timer_cycles_per_instruction;
+    uint32_t dirty_mask;
+    uint8_t pending_irq;
+} AVZNativeArchitecturalState;
+
 AVZGuestMemory *avz_guest_memory_create(size_t size);
 void avz_guest_memory_destroy(AVZGuestMemory *memory);
 uint8_t *avz_guest_memory_bytes(AVZGuestMemory *memory);
 size_t avz_guest_memory_size(const AVZGuestMemory *memory);
+uint64_t avz_guest_memory_page_write_generation(
+    const AVZGuestMemory *memory,
+    uint64_t physical_page,
+    uint64_t ram_base
+);
 
 typedef struct {
     size_t offset;
@@ -514,6 +588,13 @@ void avz_guest_memory_mark_dirty(
     size_t offset,
     size_t byte_count
 );
+void avz_guest_memory_note_write(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+void avz_guest_memory_invalidate_translations(AVZGuestMemory *memory);
+uint64_t avz_guest_memory_translation_epoch(const AVZGuestMemory *memory);
 uint64_t avz_guest_memory_advance_dirty_epoch(AVZGuestMemory *memory);
 size_t avz_guest_memory_dirty_ranges(
     const AVZGuestMemory *memory,
@@ -580,6 +661,19 @@ void avz_native_memory_fast_path_get_thread_registers(
     const AVZNativeMemoryFastPath *fast_path,
     AVZNativeThreadRegisterState *state
 );
+void avz_native_memory_fast_path_set_architectural_state(
+    AVZNativeMemoryFastPath *fast_path,
+    const AVZNativeArchitecturalState *state
+);
+void avz_native_memory_fast_path_get_architectural_state(
+    const AVZNativeMemoryFastPath *fast_path,
+    AVZNativeArchitecturalState *state
+);
+int avz_native_memory_fast_path_advance_time(
+    AVZNativeMemoryFastPath *fast_path,
+    uint64_t instruction_count,
+    uint64_t pstate
+);
 AVZNativeMemoryFastPathStatistics avz_native_memory_fast_path_statistics(
     const AVZNativeMemoryFastPath *fast_path
 );
@@ -602,6 +696,42 @@ int avz_native_fast_memory_write(
     uint64_t virtual_address,
     uint8_t width,
     uint64_t value
+);
+int avz_native_fast_memory_reservation_generation(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *generation
+);
+int avz_native_fast_memory_exclusive_read(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *value,
+    uint64_t *generation
+);
+int avz_native_fast_memory_exclusive_read_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *first_value,
+    uint64_t *second_value,
+    uint64_t *generation
+);
+int avz_native_fast_memory_exclusive_write(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t value,
+    uint64_t expected_generation
+);
+int avz_native_fast_memory_exclusive_write_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t first_value,
+    uint64_t second_value,
+    uint64_t expected_generation
 );
 int avz_native_fast_memory_read_bytes(
     void *context,
@@ -671,6 +801,7 @@ int avz_native_fast_exception_return(
 int avz_native_fast_synchronous_exception(
     void *context,
     uint32_t instruction,
+    uint64_t *x31,
     uint64_t *pstate,
     uint64_t *sp,
     uint64_t *pc
@@ -940,6 +1071,131 @@ int avz_framebuffer_source_over_bgra8(
     size_t destination_y,
     size_t width,
     size_t height
+);
+
+int avz_framebuffer_scale_copy_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+);
+
+int avz_framebuffer_scale_source_over_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+);
+
+int avz_framebuffer_bilinear_scale_copy_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+);
+
+int avz_framebuffer_bilinear_scale_source_over_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+);
+
+int avz_framebuffer_fill_bgra8(
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t width,
+    size_t height,
+    uint32_t premultiplied_bgra
+);
+
+int avz_framebuffer_fill_over_bgra8(
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t width,
+    size_t height,
+    uint32_t premultiplied_bgra
+);
+
+int avz_framebuffer_masked_composite_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    const uint8_t *mask,
+    size_t mask_stride,
+    uint8_t solid_mask_alpha,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height,
+    uint32_t premultiplied_bgra,
+    uint32_t operation,
+    int bilinear_filtering
+);
+
+int avz_framebuffer_composite_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    const uint8_t *mask,
+    size_t mask_stride,
+    uint8_t solid_mask_alpha,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height,
+    uint32_t premultiplied_bgra,
+    uint32_t blend_operator,
+    int source_is_solid,
+    int bilinear_filtering,
+    int component_alpha_mask,
+    int mask_is_packed_a8
 );
 
 size_t avz_framebuffer_commit_dirty_tiles(

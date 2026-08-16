@@ -8,10 +8,13 @@
 
 /* Begin PBXBuildFile section */
 		08DC7D243379CEB9E28A74BE /* rootfs.ext4 in Resources */ = {isa = PBXBuildFile; fileRef = C0215C91AA40F568F9DCD279 /* rootfs.ext4 */; };
+		08DC7D243379CEB9E28A74BF /* rootfs.ext4.sha256 in Resources */ = {isa = PBXBuildFile; fileRef = C0215C91AA40F568F9DCD27A /* rootfs.ext4.sha256 */; };
+		11A3E09ED93A4DA381737911 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 11A3E09ED93A4DA381737912 /* Assets.xcassets */; };
 		2D37BB4EF54DE93C7376E69B /* MobileOSHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF42DF3F91CA92DC1D8E54AE /* MobileOSHostApp.swift */; };
 		30DC752EA0A0D089D811DB7B /* Image in Resources */ = {isa = PBXBuildFile; fileRef = 942BA3A83D3B012158298AD8 /* Image */; };
 		33E0F3FAF09E6F0DC418BC41 /* JavaScriptMobileOSView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A28E1C7823EFFC2FA892060 /* JavaScriptMobileOSView.swift */; };
 		50C66793DFB9475C94B96C3D /* GuestDisplaySurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87320D2F79ED4C6EBBC8F63A /* GuestDisplaySurface.swift */; };
+		7A88B182E11A4BC1B95A5501 /* PineconeMetalGraphicsAccelerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A88B182E11A4BC1B95A5502 /* PineconeMetalGraphicsAccelerator.swift */; };
 		895FD4095CE1478FC1758444 /* ARM64VizCore in Frameworks */ = {isa = PBXBuildFile; productRef = AF1D82503BD19E36F56FAEB0 /* ARM64VizCore */; };
 		9CDA5A868711F5D8834C6122 /* initramfs-minimal-ttyinit.cpio in Resources */ = {isa = PBXBuildFile; fileRef = 75E32F58ABBA3AA329470C7A /* initramfs-minimal-ttyinit.cpio */; };
 		C3F7BCCE762994663D9097D0 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E06DFAFCEC27CD260D45334C /* ContentView.swift */; };
@@ -20,13 +23,16 @@
 
 /* Begin PBXFileReference section */
 		335C90A880A12B1504E53825 /* arm64viz */ = {isa = PBXFileReference; lastKnownFileType = folder; name = arm64viz; path = ../../..; sourceTree = SOURCE_ROOT; };
+		11A3E09ED93A4DA381737912 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		49A999D2DC1723A0A54AF0EC /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		4A28E1C7823EFFC2FA892060 /* JavaScriptMobileOSView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JavaScriptMobileOSView.swift; sourceTree = "<group>"; };
 		75E32F58ABBA3AA329470C7A /* initramfs-minimal-ttyinit.cpio */ = {isa = PBXFileReference; lastKnownFileType = file; path = "initramfs-minimal-ttyinit.cpio"; sourceTree = "<group>"; };
 		8058E225562743A074060043 /* MobileOSHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MobileOSHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		87320D2F79ED4C6EBBC8F63A /* GuestDisplaySurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestDisplaySurface.swift; sourceTree = "<group>"; };
+		7A88B182E11A4BC1B95A5502 /* PineconeMetalGraphicsAccelerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PineconeMetalGraphicsAccelerator.swift; sourceTree = "<group>"; };
 		942BA3A83D3B012158298AD8 /* Image */ = {isa = PBXFileReference; lastKnownFileType = file; path = Image; sourceTree = "<group>"; };
 		C0215C91AA40F568F9DCD279 /* rootfs.ext4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = rootfs.ext4; sourceTree = "<group>"; };
+		C0215C91AA40F568F9DCD27A /* rootfs.ext4.sha256 */ = {isa = PBXFileReference; lastKnownFileType = text; path = rootfs.ext4.sha256; sourceTree = "<group>"; };
 		D1FDA047CF469DEA2FDA55D6 /* MobileOSHostModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileOSHostModel.swift; sourceTree = "<group>"; };
 		E06DFAFCEC27CD260D45334C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		FF42DF3F91CA92DC1D8E54AE /* MobileOSHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileOSHostApp.swift; sourceTree = "<group>"; };
@@ -63,8 +69,10 @@
 		7B14BE0155C95E6DDB1FC86F /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				11A3E09ED93A4DA381737912 /* Assets.xcassets */,
 				E06DFAFCEC27CD260D45334C /* ContentView.swift */,
 				87320D2F79ED4C6EBBC8F63A /* GuestDisplaySurface.swift */,
+				7A88B182E11A4BC1B95A5502 /* PineconeMetalGraphicsAccelerator.swift */,
 				49A999D2DC1723A0A54AF0EC /* Info.plist */,
 				4A28E1C7823EFFC2FA892060 /* JavaScriptMobileOSView.swift */,
 				FF42DF3F91CA92DC1D8E54AE /* MobileOSHostApp.swift */,
@@ -89,6 +97,7 @@
 				942BA3A83D3B012158298AD8 /* Image */,
 				75E32F58ABBA3AA329470C7A /* initramfs-minimal-ttyinit.cpio */,
 				C0215C91AA40F568F9DCD279 /* rootfs.ext4 */,
+				C0215C91AA40F568F9DCD27A /* rootfs.ext4.sha256 */,
 			);
 			name = out;
 			path = "../../../artifacts/linux-shell/out";
@@ -158,9 +167,11 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				11A3E09ED93A4DA381737911 /* Assets.xcassets in Resources */,
 				30DC752EA0A0D089D811DB7B /* Image in Resources */,
 				9CDA5A868711F5D8834C6122 /* initramfs-minimal-ttyinit.cpio in Resources */,
 				08DC7D243379CEB9E28A74BE /* rootfs.ext4 in Resources */,
+				08DC7D243379CEB9E28A74BF /* rootfs.ext4.sha256 in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -173,6 +184,7 @@
 			files = (
 				C3F7BCCE762994663D9097D0 /* ContentView.swift in Sources */,
 				50C66793DFB9475C94B96C3D /* GuestDisplaySurface.swift in Sources */,
+				7A88B182E11A4BC1B95A5501 /* PineconeMetalGraphicsAccelerator.swift in Sources */,
 				33E0F3FAF09E6F0DC418BC41 /* JavaScriptMobileOSView.swift in Sources */,
 				2D37BB4EF54DE93C7376E69B /* MobileOSHostApp.swift in Sources */,
 				CE8D5515995E824D0DDF3AC8 /* MobileOSHostModel.swift in Sources */,

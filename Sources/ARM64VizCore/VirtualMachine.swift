@@ -1,3 +1,5 @@
+import Dispatch
+
 public enum ARM64ExceptionSource: String, Codable, Equatable {
     case supervisorCall
     case breakpoint
@@ -253,6 +255,7 @@ private struct ARM64ExceptionSignature: Equatable {
 
 public enum RunStopReason: Equatable, CustomStringConvertible {
     case halted
+    case yielded
     case breakpoint(GuestAddress)
     case maxSteps(Int)
     case exceptionLoop(GuestAddress)
@@ -267,6 +270,8 @@ public enum RunStopReason: Equatable, CustomStringConvertible {
         switch self {
         case .halted:
             return "halted"
+        case .yielded:
+            return "yielded"
         case let .breakpoint(address):
             return "breakpoint(\(address.hexString))"
         case let .maxSteps(count):
@@ -319,12 +324,25 @@ public final class VirtualMachine {
     public static let physicalTimerIRQ: UInt32 = 30
     public static let virtualTimerIRQ: UInt32 = 27
 
+    private struct VirtualCPURuntime {
+        var architecture: VirtualCPUArchitecturalState
+        var translationCache: [ARM64TranslationCacheKey: GuestAddress] = [:]
+        var cachedSCTLR_EL1: UInt64 = 0
+        var cachedTCR_EL1: UInt64 = 0
+        var cachedTTBR0_EL1: UInt64 = 0
+        var cachedTTBR1_EL1: UInt64 = 0
+        var nextGenericTimerRefreshTick: UInt64 = 0
+    }
+
     public let memory: PhysicalMemory
     public let mmio: MMIOBus
     public let interruptController: InterruptController
     public let backend: VirtualMachineBackend
+    public let virtualCPUCount: Int
     public var cpu: CPUState
     public var systemRegisters: ARM64SystemRegisterBank
+    public private(set) var activeVCPUID: Int
+    public var virtualCPUQuantumSteps: Int
     public var breakpoints: Set<GuestAddress>
     public var breakpointSkipCounts: [GuestAddress: Int]
     public var bootDevices: [BootDeviceDescriptor]
@@ -377,6 +395,8 @@ public final class VirtualMachine {
     public var exceptionStormThreshold: Int
     public var timerCyclesPerInstruction: UInt64
     public var wallClockRunBudgetNanoseconds: UInt64?
+    public var nativeCheckpointBlockInterval: UInt64
+    public var hostPreemptionGenerationProvider: (@Sendable () -> UInt64)?
     public var stopOnEL0Entry: Bool
     public var stopOnEL0Fault: Bool
     public var el0FaultStopSkipCount: Int
@@ -399,20 +419,35 @@ public final class VirtualMachine {
     private var cachedTTBR0_EL1: UInt64
     private var cachedTTBR1_EL1: UInt64
     private var nextGenericTimerRefreshTick: UInt64
+    private var virtualCPUs: [VirtualCPURuntime]
+    private var nextScheduledVCPUID: Int
+    private var externallyManagedVCPUID: Int?
+    private var externalClock: ParallelVCPUClock?
+    private var externalCPUStartHandler: ((Int, GuestAddress, UInt64) -> Bool)?
+    private var externalResetHandler: ((GuestAddress) -> Void)?
+    private var externalStateProvider: (() -> [VirtualCPUArchitecturalState])?
+    private var observedSharedTranslationEpoch: UInt64
     var currentRunDeadlineNanoseconds: UInt64?
 
     public init(
         memory: PhysicalMemory,
         mmio: MMIOBus = MMIOBus(),
         interruptController: InterruptController = SimpleInterruptController(),
-        backend: VirtualMachineBackend = SoftwareARM64Backend()
+        backend: VirtualMachineBackend = SoftwareARM64Backend(),
+        virtualCPUCount: Int = 1
     ) {
+        precondition((1...8).contains(virtualCPUCount), "virtual CPU count must be between 1 and 8")
         self.memory = memory
         self.mmio = mmio
         self.interruptController = interruptController
         self.backend = backend
+        self.virtualCPUCount = virtualCPUCount
         self.cpu = CPUState()
-        self.systemRegisters = ARM64SystemRegisterBank()
+        var bootstrapRegisters = ARM64SystemRegisterBank()
+        bootstrapRegisters.reset(mpidr: Self.mpidr(forVCPUID: 0))
+        self.systemRegisters = bootstrapRegisters
+        self.activeVCPUID = 0
+        self.virtualCPUQuantumSteps = 16_384
         self.breakpoints = []
         self.breakpointSkipCounts = [:]
         self.bootDevices = []
@@ -447,6 +482,8 @@ public final class VirtualMachine {
         self.exceptionStormThreshold = 32
         self.timerCyclesPerInstruction = 1
         self.wallClockRunBudgetNanoseconds = nil
+        self.nativeCheckpointBlockInterval = 256
+        self.hostPreemptionGenerationProvider = nil
         self.stopOnEL0Entry = false
         self.stopOnEL0Fault = false
         self.el0FaultStopSkipCount = 0
@@ -466,14 +503,32 @@ public final class VirtualMachine {
         self.cachedTTBR0_EL1 = 0
         self.cachedTTBR1_EL1 = 0
         self.nextGenericTimerRefreshTick = 0
+        self.virtualCPUs = (0..<virtualCPUCount).map { id in
+            var registers = ARM64SystemRegisterBank()
+            registers.reset(mpidr: Self.mpidr(forVCPUID: id))
+            return VirtualCPURuntime(
+                architecture: VirtualCPUArchitecturalState(
+                    id: id,
+                    cpu: CPUState(),
+                    systemRegisters: registers,
+                    lifecycle: id == 0 ? .runnable : .offline
+                )
+            )
+        }
+        self.nextScheduledVCPUID = 0
+        self.externallyManagedVCPUID = nil
+        self.externalClock = nil
+        self.externalCPUStartHandler = nil
+        self.externalResetHandler = nil
+        self.externalStateProvider = nil
+        self.observedSharedTranslationEpoch = memory.sharedTranslationEpoch
         self.currentRunDeadlineNanoseconds = nil
         refreshCachedTranslationRegisters()
+        saveActiveVirtualCPU()
     }
 
     public func reset(entryPoint: GuestAddress) {
-        cpu = CPUState(pc: entryPoint)
-        systemRegisters.reset()
-        refreshCachedTranslationRegisters()
+        resetVirtualCPUs(entryPoint: entryPoint)
         mmio.reset()
         interruptController.reset()
         clearInstructionTrace()
@@ -490,6 +545,7 @@ public final class VirtualMachine {
         invalidateGenericTimerDeadline()
         requestedStopReason = nil
         currentRunDeadlineNanoseconds = nil
+        externalResetHandler?(entryPoint)
     }
 
     public func loadBinary(_ bytes: [UInt8], at address: GuestAddress) throws {
@@ -497,13 +553,495 @@ public final class VirtualMachine {
     }
 
     public func run(maxSteps: Int = 100_000) throws -> RunResult {
-        try backend.run(vm: self, maxSteps: maxSteps)
+        if externallyManagedVCPUID != nil {
+            return try runExternallyManagedVirtualCPU(maxSteps: maxSteps)
+        }
+        guard virtualCPUCount > 1 else {
+            return try backend.run(vm: self, maxSteps: maxSteps)
+        }
+        return try runVirtualCPUs(maxSteps: maxSteps)
     }
+
+    public var virtualCPUStates: [VirtualCPUArchitecturalState] {
+        if let externalStateProvider {
+            return externalStateProvider()
+        }
+        saveActiveVirtualCPU()
+        let counterTicks = systemRegisters.counterTicks
+        return virtualCPUs.map { runtime in
+            var architecture = runtime.architecture
+            architecture.systemRegisters.synchronizeCounterTicks(counterTicks)
+            return architecture
+        }
+    }
+
+    public func virtualCPUState(id: Int) -> VirtualCPUArchitecturalState? {
+        if let externalStateProvider {
+            return externalStateProvider().first { $0.id == id }
+        }
+        guard virtualCPUs.indices.contains(id) else { return nil }
+        saveActiveVirtualCPU()
+        var architecture = virtualCPUs[id].architecture
+        architecture.systemRegisters.synchronizeCounterTicks(systemRegisters.counterTicks)
+        return architecture
+    }
+
+    public var hasPendingInterruptForAnyVirtualCPU: Bool {
+        (0..<virtualCPUCount).contains {
+            interruptController.peekPending(targetVCPU: $0) != nil
+        }
+    }
+
+    public var waitingVirtualCPUCount: Int {
+        if let externalStateProvider {
+            return externalStateProvider().reduce(into: 0) { count, state in
+                if state.lifecycle == .waitingForInterrupt {
+                    count += 1
+                }
+            }
+        }
+        saveActiveVirtualCPU()
+        return virtualCPUs.reduce(into: 0) { count, runtime in
+            if runtime.architecture.lifecycle == .waitingForInterrupt {
+                count += 1
+            }
+        }
+    }
+
+    func restoreVirtualCPUStates(
+        _ states: [VirtualCPUArchitecturalState],
+        activeVCPUID: Int
+    ) throws {
+        guard states.count == virtualCPUCount,
+              states.indices.contains(activeVCPUID),
+              states.enumerated().allSatisfy({ $0.offset == $0.element.id }) else {
+            throw VMError.invalidSnapshot(
+                "snapshot virtual CPU topology does not match \(virtualCPUCount)-CPU machine"
+            )
+        }
+
+        let sharedCounterTicks = states.map(\.systemRegisters.counterTicks).max() ?? 0
+        virtualCPUs = states.map { architecture in
+            var synchronized = architecture
+            synchronized.systemRegisters.synchronizeCounterTicks(sharedCounterTicks)
+            return VirtualCPURuntime(architecture: synchronized)
+        }
+        self.activeVCPUID = activeVCPUID
+        nextScheduledVCPUID = (activeVCPUID + 1) % virtualCPUCount
+        cpu = virtualCPUs[activeVCPUID].architecture.cpu
+        systemRegisters = virtualCPUs[activeVCPUID].architecture.systemRegisters
+        translationCache = [:]
+        refreshCachedTranslationRegisters()
+        nextGenericTimerRefreshTick = 0
+        saveActiveVirtualCPU()
+        backend.invalidateTranslationCache(for: self)
+    }
+
+    @discardableResult
+    public func startVirtualCPU(
+        id: Int,
+        entryPoint: GuestAddress,
+        context: UInt64
+    ) -> Bool {
+        guard virtualCPUs.indices.contains(id),
+              id != activeVCPUID,
+              entryPoint & 0x3 == 0,
+              memory.range.contains(entryPoint, width: 4),
+              !Self.isPoweredOn(virtualCPUs[id].architecture.lifecycle) else {
+            return false
+        }
+
+        var registers = ARM64SystemRegisterBank()
+        registers.reset(
+            mpidr: Self.mpidr(forVCPUID: id),
+            counterTicks: systemRegisters.counterTicks
+        )
+        var state = CPUState(
+            pc: entryPoint,
+            pstate: ARM64PState.el1hMasked
+        )
+        state.x[0] = context
+        virtualCPUs[id] = VirtualCPURuntime(
+            architecture: VirtualCPUArchitecturalState(
+                id: id,
+                cpu: state,
+                systemRegisters: registers,
+                lifecycle: .runnable
+            )
+        )
+        if let externalCPUStartHandler,
+           !externalCPUStartHandler(id, entryPoint, context) {
+            virtualCPUs[id].architecture.lifecycle = .offline
+            return false
+        }
+        return true
+    }
+
+    func configureExternalParallelExecution(
+        vcpuID: Int,
+        clock: ParallelVCPUClock,
+        stateProvider: (() -> [VirtualCPUArchitecturalState])? = nil,
+        cpuStartHandler: ((Int, GuestAddress, UInt64) -> Bool)? = nil,
+        resetHandler: ((GuestAddress) -> Void)? = nil
+    ) {
+        precondition(virtualCPUs.indices.contains(vcpuID))
+        externallyManagedVCPUID = vcpuID
+        externalClock = clock
+        externalStateProvider = stateProvider
+        externalCPUStartHandler = cpuStartHandler
+        externalResetHandler = resetHandler
+        activeVCPUID = vcpuID
+        cpu = virtualCPUs[vcpuID].architecture.cpu
+        systemRegisters = virtualCPUs[vcpuID].architecture.systemRegisters
+        translationCache = virtualCPUs[vcpuID].translationCache
+        refreshCachedTranslationRegisters()
+        nextGenericTimerRefreshTick = 0
+    }
+
+    func installExternalVirtualCPUState(_ architecture: VirtualCPUArchitecturalState) {
+        precondition(architecture.id == externallyManagedVCPUID)
+        activeVCPUID = architecture.id
+        virtualCPUs[architecture.id] = VirtualCPURuntime(architecture: architecture)
+        cpu = architecture.cpu
+        systemRegisters = architecture.systemRegisters
+        translationCache.removeAll(keepingCapacity: true)
+        refreshCachedTranslationRegisters()
+        nextGenericTimerRefreshTick = 0
+        backend.invalidateTranslationCache(for: self)
+    }
+
+    func externalVirtualCPUStateSnapshot() -> VirtualCPUArchitecturalState {
+        let id = externallyManagedVCPUID ?? activeVCPUID
+        return VirtualCPUArchitecturalState(
+            id: id,
+            cpu: cpu,
+            systemRegisters: systemRegisters,
+            lifecycle: virtualCPUs[id].architecture.lifecycle
+        )
+    }
+
+    private func runExternallyManagedVirtualCPU(maxSteps: Int) throws -> RunResult {
+        guard maxSteps > 0 else {
+            return RunResult(steps: 0, stopReason: .maxSteps(maxSteps), lastException: lastException)
+        }
+        let id = activeVCPUID
+        externalClock?.synchronize(&systemRegisters)
+        if virtualCPUs[id].architecture.lifecycle == .waitingForInterrupt {
+            updateGenericTimerInterruptsIfNeeded(force: true)
+            guard interruptController.peekPending(targetVCPU: id) != nil else {
+                return RunResult(steps: 0, stopReason: .yielded, lastException: lastException)
+            }
+            virtualCPUs[id].architecture.lifecycle = .runnable
+        }
+
+        let result = try backend.run(vm: self, maxSteps: maxSteps)
+        externalClock?.publish(systemRegisters.counterTicks)
+        if result.stopReason == .halted {
+            virtualCPUs[id].architecture.lifecycle = .halted
+        }
+        virtualCPUs[id].architecture.cpu = cpu
+        virtualCPUs[id].architecture.systemRegisters = systemRegisters
+        return result
+    }
+
+    public func handleFirmwareCall(instruction: UInt32) -> Bool {
+        let encoding = instruction & 0xffe0_001f
+        guard encoding == 0xd400_0002 || encoding == 0xd400_0003 else {
+            return false
+        }
+
+        let function = UInt32(truncatingIfNeeded: cpu.x[0])
+        let argument1 = cpu.x[1]
+        let argument2 = cpu.x[2]
+        let argument3 = cpu.x[3]
+        let result: Int64
+
+        switch function {
+        case 0x8000_0000: // SMCCC_VERSION
+            result = Int64(0x0001_0001)
+        case 0x8000_0001: // SMCCC_ARCH_FEATURES
+            result = Self.psciNotSupported
+        case 0x8400_0000: // PSCI_VERSION
+            result = Int64(0x0001_0001)
+        case 0x8400_0001, 0xc400_0001: // PSCI_CPU_SUSPEND
+            result = Self.psciSuccess
+        case 0x8400_0003, 0xc400_0003: // PSCI_CPU_ON
+            result = psciCPUOn(target: argument1, entryPoint: argument2, context: argument3)
+        case 0x8400_0004, 0xc400_0004: // PSCI_AFFINITY_INFO
+            result = psciAffinityInfo(target: argument1)
+        case 0x8400_0006: // PSCI_MIGRATE_INFO_TYPE
+            result = 2
+        case 0x8400_000a: // PSCI_FEATURES
+            result = Self.supportedPSCIFunctions.contains(UInt32(truncatingIfNeeded: argument1))
+                ? Self.psciSuccess
+                : Self.psciNotSupported
+        default:
+            result = Self.psciNotSupported
+        }
+
+        cpu.x[0] = UInt64(bitPattern: result)
+        cpu.pc &+= 4
+        return true
+    }
+
+    private func runVirtualCPUs(maxSteps: Int) throws -> RunResult {
+        guard maxSteps > 0 else {
+            return RunResult(steps: 0, stopReason: .maxSteps(maxSteps), lastException: lastException)
+        }
+
+        let ownsDeadline = currentRunDeadlineNanoseconds == nil
+        if ownsDeadline, let budget = wallClockRunBudgetNanoseconds {
+            currentRunDeadlineNanoseconds = DispatchTime.now().uptimeNanoseconds &+ budget
+        }
+        defer {
+            saveActiveVirtualCPU()
+            if ownsDeadline {
+                currentRunDeadlineNanoseconds = nil
+            }
+        }
+
+        var totalSteps = 0
+        while totalSteps < maxSteps {
+            if let deadline = currentRunDeadlineNanoseconds,
+               DispatchTime.now().uptimeNanoseconds >= deadline {
+                return RunResult(
+                    steps: totalSteps,
+                    stopReason: .maxSteps(maxSteps),
+                    lastException: lastException
+                )
+            }
+            guard let id = nextRunnableVirtualCPU() else {
+                if fastForwardWaitingVirtualCPUsToNextTimerDeadline() {
+                    continue
+                }
+                let stopReason: RunStopReason = virtualCPUs.contains {
+                    $0.architecture.lifecycle == .waitingForInterrupt
+                } ? .maxSteps(maxSteps) : .halted
+                return RunResult(
+                    steps: totalSteps,
+                    stopReason: stopReason,
+                    lastException: lastException
+                )
+            }
+            activateVirtualCPU(id)
+
+            let sliceSteps = min(
+                maxSteps - totalSteps,
+                max(1, virtualCPUQuantumSteps)
+            )
+            let result = try backend.run(vm: self, maxSteps: sliceSteps)
+            totalSteps += result.steps
+
+            switch result.stopReason {
+            case .maxSteps:
+                if result.steps == 0 {
+                    return RunResult(
+                        steps: totalSteps,
+                        stopReason: .maxSteps(maxSteps),
+                        lastException: lastException
+                    )
+                }
+            case .yielded:
+                saveActiveVirtualCPU()
+            case .halted:
+                virtualCPUs[activeVCPUID].architecture.lifecycle = .halted
+                saveActiveVirtualCPU()
+                if !virtualCPUs.contains(where: {
+                    $0.architecture.lifecycle == .runnable ||
+                        $0.architecture.lifecycle == .waitingForInterrupt
+                }) {
+                    return RunResult(steps: totalSteps, stopReason: .halted, lastException: lastException)
+                }
+            default:
+                return RunResult(
+                    steps: totalSteps,
+                    stopReason: result.stopReason,
+                    lastException: result.lastException
+                )
+            }
+        }
+        return RunResult(steps: totalSteps, stopReason: .maxSteps(maxSteps), lastException: lastException)
+    }
+
+    private func nextRunnableVirtualCPU() -> Int? {
+        wakeVirtualCPUsForPendingInterrupts()
+
+        for offset in 0..<virtualCPUCount {
+            let id = (nextScheduledVCPUID + offset) % virtualCPUCount
+            if virtualCPUs[id].architecture.lifecycle == .runnable {
+                nextScheduledVCPUID = (id + 1) % virtualCPUCount
+                return id
+            }
+        }
+        return nil
+    }
+
+    private func wakeVirtualCPUsForPendingInterrupts() {
+        saveActiveVirtualCPU()
+        let counterTicks = systemRegisters.counterTicks
+
+        for id in virtualCPUs.indices
+        where virtualCPUs[id].architecture.lifecycle == .waitingForInterrupt {
+            virtualCPUs[id].architecture.systemRegisters.synchronizeCounterTicks(counterTicks)
+            let registers = virtualCPUs[id].architecture.systemRegisters
+            if registers.physicalTimerInterruptAsserted {
+                interruptController.raise(line: Self.physicalTimerIRQ, targetVCPU: id)
+            }
+            if registers.virtualTimerInterruptAsserted {
+                interruptController.raise(line: Self.virtualTimerIRQ, targetVCPU: id)
+            }
+            if interruptController.peekPending(targetVCPU: id) != nil {
+                virtualCPUs[id].architecture.lifecycle = .runnable
+            }
+        }
+    }
+
+    private func fastForwardWaitingVirtualCPUsToNextTimerDeadline() -> Bool {
+        saveActiveVirtualCPU()
+        let waitingIDs = virtualCPUs.indices.filter {
+            virtualCPUs[$0].architecture.lifecycle == .waitingForInterrupt
+        }
+        guard !waitingIDs.isEmpty,
+              !virtualCPUs.contains(where: { $0.architecture.lifecycle == .runnable }) else {
+            return false
+        }
+
+        let counterTicks = systemRegisters.counterTicks
+        let deadline = waitingIDs.compactMap { id -> UInt64? in
+            virtualCPUs[id].architecture.systemRegisters.synchronizeCounterTicks(counterTicks)
+            return virtualCPUs[id].architecture.systemRegisters.nextUnmaskedTimerDeadline
+        }.min()
+        guard let deadline, deadline > counterTicks else {
+            wakeVirtualCPUsForPendingInterrupts()
+            return virtualCPUs.contains { $0.architecture.lifecycle == .runnable }
+        }
+
+        let cycles = deadline &- counterTicks
+        systemRegisters.synchronizeCounterTicks(deadline)
+        for id in virtualCPUs.indices {
+            virtualCPUs[id].architecture.systemRegisters.synchronizeCounterTicks(deadline)
+        }
+        timerFastForwardCount &+= 1
+        timerFastForwardCycles &+= cycles
+        wakeVirtualCPUsForPendingInterrupts()
+        return virtualCPUs.contains { $0.architecture.lifecycle == .runnable }
+    }
+
+    private func activateVirtualCPU(_ id: Int) {
+        guard id != activeVCPUID else { return }
+        // Cooperative scheduling makes the context-switch boundary the point
+        // at which another observer may have modified an exclusive location.
+        clearExclusiveReservation()
+        let sharedCounterTicks = systemRegisters.counterTicks
+        saveActiveVirtualCPU()
+
+        var runtime = virtualCPUs[id]
+        runtime.architecture.systemRegisters.synchronizeCounterTicks(sharedCounterTicks)
+        activeVCPUID = id
+        cpu = runtime.architecture.cpu
+        systemRegisters = runtime.architecture.systemRegisters
+        translationCache = runtime.translationCache
+        cachedSCTLR_EL1 = runtime.cachedSCTLR_EL1
+        cachedTCR_EL1 = runtime.cachedTCR_EL1
+        cachedTTBR0_EL1 = runtime.cachedTTBR0_EL1
+        cachedTTBR1_EL1 = runtime.cachedTTBR1_EL1
+        nextGenericTimerRefreshTick = runtime.nextGenericTimerRefreshTick
+        virtualCPUs[id] = runtime
+    }
+
+    private func saveActiveVirtualCPU() {
+        guard virtualCPUs.indices.contains(activeVCPUID) else { return }
+        virtualCPUs[activeVCPUID].architecture.cpu = cpu
+        virtualCPUs[activeVCPUID].architecture.systemRegisters = systemRegisters
+        virtualCPUs[activeVCPUID].translationCache = translationCache
+        virtualCPUs[activeVCPUID].cachedSCTLR_EL1 = cachedSCTLR_EL1
+        virtualCPUs[activeVCPUID].cachedTCR_EL1 = cachedTCR_EL1
+        virtualCPUs[activeVCPUID].cachedTTBR0_EL1 = cachedTTBR0_EL1
+        virtualCPUs[activeVCPUID].cachedTTBR1_EL1 = cachedTTBR1_EL1
+        virtualCPUs[activeVCPUID].nextGenericTimerRefreshTick = nextGenericTimerRefreshTick
+    }
+
+    private func resetVirtualCPUs(entryPoint: GuestAddress) {
+        activeVCPUID = 0
+        nextScheduledVCPUID = 0
+        virtualCPUs = (0..<virtualCPUCount).map { id in
+            var registers = ARM64SystemRegisterBank()
+            registers.reset(mpidr: Self.mpidr(forVCPUID: id))
+            return VirtualCPURuntime(
+                architecture: VirtualCPUArchitecturalState(
+                    id: id,
+                    cpu: CPUState(pc: id == 0 ? entryPoint : 0),
+                    systemRegisters: registers,
+                    lifecycle: id == 0 ? .runnable : .offline
+                )
+            )
+        }
+        cpu = virtualCPUs[0].architecture.cpu
+        systemRegisters = virtualCPUs[0].architecture.systemRegisters
+        translationCache = [:]
+        cachedSCTLR_EL1 = 0
+        cachedTCR_EL1 = 0
+        cachedTTBR0_EL1 = 0
+        cachedTTBR1_EL1 = 0
+        nextGenericTimerRefreshTick = 0
+        refreshCachedTranslationRegisters()
+        saveActiveVirtualCPU()
+    }
+
+    private func psciCPUOn(target: UInt64, entryPoint: GuestAddress, context: UInt64) -> Int64 {
+        let id = Int(target & 0xff)
+        guard virtualCPUs.indices.contains(id), target & 0x00ff_ffff_ffff_ff00 == 0 else {
+            return Self.psciInvalidParameters
+        }
+        guard virtualCPUs[id].architecture.lifecycle != .runnable else {
+            return Self.psciAlreadyOn
+        }
+        return startVirtualCPU(id: id, entryPoint: entryPoint, context: context)
+            ? Self.psciSuccess
+            : Self.psciInvalidParameters
+    }
+
+    private func psciAffinityInfo(target: UInt64) -> Int64 {
+        let id = Int(target & 0xff)
+        guard virtualCPUs.indices.contains(id), target & 0x00ff_ffff_ffff_ff00 == 0 else {
+            return Self.psciInvalidParameters
+        }
+        return Self.isPoweredOn(virtualCPUs[id].architecture.lifecycle) ? 0 : 1
+    }
+
+    private static func isPoweredOn(_ lifecycle: VirtualCPULifecycle) -> Bool {
+        lifecycle == .runnable || lifecycle == .waitingForInterrupt
+    }
+
+    private static func mpidr(forVCPUID id: Int) -> UInt64 {
+        0x8000_0000 | UInt64(id & 0xff)
+    }
+
+    private static let psciSuccess: Int64 = 0
+    private static let psciNotSupported: Int64 = -1
+    private static let psciInvalidParameters: Int64 = -2
+    private static let psciAlreadyOn: Int64 = -4
+    private static let supportedPSCIFunctions: Set<UInt32> = [
+        0x8400_0000,
+        0x8400_0001,
+        0xc400_0001,
+        0x8400_0003,
+        0xc400_0003,
+        0x8400_0004,
+        0xc400_0004,
+        0x8400_0006,
+        0x8400_000a
+    ]
 
     public func translateAddress(
         _ virtualAddress: GuestAddress,
         access: GuestMemoryAccessKind = .dataRead
     ) throws -> GuestAddress {
+        let sharedEpoch = memory.sharedTranslationEpoch
+        if sharedEpoch != observedSharedTranslationEpoch {
+            translationCache.removeAll(keepingCapacity: true)
+            observedSharedTranslationEpoch = sharedEpoch
+        }
         let sctlr = cachedSCTLR_EL1
         guard (sctlr & 0x1) != 0 else {
             return virtualAddress
@@ -669,6 +1207,11 @@ public final class VirtualMachine {
 
     @discardableResult
     public func fastForwardGenericTimerToNextDeadline() -> UInt64 {
+        // A sleeping vCPU cannot advance the shared architectural counter while
+        // another vCPU remains runnable. SMP time advances through scheduled work.
+        guard virtualCPUCount == 1 else {
+            return 0
+        }
         guard let deadline = systemRegisters.nextUnmaskedTimerDeadline else {
             return 0
         }
@@ -687,6 +1230,21 @@ public final class VirtualMachine {
         waitForInterruptCount &+= 1
     }
 
+    @discardableResult
+    public func suspendActiveVirtualCPUForWaitForInterrupt() -> Bool {
+        guard virtualCPUCount > 1,
+              interruptController.peekPending(targetVCPU: activeVCPUID) == nil else {
+            return false
+        }
+        virtualCPUs[activeVCPUID].architecture.lifecycle = .waitingForInterrupt
+        return true
+    }
+
+    public var activeVirtualCPUIsWaitingForInterrupt: Bool {
+        virtualCPUs.indices.contains(activeVCPUID) &&
+            virtualCPUs[activeVCPUID].architecture.lifecycle == .waitingForInterrupt
+    }
+
     public func recordWaitForEvent() {
         waitForEventCount &+= 1
     }
@@ -702,6 +1260,14 @@ public final class VirtualMachine {
             translationCacheHits = 0
             translationCacheMisses = 0
         }
+    }
+
+    func executeSystemMaintenanceInstruction(_ instruction: UInt32) {
+        let crn = (instruction >> 12) & 0xf
+        if crn == 8 {
+            memory.invalidateSharedTranslationCaches()
+        }
+        invalidateTranslationCache()
     }
 
     public func didWriteSystemRegister(_ key: ARM64SystemRegisterKey) {
@@ -741,6 +1307,10 @@ public final class VirtualMachine {
     public func clearExclusiveReservation() {
         cpu.exclusiveReservationAddress = nil
         cpu.exclusiveReservationSize = nil
+        for id in virtualCPUs.indices where id != activeVCPUID {
+            virtualCPUs[id].architecture.cpu.exclusiveReservationAddress = nil
+            virtualCPUs[id].architecture.cpu.exclusiveReservationSize = nil
+        }
     }
 
     @inline(__always)
@@ -781,9 +1351,9 @@ public final class VirtualMachine {
 
     private func updateTimerInterrupt(line: UInt32, asserted: Bool) {
         if asserted {
-            interruptController.raise(line: line)
+            interruptController.raise(line: line, targetVCPU: activeVCPUID)
         } else {
-            interruptController.clear(line: line)
+            interruptController.clear(line: line, targetVCPU: activeVCPUID)
         }
     }
 
@@ -1148,7 +1718,11 @@ public final class VirtualMachine {
             throw VMError.invalidMMIOAccess(address: address, width: width.rawValue)
         }
         let offset = address - device.range.start
-        let value = try device.read(offset: offset, width: width)
+        let value = try mmio.read(
+            address: address,
+            width: width,
+            targetVCPU: activeVCPUID
+        )
         recordMMIOAccess(
             deviceName: device.name,
             access: .read,
@@ -1180,7 +1754,12 @@ public final class VirtualMachine {
             throw VMError.invalidMMIOAccess(address: address, width: width.rawValue)
         }
         let offset = address - device.range.start
-        try device.write(offset: offset, width: width, value: value)
+        try mmio.write(
+            address: address,
+            width: width,
+            value: value,
+            targetVCPU: activeVCPUID
+        )
         recordMMIOAccess(
             deviceName: device.name,
             access: .write,

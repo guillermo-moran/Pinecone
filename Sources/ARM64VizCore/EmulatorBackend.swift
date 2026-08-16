@@ -78,7 +78,6 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     private var codeCacheGeneration: UInt64 = 0
     private let maxBasicBlockInstructions = 32
     private let nativeChainBlockLimit: UInt64 = 1_024
-    private let nativeCheckpointBlockInterval: UInt64 = 256
     private let decodeScratch = DecodeScratch(capacity: 32)
     public init() {
         nativeBlockCache = avz_native_block_cache_create()
@@ -188,12 +187,12 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     public func nativeHotPCSnapshot(
         limit: Int = 8
-    ) -> [(pc: GuestAddress, samples: UInt64)] {
+    ) -> [(pc: GuestAddress, samples: UInt64, instructions: [UInt32])] {
         guard let nativeExecutionContext, limit > 0 else {
             return []
         }
         var entries = Array(
-            repeating: AVZNativeHotPC(pc: 0, samples: 0),
+            repeating: AVZNativeHotPC(),
             count: limit
         )
         let count = entries.withUnsafeMutableBufferPointer { buffer in
@@ -203,8 +202,19 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 buffer.count
             )
         }
-        return entries.prefix(count).map {
-            (pc: GuestAddress($0.pc), samples: $0.samples)
+        return entries.prefix(count).map { entry in
+            let available = min(Int(entry.instruction_count), 4)
+            let words = [
+                entry.instruction0,
+                entry.instruction1,
+                entry.instruction2,
+                entry.instruction3
+            ]
+            return (
+                pc: GuestAddress(entry.pc),
+                samples: entry.samples,
+                instructions: Array(words.prefix(available))
+            )
         }
     }
 
@@ -304,11 +314,16 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     public func run(vm: VirtualMachine, maxSteps: Int) throws -> RunResult {
         var steps = 0
         var nextDeadlineCheckStep = 256
-        vm.currentRunDeadlineNanoseconds = vm.wallClockRunBudgetNanoseconds.map {
-            DispatchTime.now().uptimeNanoseconds &+ $0
+        let ownsRunDeadline = vm.currentRunDeadlineNanoseconds == nil
+        if ownsRunDeadline {
+            vm.currentRunDeadlineNanoseconds = vm.wallClockRunBudgetNanoseconds.map {
+                DispatchTime.now().uptimeNanoseconds &+ $0
+            }
         }
         defer {
-            vm.currentRunDeadlineNanoseconds = nil
+            if ownsRunDeadline {
+                vm.currentRunDeadlineNanoseconds = nil
+            }
         }
         while steps < maxSteps {
             if steps >= nextDeadlineCheckStep {
@@ -368,6 +383,34 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     if nativeOutcome.shouldContinue {
                         continue
                     }
+                }
+
+                /*
+                 * A native block can return no progress at a timer or callback
+                 * boundary even though its first instruction is fully native.
+                 * Retry that instruction in C before considering the decoded
+                 * compatibility path.
+                 */
+                let nativeRetryPC = vm.cpu.pc
+                let nativeRetryPState = vm.cpu.pstate
+                if block.nativeEligible,
+                   try executeNativeSingleInstructionIfPossible(vm) {
+                    singleInstructionSteps += 1
+                    nativeSingleInstructionSteps += 1
+                    steps += 1
+                    if let stopReason = finishInstructionCycle(
+                        vm,
+                        stepNumber: steps,
+                        pcBeforeInstruction: nativeRetryPC,
+                        pstateBeforeInstruction: nativeRetryPState
+                    ) {
+                        return RunResult(
+                            steps: steps,
+                            stopReason: stopReason,
+                            lastException: vm.lastException
+                        )
+                    }
+                    continue
                 }
 
                 guard fallbackInterpreterAllowed(for: vm) else {
@@ -871,6 +914,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         let memoryContext: NativeMemoryContext
         let pstateBox: NativePStateBox
         let maxSteps: Int
+        let hostPreemptionGeneration: UInt64?
         var totalSteps: Int
         var nextDeadlineCheckStep: Int
         var stopReason: RunStopReason?
@@ -885,7 +929,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             pstateBox: NativePStateBox,
             maxSteps: Int,
             totalSteps: Int,
-            nextDeadlineCheckStep: Int
+            nextDeadlineCheckStep: Int,
+            hostPreemptionGeneration: UInt64?
         ) {
             self.backend = backend
             self.vm = vm
@@ -894,6 +939,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             self.maxSteps = maxSteps
             self.totalSteps = totalSteps
             self.nextDeadlineCheckStep = nextDeadlineCheckStep
+            self.hostPreemptionGeneration = hostPreemptionGeneration
         }
 
         func checkpoint(
@@ -912,7 +958,6 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     backend.nativeBasicBlockExecutions += executedBlocks
                     backend.nativeBasicBlockSteps += executedSteps
                     totalSteps += executedSteps
-                    backend.advanceTimersAfterNativeExecution(vm, executedSteps: executedSteps)
                 }
                 blockedPinnedDeviceAccess = true
                 return 0
@@ -922,7 +967,6 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 backend.nativeBasicBlockExecutions += executedBlocks
                 backend.nativeBasicBlockSteps += accountedSteps
                 totalSteps += accountedSteps
-                backend.advanceTimersAfterNativeExecution(vm, executedSteps: accountedSteps)
             }
 
             if let requestedStop = vm.requestedStopReason {
@@ -930,8 +974,14 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 shouldYield = true
                 return 0
             }
+            if let hostPreemptionGeneration,
+               vm.hostPreemptionGenerationProvider?() != hostPreemptionGeneration {
+                stopReason = .maxSteps(maxSteps)
+                shouldYield = true
+                return 0
+            }
             if totalSteps >= nextDeadlineCheckStep {
-                nextDeadlineCheckStep = totalSteps + 64
+                nextDeadlineCheckStep = totalSteps + 4_096
                 if backend.hasReachedWallClockRunDeadline(vm, completedSteps: totalSteps) {
                     shouldYield = true
                     return 0
@@ -956,13 +1006,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             }
 
             memoryContext.resetTransientState()
-            let limit = backend.nativeStepLimitBeforeTimerDeadline(
-                vm,
-                requestedSteps: min(maxSteps - totalSteps, 4_096),
-                pstate: pstate,
-                timerStateIsCurrent: true,
-                pendingIRQChecked: true
-            )
+            let limit = min(maxSteps - totalSteps, 65_536)
             if limit == 0 {
                 shouldYield = true
             }
@@ -2136,7 +2180,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     private func hasUnmaskedPendingIRQ(_ vm: VirtualMachine, pstate: UInt64) -> Bool {
         (pstate & ARM64PState.irqMask) == 0 &&
-            vm.interruptController.peekPending() != nil
+            vm.interruptController.peekPending(targetVCPU: vm.activeVCPUID) != nil
     }
 
     @inline(__always)
@@ -2465,6 +2509,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
              AVZ_NATIVE_OP_SIMD_ADD_VECTOR,
              AVZ_NATIVE_OP_SIMD_COMPARE_EQUAL_VECTOR,
              AVZ_NATIVE_OP_SIMD_COUNT_SET_BITS,
+             AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS,
              AVZ_NATIVE_OP_SIMD_ORR_VECTOR,
              AVZ_NATIVE_OP_SIMD_DUPLICATE_GENERAL,
              AVZ_NATIVE_OP_SIMD_MOVI_ZERO,
@@ -2625,7 +2670,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
 
         var totalSteps = 0
-        var nextDeadlineCheckStep = 64
+        let hostPreemptionGeneration = vm.hostPreemptionGenerationProvider?()
+        var nextDeadlineCheckStep = 4_096
         var stopReason: RunStopReason?
         var unsupportedInstruction: UInt32?
         var translationFault: ARM64TranslationFault?
@@ -2649,6 +2695,30 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         avz_native_memory_fast_path_set_thread_registers(
             fastMemoryContext,
             &threadRegisters
+        )
+        let initialSPUsesEL0 = CPUState.stackPointerBank(for: livePState) == .spEL0
+        var architecturalState = AVZNativeArchitecturalState(
+            sp_el0: initialSPUsesEL0
+                ? sp
+                : vm.systemRegisters.rawValue(for: ARM64SystemRegister.spEL0),
+            sp_el1: initialSPUsesEL0 ? vm.cpu.spEL1 : sp,
+            spsr_el1: vm.systemRegisters.rawValue(for: ARM64SystemRegister.spsrEL1),
+            elr_el1: vm.systemRegisters.rawValue(for: ARM64SystemRegister.elrEL1),
+            esr_el1: vm.systemRegisters.rawValue(for: ARM64SystemRegister.esrEL1),
+            far_el1: vm.systemRegisters.rawValue(for: ARM64SystemRegister.farEL1),
+            vbar_el1: vm.systemRegisters.rawValue(for: ARM64SystemRegister.vbarEL1),
+            counter_ticks: vm.systemRegisters.counterTicks,
+            cntp_ctl_el0: vm.systemRegisters.rawValue(for: ARM64SystemRegister.cntpCtlEL0),
+            cntp_cval_el0: vm.systemRegisters.rawValue(for: ARM64SystemRegister.cntpCvalEL0),
+            cntv_ctl_el0: vm.systemRegisters.rawValue(for: ARM64SystemRegister.cntvCtlEL0),
+            cntv_cval_el0: vm.systemRegisters.rawValue(for: ARM64SystemRegister.cntvCvalEL0),
+            timer_cycles_per_instruction: vm.timerCyclesPerInstruction,
+            dirty_mask: 0,
+            pending_irq: vm.interruptController.peekPending(targetVCPU: vm.activeVCPUID) == nil ? 0 : 1
+        )
+        avz_native_memory_fast_path_set_architectural_state(
+            fastMemoryContext,
+            &architecturalState
         )
         defer {
             recordNativeMemoryStatistics(memorySession.takeStatisticsDelta())
@@ -2681,6 +2751,37 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     value: threadRegisters.contextidr_el1
                 )
             }
+            avz_native_memory_fast_path_get_architectural_state(
+                fastMemoryContext,
+                &architecturalState
+            )
+            let architecturalDirtyMask = architecturalState.dirty_mask
+            if architecturalDirtyMask & UInt32(AVZ_NATIVE_ARCH_SP_EL0) != 0 {
+                vm.systemRegisters.writeRaw(
+                    ARM64SystemRegister.spEL0,
+                    value: architecturalState.sp_el0
+                )
+            }
+            if architecturalDirtyMask & UInt32(AVZ_NATIVE_ARCH_SP_EL1) != 0 {
+                vm.cpu.spEL1 = architecturalState.sp_el1
+            }
+            let architecturalRegisters: [(UInt32, ARM64SystemRegisterKey, UInt64)] = [
+                (UInt32(AVZ_NATIVE_ARCH_SPSR_EL1), ARM64SystemRegister.spsrEL1, architecturalState.spsr_el1),
+                (UInt32(AVZ_NATIVE_ARCH_ELR_EL1), ARM64SystemRegister.elrEL1, architecturalState.elr_el1),
+                (UInt32(AVZ_NATIVE_ARCH_ESR_EL1), ARM64SystemRegister.esrEL1, architecturalState.esr_el1),
+                (UInt32(AVZ_NATIVE_ARCH_FAR_EL1), ARM64SystemRegister.farEL1, architecturalState.far_el1),
+                (UInt32(AVZ_NATIVE_ARCH_VBAR_EL1), ARM64SystemRegister.vbarEL1, architecturalState.vbar_el1),
+                (UInt32(AVZ_NATIVE_ARCH_CNTP_CTL_EL0), ARM64SystemRegister.cntpCtlEL0, architecturalState.cntp_ctl_el0),
+                (UInt32(AVZ_NATIVE_ARCH_CNTP_CVAL_EL0), ARM64SystemRegister.cntpCvalEL0, architecturalState.cntp_cval_el0),
+                (UInt32(AVZ_NATIVE_ARCH_CNTV_CTL_EL0), ARM64SystemRegister.cntvCtlEL0, architecturalState.cntv_ctl_el0),
+                (UInt32(AVZ_NATIVE_ARCH_CNTV_CVAL_EL0), ARM64SystemRegister.cntvCvalEL0, architecturalState.cntv_cval_el0)
+            ]
+            for (mask, register, value) in architecturalRegisters
+                where architecturalDirtyMask & mask != 0 {
+                vm.systemRegisters.writeRaw(register, value: value)
+            }
+            vm.systemRegisters.synchronizeCounterTicks(architecturalState.counter_ticks)
+            vm.updateGenericTimerInterruptsIfNeeded(force: true)
         }
         guard let nativeExecutionContext else {
             return nil
@@ -2754,7 +2855,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     )
                     let nativeStepLimit = nativeStepLimitBeforeTimerDeadline(
                         vm,
-                        requestedSteps: min(maxSteps - totalSteps, 4_096),
+                        requestedSteps: min(maxSteps - totalSteps, 16_384),
                         pstate: residentPState
                     )
                     guard nativeStepLimit > 0 else {
@@ -2771,7 +2872,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                         pstateBox: pstateBox,
                         maxSteps: maxSteps,
                         totalSteps: totalSteps,
-                        nextDeadlineCheckStep: nextDeadlineCheckStep
+                        nextDeadlineCheckStep: nextDeadlineCheckStep,
+                        hostPreemptionGeneration: hostPreemptionGeneration
                     )
                     let nativeStart = collectPerformanceTimings ? DispatchTime.now().uptimeNanoseconds : 0
                     let result = avz_native_execution_context_run_cached_chain_checkpointed(
@@ -2781,7 +2883,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                         UInt64(nativeStepLimit),
                         UInt64(maxSteps - totalSteps),
                         nativeChainBlockLimit,
-                        nativeCheckpointBlockInterval,
+                        max(1, vm.nativeCheckpointBlockInterval),
                         nativeChainCheckpoint,
                         Unmanaged.passUnretained(checkpoint).toOpaque(),
                         avz_native_fast_fetch_instruction,
@@ -2841,6 +2943,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     }
                     if result.status == UInt32(AVZ_NATIVE_STATUS_HALTED) {
                         stopReason = .halted
+                        return NativeBurstLoopResult.yielded
+                    }
+                    if result.status == UInt32(AVZ_NATIVE_STATUS_YIELDED) {
+                        stopReason = .yielded
                         return NativeBurstLoopResult.yielded
                     }
                     if checkpoint.shouldYield || result.steps == 0 {
@@ -3146,6 +3252,14 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 steps: accountedSteps,
                 stopReason: nil,
                 shouldContinue: true,
+                unsupportedInstruction: unsupportedInstruction,
+                translationFault: nil
+            )
+        case UInt32(AVZ_NATIVE_STATUS_YIELDED):
+            return NativeBasicBlockExecutionOutcome(
+                steps: accountedSteps,
+                stopReason: .yielded,
+                shouldContinue: false,
                 unsupportedInstruction: unsupportedInstruction,
                 translationFault: nil
             )
@@ -3688,7 +3802,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             }
         }
 
-        nativeContext.vm.invalidateTranslationCache()
+        nativeContext.vm.executeSystemMaintenanceInstruction(instruction)
         return 1
     }
 
@@ -3731,27 +3845,39 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     private let nativeSynchronousException: AVZNativeSynchronousExceptionCallback = {
         context,
         instruction,
+        registers,
         pstate,
         sp,
         pc
     in
-        guard let context, let pstate, let sp, let pc else {
+        guard let context, let registers, let pstate, let sp, let pc else {
             return 0
         }
         let nativeContext = Unmanaged<NativeMemoryContext>.fromOpaque(context).takeUnretainedValue()
         let vm = nativeContext.vm
+        for index in 0..<31 {
+            vm.cpu.x[index] = registers[index]
+        }
         vm.cpu.pstate = pstate.pointee
         vm.cpu.sp = sp.pointee
         vm.cpu.pc = pc.pointee
 
         if (instruction & 0xffe0_001f) == 0xd400_0001 {
             nativeContext.backend.routeSupervisorCall(vm, instruction: instruction)
+        } else if (instruction & 0xffe0_001f) == 0xd400_0002 ||
+                    (instruction & 0xffe0_001f) == 0xd400_0003 {
+            guard vm.handleFirmwareCall(instruction: instruction) else {
+                return 0
+            }
         } else if (instruction & 0xffe0_001f) == 0xd420_0000 {
             nativeContext.backend.routeBreakpointException(vm, instruction: instruction)
         } else {
             return 0
         }
 
+        for index in 0..<31 {
+            registers[index] = vm.cpu.x[index]
+        }
         pstate.pointee = vm.cpu.pstate
         sp.pointee = vm.cpu.sp
         pc.pointee = vm.cpu.pc
@@ -3771,15 +3897,17 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         let nativeContext = Unmanaged<NativeMemoryContext>.fromOpaque(context).takeUnretainedValue()
         let vm = nativeContext.vm
         vm.cpu.pc = pc.pointee
+        let yielded: Bool
         if instruction == 0xd503_205f {
             nativeContext.backend.executeWaitForEvent(vm)
+            yielded = false
         } else if instruction == 0xd503_207f {
-            nativeContext.backend.executeWaitForInterrupt(vm)
+            yielded = nativeContext.backend.executeWaitForInterrupt(vm)
         } else {
             return 0
         }
         pc.pointee = vm.cpu.pc
-        return 1
+        return yielded ? Int32(AVZ_NATIVE_WAIT_YIELD) : Int32(AVZ_NATIVE_WAIT_CONTINUE)
     }
 
     private func executeDecodedBasicBlock(
@@ -4009,6 +4137,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             return .exceptionStorm(exceptionStorm.entry.returnAddress, exceptionStorm.count)
         }
 
+        if vm.activeVirtualCPUIsWaitingForInterrupt {
+            return .yielded
+        }
+
         return nil
     }
 
@@ -4066,6 +4198,14 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
         if (instruction & 0xffe0_001f) == 0xd400_0001 {
             routeSupervisorCall(vm, instruction: instruction)
+            return
+        }
+
+        if (instruction & 0xffe0_001f) == 0xd400_0002 ||
+            (instruction & 0xffe0_001f) == 0xd400_0003 {
+            guard vm.handleFirmwareCall(instruction: instruction) else {
+                throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+            }
             return
         }
 
@@ -4632,6 +4772,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         case halt
         case exceptionReturn
         case supervisorCall
+        case firmwareCall
         case breakpoint
         case clearExclusive
         case barrier
@@ -5682,6 +5823,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if (instruction & 0xffe0_001f) == 0xd440_0000 { return .halt }
         if instruction == 0xd69f_03e0 { return .exceptionReturn }
         if (instruction & 0xffe0_001f) == 0xd400_0001 { return .supervisorCall }
+        if (instruction & 0xffe0_001f) == 0xd400_0002 ||
+            (instruction & 0xffe0_001f) == 0xd400_0003 { return .firmwareCall }
         if (instruction & 0xffe0_001f) == 0xd420_0000 { return .breakpoint }
         if (instruction & 0xffff_f0ff) == 0xd503_305f { return .clearExclusive }
         if isBarrier(instruction) { return .barrier }
@@ -5883,6 +6026,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             executeExceptionReturn(vm)
         case .supervisorCall:
             routeSupervisorCall(vm, instruction: instruction)
+        case .firmwareCall:
+            guard vm.handleFirmwareCall(instruction: instruction) else {
+                throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+            }
         case .breakpoint:
             routeBreakpointException(vm, instruction: instruction)
         case .clearExclusive:
@@ -6152,7 +6299,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         guard (vm.cpu.pstate & ARM64PState.irqMask) == 0 else {
             return
         }
-        guard vm.interruptController.peekPending() != nil else {
+        guard vm.interruptController.peekPending(targetVCPU: vm.activeVCPUID) != nil else {
             return
         }
 
@@ -6179,7 +6326,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             previousPState: previousPState,
             newPState: newPState,
             currentEL: Int(vm.cpu.currentExceptionLevel),
-            irqLine: vm.interruptController.peekPending()
+            irqLine: vm.interruptController.peekPending(targetVCPU: vm.activeVCPUID)
         ))
 
         vm.switchActiveStackPointer(from: previousPState, to: newPState)
@@ -6192,13 +6339,15 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         vm.cpu.pc += 4
     }
 
-    private func executeWaitForInterrupt(_ vm: VirtualMachine) {
+    @discardableResult
+    private func executeWaitForInterrupt(_ vm: VirtualMachine) -> Bool {
         vm.recordWaitForInterrupt()
         vm.cpu.pc += 4
-        if vm.interruptController.peekPending() == nil {
+        if vm.interruptController.peekPending(targetVCPU: vm.activeVCPUID) == nil {
             _ = vm.fastForwardGenericTimerToNextDeadline()
         }
         vm.updateGenericTimerInterruptsIfNeeded(force: true)
+        return vm.suspendActiveVirtualCPUForWaitForInterrupt()
     }
 
     private func routeSynchronousException(
@@ -6309,7 +6458,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             return
         }
 
-        vm.invalidateTranslationCache()
+        vm.executeSystemMaintenanceInstruction(instruction)
         vm.cpu.pc = pc + 4
     }
 

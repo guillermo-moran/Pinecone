@@ -39,6 +39,8 @@ public struct BootDeviceDescriptor: Codable, Equatable {
 public struct BootConfiguration: Codable, Equatable {
     public let machineName: String
     public let cpuCount: Int
+    public let cpuEnableMethod: String?
+    public let psciMethod: String?
     public let entryPoint: GuestAddress
     public let ramBase: GuestAddress
     public let ramSize: UInt64
@@ -48,6 +50,8 @@ public struct BootConfiguration: Codable, Equatable {
     public init(
         machineName: String = "arm64viz-research-vm",
         cpuCount: Int = 1,
+        cpuEnableMethod: String? = nil,
+        psciMethod: String? = nil,
         entryPoint: GuestAddress,
         ramBase: GuestAddress,
         ramSize: UInt64,
@@ -56,6 +60,8 @@ public struct BootConfiguration: Codable, Equatable {
     ) {
         self.machineName = machineName
         self.cpuCount = cpuCount
+        self.cpuEnableMethod = cpuEnableMethod
+        self.psciMethod = psciMethod
         self.entryPoint = entryPoint
         self.ramBase = ramBase
         self.ramSize = ramSize
@@ -92,9 +98,19 @@ public struct BootConfiguration: Codable, Equatable {
             lines.append("            device_type = \"cpu\";")
             lines.append("            compatible = \"arm,armv8\";")
             lines.append("            reg = <\(cpu)>;")
+            if let cpuEnableMethod {
+                lines.append("            enable-method = \"\(escape(cpuEnableMethod))\";")
+            }
             lines.append("        };")
         }
         lines.append("    };")
+        if let psciMethod {
+            lines.append("")
+            lines.append("    psci {")
+            lines.append("        compatible = \"arm,psci-1.0\", \"arm,psci-0.2\";")
+            lines.append("        method = \"\(escape(psciMethod))\";")
+            lines.append("    };")
+        }
         lines.append("")
         lines.append("    aliases {")
         if devices.contains(where: { $0.name.contains("uart") }) {

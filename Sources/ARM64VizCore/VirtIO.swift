@@ -1849,6 +1849,7 @@ public final class VirtualVirtIODevice: MMIODevice {
     public let blockSize: Int
 
     private let interruptController: InterruptController?
+    private let deviceLock = NSRecursiveLock()
     private let memory: PhysicalMemory?
     private var selectedDeviceFeatures: UInt32 = 0
     private var selectedDriverFeatures: UInt32 = 0
@@ -1889,18 +1890,20 @@ public final class VirtualVirtIODevice: MMIODevice {
     public var onDisplayFrameCommitted: (@Sendable (UInt64) -> Void)?
 
     public var pendingInputEventCount: Int {
-        max(0, pendingInputEvents.count - pendingInputReadIndex)
+        withDeviceLock { max(0, pendingInputEvents.count - pendingInputReadIndex) }
     }
 
     public var inputDiagnostics: String {
-        guard kind == .input else {
-            return ""
+        withDeviceLock {
+            guard kind == .input else {
+                return ""
+            }
+            let role = inputRole == .touchscreen ? "touch" : "key"
+            let ready = queues[0]?.ready == true ? 1 : 0
+            return "\(role)=s\(inputSamplesReceived)/f\(inputFramesGenerated)" +
+                "/d\(inputFramesDelivered):e\(inputEventsDelivered)" +
+                "/p\(pendingInputEventCount):q\(ready):x\(inputQueueStarvations)"
         }
-        let role = inputRole == .touchscreen ? "touch" : "key"
-        let ready = queues[0]?.ready == true ? 1 : 0
-        return "\(role)=s\(inputSamplesReceived)/f\(inputFramesGenerated)" +
-            "/d\(inputFramesDelivered):e\(inputEventsDelivered)" +
-            "/p\(pendingInputEventCount):q\(ready):x\(inputQueueStarvations)"
     }
 
     public init(
@@ -1947,26 +1950,42 @@ public final class VirtualVirtIODevice: MMIODevice {
     }
 
     public func attachNetworkBackend(_ backend: VirtIONetworkBackend?) {
-        networkBackend = backend
-        networkBackend?.onFramesAvailable = { [weak self] in
-            self?.pumpNetworkReceiveQueue()
+        withDeviceLock {
+            networkBackend = backend
+            networkBackend?.onFramesAvailable = { [weak self] in
+                self?.pumpNetworkReceiveQueue()
+            }
+        }
+    }
+
+    public func attachGraphicsAccelerator(
+        _ accelerator: PineconeGraphicsAccelerator?
+    ) {
+        withDeviceLock {
+            guard kind == .gpu else { return }
+            gpu?.setGraphicsAccelerator(accelerator)
         }
     }
 
     public func injectNetworkReceiveFrame(_ frame: [UInt8]) {
-        pendingReceiveFrames.append(frame)
-        pumpNetworkReceiveQueue()
+        withDeviceLock {
+            pendingReceiveFrames.append(frame)
+            pumpNetworkReceiveQueue()
+        }
     }
 
     public func pumpNetworkReceiveQueue() {
-        guard kind == .network else {
-            return
+        withDeviceLock {
+            guard kind == .network else {
+                return
+            }
+            try? processNetworkReceiveQueue()
+            updateInterruptLine()
         }
-        try? processNetworkReceiveQueue()
-        updateInterruptLine()
     }
 
     public func enqueueTouch(x: UInt32, y: UInt32, isDown: Bool) {
+        withDeviceLock {
         guard kind == .input, inputRole == .touchscreen else {
             return
         }
@@ -2024,9 +2043,11 @@ public final class VirtualVirtIODevice: MMIODevice {
             interruptStatus |= Self.usedBufferInterrupt
             updateInterruptLine()
         }
+        }
     }
 
     public func enqueueKey(code: UInt16, value: Int32) {
+        withDeviceLock {
         guard kind == .input, inputRole == .keyboard else {
             return
         }
@@ -2038,24 +2059,29 @@ public final class VirtualVirtIODevice: MMIODevice {
             interruptStatus |= Self.usedBufferInterrupt
             updateInterruptLine()
         }
+        }
     }
 
     public var storageBytes: [UInt8] {
-        guard let blockStorage else {
-            return []
+        withDeviceLock {
+            guard let blockStorage else {
+                return []
+            }
+            return (try? blockStorage.snapshot()) ?? []
         }
-        return (try? blockStorage.snapshot()) ?? []
     }
 
     public var storageByteCount: Int {
-        blockStorage?.count ?? 0
+        withDeviceLock { blockStorage?.count ?? 0 }
     }
 
     public func flushStorage() throws {
-        guard kind == .block, let blockStorage else {
-            throw VMError.deviceError("\(name) is not a block-capable virtio device")
+        try withDeviceLock {
+            guard kind == .block, let blockStorage else {
+                throw VMError.deviceError("\(name) is not a block-capable virtio device")
+            }
+            try blockStorage.flush()
         }
-        try blockStorage.flush()
     }
 
     public func displaySnapshot(afterGeneration previousGeneration: UInt64? = nil) -> VirtualFramebufferSnapshot? {
@@ -2094,20 +2120,22 @@ public final class VirtualVirtIODevice: MMIODevice {
     }
 
     public var blockRequestTypeCounts: [VirtIOBlockRequestTypeCount] {
-        completedBlockRequestTypes
-            .map {
-                VirtIOBlockRequestTypeCount(
-                    requestType: $0.key,
-                    name: Self.blockRequestTypeName($0.key),
-                    count: $0.value
-                )
-            }
-            .sorted {
-                if $0.requestType == $1.requestType {
-                    return $0.name < $1.name
+        withDeviceLock {
+            completedBlockRequestTypes
+                .map {
+                    VirtIOBlockRequestTypeCount(
+                        requestType: $0.key,
+                        name: Self.blockRequestTypeName($0.key),
+                        count: $0.value
+                    )
                 }
-                return $0.requestType < $1.requestType
-            }
+                .sorted {
+                    if $0.requestType == $1.requestType {
+                        return $0.name < $1.name
+                    }
+                    return $0.requestType < $1.requestType
+                }
+        }
     }
 
     public static func blockRequestTypeName(_ requestType: UInt32) -> String {
@@ -2128,6 +2156,7 @@ public final class VirtualVirtIODevice: MMIODevice {
     }
 
     public func replaceStorage(_ bytes: [UInt8], notifyConfigChange: Bool = true) throws {
+        try withDeviceLock {
         guard kind == .block else {
             throw VMError.deviceError("\(name) is not a block-capable virtio device")
         }
@@ -2146,9 +2175,11 @@ public final class VirtualVirtIODevice: MMIODevice {
             interruptStatus |= Self.configChangeInterrupt
             updateInterruptLine()
         }
+        }
     }
 
     public func read(offset: UInt64, width: MMIOWidth) throws -> UInt64 {
+        withDeviceLock {
         switch offset {
         case 0x000:
             return UInt64(Self.magicValue)
@@ -2196,9 +2227,11 @@ public final class VirtualVirtIODevice: MMIODevice {
         default:
             return 0
         }
+        }
     }
 
     public func write(offset: UInt64, width: MMIOWidth, value: UInt64) throws {
+        withDeviceLock {
         switch offset {
         case 0x014:
             selectedDeviceFeatures = UInt32(value & 0xffff_ffff)
@@ -2244,10 +2277,18 @@ public final class VirtualVirtIODevice: MMIODevice {
         default:
             return
         }
+        }
     }
 
     public func reset() {
-        resetNegotiationState()
+        withDeviceLock { resetNegotiationState() }
+    }
+
+    @inline(__always)
+    private func withDeviceLock<T>(_ body: () throws -> T) rethrows -> T {
+        deviceLock.lock()
+        defer { deviceLock.unlock() }
+        return try body()
     }
 
     private func resetNegotiationState() {
@@ -2666,7 +2707,8 @@ public final class VirtualVirtIODevice: MMIODevice {
                 recordBlockRequest(type: requestType, sector: sector, payloadLength: dataLength, status: 1)
                 return 1
             }
-            var copied = 0
+            var guestBuffers: [UnsafeMutableRawBufferPointer] = []
+            guestBuffers.reserveCapacity(dataDescriptors.count)
             for descriptor in dataDescriptors {
                 guard descriptor.isDeviceWritable else {
                     try writeStatus(1, descriptors: descriptors, memory: memory)
@@ -2674,14 +2716,16 @@ public final class VirtualVirtIODevice: MMIODevice {
                     return 1
                 }
                 let count = Int(descriptor.length)
-                let bytes = try blockStorage.read(at: diskOffset + copied, count: count)
-                try memory.copyBytes(
-                    from: bytes,
-                    sourceOffset: 0,
-                    count: count,
-                    to: descriptor.address
+                guestBuffers.append(
+                    try memory.persistentMutableBytes(
+                        at: descriptor.address,
+                        count: count
+                    )
                 )
-                copied += count
+            }
+            try blockStorage.read(into: guestBuffers, at: diskOffset)
+            for descriptor in dataDescriptors {
+                memory.markDirty(at: descriptor.address, count: Int(descriptor.length))
             }
             try writeStatus(0, descriptors: descriptors, memory: memory)
             recordBlockRequest(type: requestType, sector: sector, payloadLength: dataLength, status: 0)
@@ -2696,7 +2740,8 @@ public final class VirtualVirtIODevice: MMIODevice {
                 recordBlockRequest(type: requestType, sector: sector, payloadLength: dataLength, status: 1)
                 return 1
             }
-            var copied = 0
+            var guestBuffers: [UnsafeRawBufferPointer] = []
+            guestBuffers.reserveCapacity(dataDescriptors.count)
             for descriptor in dataDescriptors {
                 guard !descriptor.isDeviceWritable else {
                     try writeStatus(1, descriptors: descriptors, memory: memory)
@@ -2704,16 +2749,16 @@ public final class VirtualVirtIODevice: MMIODevice {
                     return 1
                 }
                 let count = Int(descriptor.length)
-                var bytes = Array(repeating: UInt8(0), count: count)
-                try memory.copyBytes(
-                    from: descriptor.address,
-                    count: count,
-                    to: &bytes,
-                    destinationOffset: 0
+                guestBuffers.append(
+                    UnsafeRawBufferPointer(
+                        try memory.persistentMutableBytes(
+                            at: descriptor.address,
+                            count: count
+                        )
+                    )
                 )
-                try blockStorage.write(bytes, at: diskOffset + copied)
-                copied += count
             }
+            try blockStorage.write(from: guestBuffers, at: diskOffset)
             try writeStatus(0, descriptors: descriptors, memory: memory)
             recordBlockRequest(type: requestType, sector: sector, payloadLength: dataLength, status: 0)
             return 1

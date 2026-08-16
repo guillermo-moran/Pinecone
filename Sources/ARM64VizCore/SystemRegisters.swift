@@ -187,6 +187,16 @@ public struct ARM64SystemRegisterBank: Codable, Equatable {
         refreshKnownSystemRegisters()
     }
 
+    public mutating func reset(mpidr: UInt64, counterTicks: UInt64 = 0) {
+        reset()
+        self.counterTicks = counterTicks
+        setStoredValue(rawKey: ARM64SystemRegister.mpidrEL1.rawValue, value: mpidr)
+    }
+
+    public mutating func synchronizeCounterTicks(_ counterTicks: UInt64) {
+        self.counterTicks = counterTicks
+    }
+
     public mutating func advance(cycles: UInt64 = 1) {
         counterTicks &+= cycles
     }

@@ -34,7 +34,7 @@ final class ARM64FramebufferNativeTests: XCTestCase {
         let stride = width * 4
         var source = [UInt8](repeating: 0, count: stride * 2)
         var destination = [UInt8](repeating: 0, count: stride * 2)
-        setPixel([200, 100, 50, 128], x: 1, y: 0, stride: stride, in: &source)
+        setPixel([100, 50, 25, 128], x: 1, y: 0, stride: stride, in: &source)
         setPixel([20, 40, 60, 255], x: 2, y: 1, stride: stride, in: &destination)
 
         let copied = source.withUnsafeBytes { sourceBytes in
@@ -54,7 +54,7 @@ final class ARM64FramebufferNativeTests: XCTestCase {
             }
         }
         XCTAssertEqual(copied, 1)
-        XCTAssertEqual(Array(destination[(stride)..<(stride + 4)]), [200, 100, 50, 128])
+        XCTAssertEqual(Array(destination[(stride)..<(stride + 4)]), [100, 50, 25, 128])
 
         let blended = source.withUnsafeBytes { sourceBytes in
             destination.withUnsafeMutableBytes { destinationBytes in
@@ -74,6 +74,65 @@ final class ARM64FramebufferNativeTests: XCTestCase {
         }
         XCTAssertEqual(blended, 1)
         XCTAssertEqual(Array(destination[(stride + 8)..<(stride + 12)]), [110, 70, 55, 255])
+    }
+
+    func testNativeScaledCopyAndSourceOverUseNearestSampling() {
+        let sourceStride = 8
+        let destinationStride = 16
+        let source: [UInt8] = [
+            10, 20, 30, 255,
+            40, 50, 60, 128
+        ]
+        var copied = [UInt8](repeating: 0, count: destinationStride)
+        var blended = [UInt8](repeating: 20, count: destinationStride)
+
+        let copyResult = source.withUnsafeBytes { sourceBytes in
+            copied.withUnsafeMutableBytes { destinationBytes in
+                avz_framebuffer_scale_copy_bgra8(
+                    sourceBytes.baseAddress, sourceStride, 0, 0, 2, 1,
+                    destinationBytes.baseAddress, destinationStride, 0, 0, 4, 1
+                )
+            }
+        }
+        XCTAssertEqual(copyResult, 1)
+        XCTAssertEqual(copied, [
+            10, 20, 30, 255, 10, 20, 30, 255,
+            40, 50, 60, 128, 40, 50, 60, 128
+        ])
+
+        let blendResult = source.withUnsafeBytes { sourceBytes in
+            blended.withUnsafeMutableBytes { destinationBytes in
+                avz_framebuffer_scale_source_over_bgra8(
+                    sourceBytes.baseAddress, sourceStride, 0, 0, 2, 1,
+                    destinationBytes.baseAddress, destinationStride, 0, 0, 4, 1
+                )
+            }
+        }
+        XCTAssertEqual(blendResult, 1)
+        XCTAssertEqual(Array(blended.prefix(8)), [10, 20, 30, 255, 10, 20, 30, 255])
+        XCTAssertEqual(Array(blended.suffix(8)), [50, 60, 70, 138, 50, 60, 70, 138])
+    }
+
+    func testBilinearScaledCopyInterpolatesPixelCenters() {
+        let source: [UInt8] = [
+            0, 0, 0, 255,
+            100, 200, 240, 255
+        ]
+        var destination = [UInt8](repeating: 0, count: 12)
+        let result = source.withUnsafeBytes { sourceBytes in
+            destination.withUnsafeMutableBytes { destinationBytes in
+                avz_framebuffer_bilinear_scale_copy_bgra8(
+                    sourceBytes.baseAddress, 8, 0, 0, 2, 1,
+                    destinationBytes.baseAddress, 12, 0, 0, 3, 1
+                )
+            }
+        }
+        XCTAssertEqual(result, 1)
+        XCTAssertEqual(destination, [
+            0, 0, 0, 255,
+            50, 100, 120, 255,
+            100, 200, 240, 255
+        ])
     }
 
     func testNormalizeBGRA8SupportsEveryVirtIO2DPixelFormat() {

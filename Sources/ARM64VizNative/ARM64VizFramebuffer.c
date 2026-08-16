@@ -268,6 +268,78 @@ int avz_framebuffer_copy_bgra8(
     return 1;
 }
 
+int avz_framebuffer_fill_bgra8(
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t width,
+    size_t height,
+    uint32_t premultiplied_bgra
+) {
+    if (destination == NULL || width == 0 || height == 0 ||
+        destination_x > SIZE_MAX - width || destination_y > SIZE_MAX - height ||
+        destination_x + width > destination_stride / 4u) {
+        return 0;
+    }
+
+    for (size_t y = 0; y < height; y++) {
+        uint32_t *row = (uint32_t *)(destination +
+            (destination_y + y) * destination_stride) + destination_x;
+        size_t x = 0;
+#if AVZ_FRAMEBUFFER_HAS_NEON
+        const uint32x4_t pixels = vdupq_n_u32(premultiplied_bgra);
+        for (; x + 4u <= width; x += 4u) {
+            vst1q_u32(row + x, pixels);
+        }
+#endif
+        for (; x < width; x++) {
+            row[x] = premultiplied_bgra;
+        }
+    }
+    return 1;
+}
+
+int avz_framebuffer_fill_over_bgra8(
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t width,
+    size_t height,
+    uint32_t premultiplied_bgra
+) {
+    if (destination == NULL || width == 0 || height == 0 ||
+        destination_x > SIZE_MAX - width || destination_y > SIZE_MAX - height ||
+        destination_x + width > destination_stride / 4u) {
+        return 0;
+    }
+    const uint32_t alpha = premultiplied_bgra >> 24;
+    if (alpha == UINT8_MAX) {
+        return avz_framebuffer_fill_bgra8(
+            destination, destination_stride, destination_x, destination_y,
+            width, height, premultiplied_bgra
+        );
+    }
+    const uint32_t inverse_alpha = UINT8_MAX - alpha;
+    for (size_t y = 0; y < height; y++) {
+        uint8_t *row = destination + (destination_y + y) * destination_stride +
+            destination_x * 4u;
+        for (size_t x = 0; x < width; x++) {
+            uint8_t *pixel = row + x * 4u;
+            for (size_t channel = 0; channel < 4u; channel++) {
+                uint32_t product = (uint32_t)pixel[channel] * inverse_alpha;
+                product += 128u;
+                product += product >> 8u;
+                uint32_t value = ((premultiplied_bgra >> (channel * 8u)) &
+                    UINT8_MAX) + (product >> 8u);
+                pixel[channel] = (uint8_t)(value > UINT8_MAX ? UINT8_MAX : value);
+            }
+        }
+    }
+    return 1;
+}
+
 #if AVZ_FRAMEBUFFER_HAS_NEON
 static uint8x8_t avz_framebuffer_divide_255_round(uint16x8_t value) {
     value = vaddq_u16(value, vdupq_n_u16(128u));
@@ -309,17 +381,16 @@ int avz_framebuffer_source_over_bgra8(
             uint8x8_t alpha = foreground.val[3];
             uint8x8_t inverse_alpha = vsub_u8(vdup_n_u8(UINT8_MAX), alpha);
             uint8x8x4_t output;
-            for (unsigned component = 0; component < 3; component++) {
-                uint16x8_t blended = vmull_u8(foreground.val[component], alpha);
-                blended = vmlal_u8(
-                    blended,
+            for (unsigned component = 0; component < 4; component++) {
+                uint16x8_t scaled_background = vmull_u8(
                     background.val[component],
                     inverse_alpha
                 );
-                output.val[component] =
-                    avz_framebuffer_divide_255_round(blended);
+                output.val[component] = vqadd_u8(
+                    foreground.val[component],
+                    avz_framebuffer_divide_255_round(scaled_background)
+                );
             }
-            output.val[3] = vdup_n_u8(UINT8_MAX);
             vst4_u8(destination_row + column * 4u, output);
         }
 #endif
@@ -328,13 +399,500 @@ int avz_framebuffer_source_over_bgra8(
             uint8_t *background = destination_row + column * 4u;
             unsigned alpha = foreground[3];
             unsigned inverse_alpha = UINT8_MAX - alpha;
-            for (unsigned component = 0; component < 3; component++) {
+            for (unsigned component = 0; component < 4; component++) {
+                unsigned product = background[component] * inverse_alpha;
+                product += 128u;
+                product += product >> 8u;
+                unsigned value = foreground[component] + (product >> 8u);
                 background[component] = (uint8_t)(
-                    (foreground[component] * alpha +
-                     background[component] * inverse_alpha + 127u) / 255u
+                    value > UINT8_MAX ? UINT8_MAX : value
                 );
             }
-            background[3] = UINT8_MAX;
+        }
+    }
+    return 1;
+}
+
+static size_t avz_framebuffer_scaled_coordinate(
+    size_t position,
+    size_t source_extent,
+    size_t destination_extent
+) {
+    /* Sample the nearest source pixel at destination-pixel centers. */
+    const size_t quotient = source_extent / destination_extent;
+    const size_t remainder = source_extent % destination_extent;
+    return position * quotient +
+        ((position * remainder + remainder / 2u) / destination_extent);
+}
+
+static int avz_framebuffer_scale_parameters_are_valid(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+) {
+    return source != NULL && destination != NULL &&
+        source_width != 0 && source_height != 0 &&
+        destination_width != 0 && destination_height != 0 &&
+        source_x <= SIZE_MAX - source_width &&
+        source_y <= SIZE_MAX - source_height &&
+        destination_x <= SIZE_MAX - destination_width &&
+        destination_y <= SIZE_MAX - destination_height &&
+        source_x + source_width <= source_stride / 4u &&
+        destination_x + destination_width <= destination_stride / 4u;
+}
+
+int avz_framebuffer_scale_copy_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+) {
+    if (!avz_framebuffer_scale_parameters_are_valid(
+            source, source_stride, source_x, source_y,
+            source_width, source_height, destination, destination_stride,
+            destination_x, destination_y,
+            destination_width, destination_height)) {
+        return 0;
+    }
+
+    for (size_t y = 0; y < destination_height; y++) {
+        const size_t sampled_y = source_y + avz_framebuffer_scaled_coordinate(
+            y, source_height, destination_height);
+        const uint32_t *source_row = (const uint32_t *)(
+            source + sampled_y * source_stride);
+        uint32_t *destination_row = (uint32_t *)(
+            destination + (destination_y + y) * destination_stride);
+        for (size_t x = 0; x < destination_width; x++) {
+            const size_t sampled_x = source_x + avz_framebuffer_scaled_coordinate(
+                x, source_width, destination_width);
+            destination_row[destination_x + x] = source_row[sampled_x];
+        }
+    }
+    return 1;
+}
+
+int avz_framebuffer_scale_source_over_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+) {
+    if (!avz_framebuffer_scale_parameters_are_valid(
+            source, source_stride, source_x, source_y,
+            source_width, source_height, destination, destination_stride,
+            destination_x, destination_y,
+            destination_width, destination_height)) {
+        return 0;
+    }
+
+    for (size_t y = 0; y < destination_height; y++) {
+        const size_t sampled_y = source_y + avz_framebuffer_scaled_coordinate(
+            y, source_height, destination_height);
+        const uint8_t *source_row = source + sampled_y * source_stride;
+        uint8_t *destination_row = destination +
+            (destination_y + y) * destination_stride;
+        for (size_t x = 0; x < destination_width; x++) {
+            const size_t sampled_x = source_x + avz_framebuffer_scaled_coordinate(
+                x, source_width, destination_width);
+            const uint8_t *source_pixel = source_row + sampled_x * 4u;
+            uint8_t *destination_pixel = destination_row +
+                (destination_x + x) * 4u;
+            const uint16_t inverse_alpha = (uint16_t)(255u - source_pixel[3]);
+            for (size_t channel = 0; channel < 4u; channel++) {
+                uint16_t product = (uint16_t)destination_pixel[channel] *
+                    inverse_alpha;
+                product = (uint16_t)(product + 128u);
+                uint16_t blended = (uint16_t)source_pixel[channel] +
+                    ((product + (product >> 8u)) >> 8u);
+                destination_pixel[channel] = blended > 255u
+                    ? 255u
+                    : (uint8_t)blended;
+            }
+        }
+    }
+    return 1;
+}
+
+static uint64_t avz_framebuffer_bilinear_position(
+    size_t output_position,
+    size_t source_extent,
+    size_t destination_extent
+) {
+    uint64_t position = (((uint64_t)output_position * 2u + 1u) *
+        source_extent << 15u) / destination_extent;
+    if (position <= (1u << 15u)) {
+        return 0;
+    }
+    position -= 1u << 15u;
+    const uint64_t maximum = (uint64_t)(source_extent - 1u) << 16u;
+    return position < maximum ? position : maximum;
+}
+
+static void avz_framebuffer_bilinear_sample_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    size_t output_x,
+    size_t output_y,
+    size_t output_width,
+    size_t output_height,
+    uint8_t sampled[4]
+) {
+    const uint64_t fixed_x = avz_framebuffer_bilinear_position(
+        output_x, source_width, output_width);
+    const uint64_t fixed_y = avz_framebuffer_bilinear_position(
+        output_y, source_height, output_height);
+    const size_t left = source_x + (size_t)(fixed_x >> 16u);
+    const size_t top = source_y + (size_t)(fixed_y >> 16u);
+    const size_t right = left + ((fixed_x >> 16u) + 1u < source_width);
+    const size_t bottom = top + ((fixed_y >> 16u) + 1u < source_height);
+    const uint32_t fraction_x = (uint32_t)fixed_x & 0xffffu;
+    const uint32_t fraction_y = (uint32_t)fixed_y & 0xffffu;
+    const uint32_t inverse_x = 0x10000u - fraction_x;
+    const uint32_t inverse_y = 0x10000u - fraction_y;
+    const uint8_t *top_left = source + top * source_stride + left * 4u;
+    const uint8_t *top_right = source + top * source_stride + right * 4u;
+    const uint8_t *bottom_left = source + bottom * source_stride + left * 4u;
+    const uint8_t *bottom_right = source + bottom * source_stride + right * 4u;
+    for (size_t channel = 0; channel < 4u; channel++) {
+        const uint64_t upper = (uint64_t)top_left[channel] * inverse_x +
+            (uint64_t)top_right[channel] * fraction_x;
+        const uint64_t lower = (uint64_t)bottom_left[channel] * inverse_x +
+            (uint64_t)bottom_right[channel] * fraction_x;
+        sampled[channel] = (uint8_t)((upper * inverse_y +
+            lower * fraction_y + (UINT64_C(1) << 31u)) >> 32u);
+    }
+}
+
+int avz_framebuffer_bilinear_scale_copy_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+) {
+    if (!avz_framebuffer_scale_parameters_are_valid(
+            source, source_stride, source_x, source_y,
+            source_width, source_height, destination, destination_stride,
+            destination_x, destination_y,
+            destination_width, destination_height)) {
+        return 0;
+    }
+    for (size_t y = 0; y < destination_height; y++) {
+        uint8_t *destination_row = destination +
+            (destination_y + y) * destination_stride;
+        for (size_t x = 0; x < destination_width; x++) {
+            uint8_t sampled[4];
+            avz_framebuffer_bilinear_sample_bgra8(
+                source, source_stride, source_x, source_y,
+                source_width, source_height, x, y,
+                destination_width, destination_height, sampled);
+            memcpy(destination_row + (destination_x + x) * 4u, sampled, 4u);
+        }
+    }
+    return 1;
+}
+
+int avz_framebuffer_bilinear_scale_source_over_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height
+) {
+    if (!avz_framebuffer_scale_parameters_are_valid(
+            source, source_stride, source_x, source_y,
+            source_width, source_height, destination, destination_stride,
+            destination_x, destination_y,
+            destination_width, destination_height)) {
+        return 0;
+    }
+    for (size_t y = 0; y < destination_height; y++) {
+        uint8_t *destination_row = destination +
+            (destination_y + y) * destination_stride;
+        for (size_t x = 0; x < destination_width; x++) {
+            uint8_t sampled[4];
+            avz_framebuffer_bilinear_sample_bgra8(
+                source, source_stride, source_x, source_y,
+                source_width, source_height, x, y,
+                destination_width, destination_height, sampled);
+            uint8_t *destination_pixel = destination_row +
+                (destination_x + x) * 4u;
+            const uint16_t inverse_alpha = (uint16_t)(255u - sampled[3]);
+            for (size_t channel = 0; channel < 4u; channel++) {
+                uint16_t product = (uint16_t)destination_pixel[channel] *
+                    inverse_alpha;
+                product = (uint16_t)(product + 128u);
+                uint16_t blended = (uint16_t)sampled[channel] +
+                    ((product + (product >> 8u)) >> 8u);
+                destination_pixel[channel] = blended > 255u
+                    ? 255u
+                    : (uint8_t)blended;
+            }
+        }
+    }
+    return 1;
+}
+
+static uint8_t avz_framebuffer_multiply_255(uint8_t value, uint8_t alpha) {
+    uint32_t product = (uint32_t)value * alpha + 128u;
+    return (uint8_t)((product + (product >> 8u)) >> 8u);
+}
+
+int avz_framebuffer_masked_composite_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    const uint8_t *mask,
+    size_t mask_stride,
+    uint8_t solid_mask_alpha,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height,
+    uint32_t premultiplied_bgra,
+    uint32_t operation,
+    int bilinear_filtering
+) {
+    const int is_fill = operation == 3u || operation == 4u;
+    const int is_over = operation == 2u || operation == 4u;
+    if (destination == NULL || destination_width == 0 ||
+        destination_height == 0 || (!is_fill && source == NULL) ||
+        (operation < 1u || operation > 4u) ||
+        destination_x > SIZE_MAX - destination_width ||
+        destination_y > SIZE_MAX - destination_height ||
+        destination_x + destination_width > destination_stride / 4u ||
+        (mask != NULL && mask_stride / 4u < destination_width) ||
+        (!is_fill && !avz_framebuffer_scale_parameters_are_valid(
+            source, source_stride, source_x, source_y,
+            source_width, source_height, destination, destination_stride,
+            destination_x, destination_y,
+            destination_width, destination_height))) {
+        return 0;
+    }
+
+    const uint8_t fill[4] = {
+        (uint8_t)premultiplied_bgra,
+        (uint8_t)(premultiplied_bgra >> 8u),
+        (uint8_t)(premultiplied_bgra >> 16u),
+        (uint8_t)(premultiplied_bgra >> 24u)
+    };
+    for (size_t y = 0; y < destination_height; y++) {
+        uint8_t *destination_row = destination +
+            (destination_y + y) * destination_stride + destination_x * 4u;
+        const uint8_t *mask_row = mask != NULL ? mask + y * mask_stride : NULL;
+        for (size_t x = 0; x < destination_width; x++) {
+            uint8_t sampled[4];
+            if (is_fill) {
+                memcpy(sampled, fill, sizeof(sampled));
+            } else if (bilinear_filtering) {
+                avz_framebuffer_bilinear_sample_bgra8(
+                    source, source_stride, source_x, source_y,
+                    source_width, source_height, x, y,
+                    destination_width, destination_height, sampled);
+            } else {
+                const size_t sampled_x = source_x +
+                    avz_framebuffer_scaled_coordinate(
+                        x, source_width, destination_width);
+                const size_t sampled_y = source_y +
+                    avz_framebuffer_scaled_coordinate(
+                        y, source_height, destination_height);
+                memcpy(sampled,
+                    source + sampled_y * source_stride + sampled_x * 4u,
+                    sizeof(sampled));
+            }
+
+            const uint8_t alpha = mask_row != NULL
+                ? mask_row[x * 4u + 3u]
+                : solid_mask_alpha;
+            for (size_t channel = 0; channel < 4u; channel++)
+                sampled[channel] = avz_framebuffer_multiply_255(
+                    sampled[channel], alpha);
+
+            uint8_t *output = destination_row + x * 4u;
+            if (!is_over) {
+                memcpy(output, sampled, sizeof(sampled));
+                continue;
+            }
+            const uint8_t inverse_alpha = (uint8_t)(UINT8_MAX - sampled[3]);
+            for (size_t channel = 0; channel < 4u; channel++) {
+                uint32_t value = sampled[channel] +
+                    avz_framebuffer_multiply_255(output[channel], inverse_alpha);
+                output[channel] = (uint8_t)(
+                    value > UINT8_MAX ? UINT8_MAX : value);
+            }
+        }
+    }
+    return 1;
+}
+
+int avz_framebuffer_composite_bgra8(
+    const uint8_t *source,
+    size_t source_stride,
+    size_t source_x,
+    size_t source_y,
+    size_t source_width,
+    size_t source_height,
+    const uint8_t *mask,
+    size_t mask_stride,
+    uint8_t solid_mask_alpha,
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t destination_x,
+    size_t destination_y,
+    size_t destination_width,
+    size_t destination_height,
+    uint32_t premultiplied_bgra,
+    uint32_t blend_operator,
+    int source_is_solid,
+    int bilinear_filtering,
+    int component_alpha_mask,
+    int mask_is_packed_a8
+) {
+    const int source_required = blend_operator != 0u && blend_operator != 2u;
+    if (destination == NULL || destination_width == 0 ||
+        destination_height == 0 ||
+        (blend_operator != 0u && blend_operator != 1u &&
+         blend_operator != 2u && blend_operator != 3u &&
+         blend_operator != 12u) ||
+        (source_required && !source_is_solid && source == NULL) ||
+        destination_x > SIZE_MAX - destination_width ||
+        destination_y > SIZE_MAX - destination_height ||
+        destination_x + destination_width > destination_stride / 4u ||
+        (mask != NULL && mask_stride == 0) ||
+        (source_required && !source_is_solid &&
+         !avz_framebuffer_scale_parameters_are_valid(
+            source, source_stride, source_x, source_y,
+            source_width, source_height, destination, destination_stride,
+            destination_x, destination_y,
+            destination_width, destination_height))) {
+        return 0;
+    }
+
+    const uint8_t solid[4] = {
+        (uint8_t)premultiplied_bgra,
+        (uint8_t)(premultiplied_bgra >> 8u),
+        (uint8_t)(premultiplied_bgra >> 16u),
+        (uint8_t)(premultiplied_bgra >> 24u)
+    };
+    for (size_t y = 0; y < destination_height; y++) {
+        uint8_t *destination_row = destination +
+            (destination_y + y) * destination_stride + destination_x * 4u;
+        const uint8_t *mask_row = mask != NULL ? mask + y * mask_stride : NULL;
+        for (size_t x = 0; x < destination_width; x++) {
+            uint8_t *output = destination_row + x * 4u;
+            if (blend_operator == 0u) {
+                memset(output, 0, 4u);
+                continue;
+            }
+            if (blend_operator == 2u)
+                continue;
+
+            uint8_t sampled[4];
+            if (source_is_solid) {
+                memcpy(sampled, solid, sizeof(sampled));
+            } else if (bilinear_filtering) {
+                avz_framebuffer_bilinear_sample_bgra8(
+                    source, source_stride, source_x, source_y,
+                    source_width, source_height, x, y,
+                    destination_width, destination_height, sampled);
+            } else {
+                const size_t sampled_x = source_x +
+                    avz_framebuffer_scaled_coordinate(
+                        x, source_width, destination_width);
+                const size_t sampled_y = source_y +
+                    avz_framebuffer_scaled_coordinate(
+                        y, source_height, destination_height);
+                memcpy(sampled,
+                    source + sampled_y * source_stride + sampled_x * 4u,
+                    sizeof(sampled));
+            }
+
+            uint8_t coverage[4];
+            if (mask_row == NULL) {
+                memset(coverage, solid_mask_alpha, sizeof(coverage));
+            } else if (mask_is_packed_a8) {
+                memset(coverage, mask_row[x], sizeof(coverage));
+            } else if (component_alpha_mask) {
+                memcpy(coverage, mask_row + x * 4u, sizeof(coverage));
+            } else {
+                memset(coverage, mask_row[x * 4u + 3u], sizeof(coverage));
+            }
+
+            uint8_t masked_source[4];
+            for (size_t channel = 0; channel < 4u; channel++)
+                masked_source[channel] = avz_framebuffer_multiply_255(
+                    sampled[channel], coverage[channel]);
+            if (blend_operator == 1u) {
+                memcpy(output, masked_source, sizeof(masked_source));
+                continue;
+            }
+            if (blend_operator == 12u) {
+                for (size_t channel = 0; channel < 4u; channel++) {
+                    uint16_t value = (uint16_t)masked_source[channel] +
+                        output[channel];
+                    output[channel] = value > UINT8_MAX
+                        ? UINT8_MAX : (uint8_t)value;
+                }
+                continue;
+            }
+
+            for (size_t channel = 0; channel < 4u; channel++) {
+                const uint8_t covered_alpha = avz_framebuffer_multiply_255(
+                    sampled[3], coverage[channel]);
+                uint16_t value = (uint16_t)masked_source[channel] +
+                    avz_framebuffer_multiply_255(
+                        output[channel], (uint8_t)(UINT8_MAX - covered_alpha));
+                output[channel] = value > UINT8_MAX
+                    ? UINT8_MAX : (uint8_t)value;
+            }
         }
     }
     return 1;

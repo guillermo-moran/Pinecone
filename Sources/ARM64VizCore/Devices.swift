@@ -52,10 +52,36 @@ public protocol InterruptController: AnyObject {
     func activeLine() -> UInt32?
     func diagnostics() -> InterruptControllerDiagnostics
     func reset()
+    func raise(line: UInt32, targetVCPU: Int)
+    func clear(line: UInt32, targetVCPU: Int)
+    func setEnabled(line: UInt32, enabled: Bool, targetVCPU: Int)
+    func isEnabled(line: UInt32, targetVCPU: Int) -> Bool
+    func peekPending(targetVCPU: Int) -> UInt32?
+    func acknowledge(targetVCPU: Int) -> UInt32?
+    func complete(line: UInt32, targetVCPU: Int)
+    func activeLine(targetVCPU: Int) -> UInt32?
+    func setTargetMask(line: UInt32, mask: UInt8)
+    func targetMask(line: UInt32) -> UInt8
+}
+
+public extension InterruptController {
+    func raise(line: UInt32, targetVCPU: Int) { raise(line: line) }
+    func clear(line: UInt32, targetVCPU: Int) { clear(line: line) }
+    func setEnabled(line: UInt32, enabled: Bool, targetVCPU: Int) {
+        setEnabled(line: line, enabled: enabled)
+    }
+    func isEnabled(line: UInt32, targetVCPU: Int) -> Bool { isEnabled(line: line) }
+    func peekPending(targetVCPU: Int) -> UInt32? { peekPending() }
+    func acknowledge(targetVCPU: Int) -> UInt32? { acknowledge() }
+    func complete(line: UInt32, targetVCPU: Int) { complete(line: line) }
+    func activeLine(targetVCPU: Int) -> UInt32? { activeLine() }
+    func setTargetMask(line: UInt32, mask: UInt8) {}
+    func targetMask(line: UInt32) -> UInt8 { 1 }
 }
 
 public final class SimpleInterruptController: InterruptController {
     private static let initialLineCapacity = 64
+    private let lock = NSRecursiveLock()
     private var pending: [UInt32] = []
     private var enabled: Set<UInt32> = []
     private var active: [UInt32] = []
@@ -64,43 +90,247 @@ public final class SimpleInterruptController: InterruptController {
     private var acknowledgedCounts = [UInt64](repeating: 0, count: initialLineCapacity)
     private var completedCounts = [UInt64](repeating: 0, count: initialLineCapacity)
     private var clearedCounts = [UInt64](repeating: 0, count: initialLineCapacity)
+    private var targetedPending: [Int: [UInt32]] = [:]
+    private var targetedEnabled: [Int: Set<UInt32>] = [:]
+    private var targetedActive: [Int: [UInt32]] = [:]
+    private var sharedTargetMasks: [UInt32: UInt8] = [:]
+    private var wakeHandler: (() -> Void)?
 
     public init() {}
 
+    public func setWakeHandler(_ handler: (() -> Void)?) {
+        withLock { wakeHandler = handler }
+    }
+
     public func raise(line: UInt32) {
-        increment(&raisedCounts, line: line)
-        guard !active.contains(line) else {
-            increment(&activeRaiseDropCounts, line: line)
-            return
-        }
-        if !pending.contains(line) {
-            pending.append(line)
+        withLock {
+            increment(&raisedCounts, line: line)
+            guard !active.contains(line) else {
+                increment(&activeRaiseDropCounts, line: line)
+                return
+            }
+            if !pending.contains(line) {
+                pending.append(line)
+            }
+            wakeHandler?()
         }
     }
 
     public func clear(line: UInt32) {
-        increment(&clearedCounts, line: line)
-        pending.removeAll { $0 == line }
+        withLock {
+            increment(&clearedCounts, line: line)
+            pending.removeAll { $0 == line }
+        }
     }
 
     public func setEnabled(line: UInt32, enabled: Bool) {
-        if enabled {
-            self.enabled.insert(line)
-        } else {
-            self.enabled.remove(line)
+        withLock {
+            if enabled {
+                self.enabled.insert(line)
+            } else {
+                self.enabled.remove(line)
+            }
         }
     }
 
     public func isEnabled(line: UInt32) -> Bool {
-        enabled.contains(line)
+        withLock { line < 16 || enabled.contains(line) }
     }
 
     public func peekPending() -> UInt32? {
-        pending.first { enabled.contains($0) && !active.contains($0) }
+        withLock { pendingLine(targetVCPU: 0) ?? globalPendingLine(targetVCPU: 0) }
     }
 
     public func acknowledge() -> UInt32? {
-        guard let line = peekPending(), let index = pending.firstIndex(of: line) else {
+        withLock {
+            if let line = acknowledgeTargeted(targetVCPU: 0) {
+                return line
+            }
+            return acknowledgeGlobal(targetVCPU: 0)
+        }
+    }
+
+    public func complete(line: UInt32) {
+        withLock {
+            active.removeAll { $0 == line }
+            increment(&completedCounts, line: line)
+        }
+    }
+
+    public func activeLine() -> UInt32? {
+        withLock { targetedActive[0]?.first ?? active.first }
+    }
+
+    public func raise(line: UInt32, targetVCPU: Int) {
+        withLock {
+            increment(&raisedCounts, line: line)
+            if targetedActive[targetVCPU, default: []].contains(line) {
+                increment(&activeRaiseDropCounts, line: line)
+                return
+            }
+            if !targetedPending[targetVCPU, default: []].contains(line) {
+                targetedPending[targetVCPU, default: []].append(line)
+            }
+            wakeHandler?()
+        }
+    }
+
+    public func clear(line: UInt32, targetVCPU: Int) {
+        withLock {
+            increment(&clearedCounts, line: line)
+            targetedPending[targetVCPU]?.removeAll { $0 == line }
+        }
+    }
+
+    public func setEnabled(line: UInt32, enabled: Bool, targetVCPU: Int) {
+        withLock {
+            guard line >= 16 else { return }
+            if enabled {
+                targetedEnabled[targetVCPU, default: []].insert(line)
+            } else {
+                targetedEnabled[targetVCPU, default: []].remove(line)
+            }
+        }
+    }
+
+    public func isEnabled(line: UInt32, targetVCPU: Int) -> Bool {
+        withLock {
+            line < 16 ||
+                targetedEnabled[targetVCPU, default: []].contains(line) ||
+                enabled.contains(line)
+        }
+    }
+
+    public func peekPending(targetVCPU: Int) -> UInt32? {
+        withLock {
+            if let line = pendingLine(targetVCPU: targetVCPU) { return line }
+            return globalPendingLine(targetVCPU: targetVCPU)
+        }
+    }
+
+    public func acknowledge(targetVCPU: Int) -> UInt32? {
+        withLock {
+            if let line = acknowledgeTargeted(targetVCPU: targetVCPU) { return line }
+            return acknowledgeGlobal(targetVCPU: targetVCPU)
+        }
+    }
+
+    public func complete(line: UInt32, targetVCPU: Int) {
+        withLock {
+            let wasTargeted = targetedActive[targetVCPU]?.contains(line) ?? false
+            targetedActive[targetVCPU]?.removeAll { $0 == line }
+            if wasTargeted {
+                increment(&completedCounts, line: line)
+            } else if active.contains(line) {
+                complete(line: line)
+            }
+        }
+    }
+
+    public func activeLine(targetVCPU: Int) -> UInt32? {
+        withLock {
+            targetedActive[targetVCPU]?.first ?? active.first {
+                (targetMask(line: $0) & Self.targetBit(for: targetVCPU)) != 0
+            }
+        }
+    }
+
+    public func setTargetMask(line: UInt32, mask: UInt8) {
+        withLock {
+            guard line >= 32 else { return }
+            sharedTargetMasks[line] = mask
+        }
+    }
+
+    public func targetMask(line: UInt32) -> UInt8 {
+        withLock { line < 32 ? 1 : sharedTargetMasks[line, default: 1] }
+    }
+
+    public func diagnostics() -> InterruptControllerDiagnostics {
+        withLock {
+            let allPending = Set(pending + targetedPending.values.flatMap { $0 })
+            let allActive = Set(active + targetedActive.values.flatMap { $0 })
+            let allEnabled = enabled.union(targetedEnabled.values.reduce(into: Set<UInt32>()) {
+                $0.formUnion($1)
+            })
+            return InterruptControllerDiagnostics(
+                pendingLines: allPending.sorted(),
+                activeLines: allActive.sorted(),
+                enabledLines: allEnabled.sorted(),
+                raisedCounts: eventCounts(from: raisedCounts),
+                activeRaiseDropCounts: eventCounts(from: activeRaiseDropCounts),
+                acknowledgedCounts: eventCounts(from: acknowledgedCounts),
+                completedCounts: eventCounts(from: completedCounts),
+                clearedCounts: eventCounts(from: clearedCounts)
+            )
+        }
+    }
+
+    public func reset() {
+        withLock {
+            pending.removeAll()
+            enabled.removeAll()
+            active.removeAll()
+            targetedPending.removeAll(keepingCapacity: true)
+            targetedEnabled.removeAll(keepingCapacity: true)
+            targetedActive.removeAll(keepingCapacity: true)
+            sharedTargetMasks.removeAll(keepingCapacity: true)
+            resetCounts(&raisedCounts)
+            resetCounts(&activeRaiseDropCounts)
+            resetCounts(&acknowledgedCounts)
+            resetCounts(&completedCounts)
+            resetCounts(&clearedCounts)
+        }
+    }
+
+    @inline(__always)
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+
+    private func eventCounts(from counts: [UInt64]) -> [InterruptLineEventCount] {
+        counts.enumerated().compactMap { line, count in
+            guard count != 0 else {
+                return nil
+            }
+            return InterruptLineEventCount(line: UInt32(line), count: count)
+        }
+    }
+
+    private func pendingLine(targetVCPU: Int) -> UInt32? {
+        targetedPending[targetVCPU]?.first {
+            isEnabled(line: $0, targetVCPU: targetVCPU) &&
+                !(targetedActive[targetVCPU]?.contains($0) ?? false)
+        }
+    }
+
+    private func globalPendingLine(targetVCPU: Int) -> UInt32? {
+        let targetBit = Self.targetBit(for: targetVCPU)
+        return pending.first {
+            isEnabled(line: $0) &&
+                !active.contains($0) &&
+                (targetMask(line: $0) & targetBit) != 0
+        }
+    }
+
+    private func acknowledgeTargeted(targetVCPU: Int) -> UInt32? {
+        guard let line = pendingLine(targetVCPU: targetVCPU),
+              let index = targetedPending[targetVCPU]?.firstIndex(of: line) else {
+            return nil
+        }
+        targetedPending[targetVCPU]?.remove(at: index)
+        if !(targetedActive[targetVCPU]?.contains(line) ?? false) {
+            targetedActive[targetVCPU, default: []].append(line)
+        }
+        increment(&acknowledgedCounts, line: line)
+        return line
+    }
+
+    private func acknowledgeGlobal(targetVCPU: Int) -> UInt32? {
+        guard let line = globalPendingLine(targetVCPU: targetVCPU),
+              let index = pending.firstIndex(of: line) else {
             return nil
         }
         pending.remove(at: index)
@@ -111,46 +341,9 @@ public final class SimpleInterruptController: InterruptController {
         return line
     }
 
-    public func complete(line: UInt32) {
-        active.removeAll { $0 == line }
-        increment(&completedCounts, line: line)
-    }
-
-    public func activeLine() -> UInt32? {
-        active.first
-    }
-
-    public func diagnostics() -> InterruptControllerDiagnostics {
-        InterruptControllerDiagnostics(
-            pendingLines: pending.sorted(),
-            activeLines: active.sorted(),
-            enabledLines: enabled.sorted(),
-            raisedCounts: eventCounts(from: raisedCounts),
-            activeRaiseDropCounts: eventCounts(from: activeRaiseDropCounts),
-            acknowledgedCounts: eventCounts(from: acknowledgedCounts),
-            completedCounts: eventCounts(from: completedCounts),
-            clearedCounts: eventCounts(from: clearedCounts)
-        )
-    }
-
-    public func reset() {
-        pending.removeAll()
-        enabled.removeAll()
-        active.removeAll()
-        resetCounts(&raisedCounts)
-        resetCounts(&activeRaiseDropCounts)
-        resetCounts(&acknowledgedCounts)
-        resetCounts(&completedCounts)
-        resetCounts(&clearedCounts)
-    }
-
-    private func eventCounts(from counts: [UInt64]) -> [InterruptLineEventCount] {
-        counts.enumerated().compactMap { line, count in
-            guard count != 0 else {
-                return nil
-            }
-            return InterruptLineEventCount(line: UInt32(line), count: count)
-        }
+    private static func targetBit(for targetVCPU: Int) -> UInt8 {
+        guard (0..<8).contains(targetVCPU) else { return 0 }
+        return UInt8(1) << UInt8(targetVCPU)
     }
 
     @inline(__always)
@@ -174,60 +367,88 @@ public final class VirtualGIC: MMIODevice {
     public let range: AddressRange
     public let cpuInterfaceOffset: UInt64
     private let interruptController: InterruptController
+    private let lock = NSRecursiveLock()
+    private let virtualCPUCount: Int
     private var distributorEnabled = false
-    private var cpuInterfaceEnabled = false
-    private var priorityMask: UInt8 = 0xff
+    private var cpuInterfaceEnabled: [Bool]
+    private var priorityMask: [UInt8]
+    private var currentVCPUIDProvider: () -> Int = { 0 }
 
     public init(
         name: String = "intc",
         base: GuestAddress,
         length: UInt64 = 0x20_000,
         cpuInterfaceOffset: UInt64 = 0x1_0000,
-        interruptController: InterruptController
+        interruptController: InterruptController,
+        virtualCPUCount: Int = 1
     ) {
+        precondition(virtualCPUCount > 0)
         self.name = name
         self.range = AddressRange(start: base, length: length)
         self.cpuInterfaceOffset = cpuInterfaceOffset
         self.interruptController = interruptController
+        self.virtualCPUCount = virtualCPUCount
+        self.cpuInterfaceEnabled = Array(repeating: false, count: virtualCPUCount)
+        self.priorityMask = Array(repeating: 0xff, count: virtualCPUCount)
+    }
+
+    public func setCurrentVCPUIDProvider(_ provider: @escaping () -> Int) {
+        withLock { currentVCPUIDProvider = provider }
     }
 
     public func read(offset: UInt64, width: MMIOWidth) throws -> UInt64 {
-        if offset >= cpuInterfaceOffset {
-            return readCPUInterface(offset: offset - cpuInterfaceOffset)
+        withLock {
+            if offset >= cpuInterfaceOffset {
+                return readCPUInterface(offset: offset - cpuInterfaceOffset)
+            }
+            return readDistributor(offset: offset, width: width)
         }
-        return readDistributor(offset: offset)
     }
 
     public func write(offset: UInt64, width: MMIOWidth, value: UInt64) throws {
-        if offset >= cpuInterfaceOffset {
-            writeCPUInterface(offset: offset - cpuInterfaceOffset, value: value)
-        } else {
-            writeDistributor(offset: offset, value: value)
+        withLock {
+            if offset >= cpuInterfaceOffset {
+                writeCPUInterface(offset: offset - cpuInterfaceOffset, value: value)
+            } else {
+                writeDistributor(offset: offset, width: width, value: value)
+            }
         }
     }
 
     public func reset() {
-        distributorEnabled = false
-        cpuInterfaceEnabled = false
-        priorityMask = 0xff
+        withLock {
+            distributorEnabled = false
+            cpuInterfaceEnabled = Array(repeating: false, count: virtualCPUCount)
+            priorityMask = Array(repeating: 0xff, count: virtualCPUCount)
+        }
     }
 
-    private func readDistributor(offset: UInt64) -> UInt64 {
+    @inline(__always)
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+
+    private func readDistributor(offset: UInt64, width: MMIOWidth) -> UInt64 {
         switch offset {
         case 0x000:
             return distributorEnabled ? 1 : 0
         case 0x004:
-            return 0
+            let cpuCountField = UInt64(max(0, min(7, virtualCPUCount - 1))) << 5
+            return 2 | cpuCountField
         case 0x100..<0x180:
             return enabledBitmap(offset: offset - 0x100)
         case 0x200..<0x280:
             return pendingBitmap(offset: offset - 0x200)
+        case 0x800..<0xc00:
+            return targetRegisterValue(offset: offset - 0x800, width: width)
         default:
             return 0
         }
     }
 
-    private func writeDistributor(offset: UInt64, value: UInt64) {
+    private func writeDistributor(offset: UInt64, width: MMIOWidth, value: UInt64) {
         switch offset {
         case 0x000:
             distributorEnabled = (value & 0x1) != 0
@@ -239,32 +460,41 @@ public final class VirtualGIC: MMIODevice {
             raiseLines(offset: offset - 0x200, bitmap: UInt32(value & 0xffff_ffff))
         case 0x280..<0x300:
             clearLines(offset: offset - 0x280, bitmap: UInt32(value & 0xffff_ffff))
+        case 0x800..<0xc00:
+            setTargetRegisterValue(offset: offset - 0x800, width: width, value: value)
+        case 0xf00:
+            sendSoftwareGeneratedInterrupt(value: UInt32(value & 0xffff_ffff))
         default:
             return
         }
     }
 
     private func readCPUInterface(offset: UInt64) -> UInt64 {
+        let vcpuID = currentVCPUID
         switch offset {
         case 0x000:
-            return cpuInterfaceEnabled ? 1 : 0
+            return cpuInterfaceEnabled[vcpuID] ? 1 : 0
         case 0x004:
-            return UInt64(priorityMask)
+            return UInt64(priorityMask[vcpuID])
         case 0x00c:
-            return UInt64(interruptController.acknowledge() ?? 1023)
+            return UInt64(interruptController.acknowledge(targetVCPU: vcpuID) ?? 1023)
         default:
             return 0
         }
     }
 
     private func writeCPUInterface(offset: UInt64, value: UInt64) {
+        let vcpuID = currentVCPUID
         switch offset {
         case 0x000:
-            cpuInterfaceEnabled = (value & 0x1) != 0
+            cpuInterfaceEnabled[vcpuID] = (value & 0x1) != 0
         case 0x004:
-            priorityMask = UInt8(value & 0xff)
+            priorityMask[vcpuID] = UInt8(value & 0xff)
         case 0x010:
-            interruptController.complete(line: UInt32(value & 0x3ff))
+            interruptController.complete(
+                line: UInt32(value & 0x3ff),
+                targetVCPU: vcpuID
+            )
         default:
             return
         }
@@ -273,7 +503,7 @@ public final class VirtualGIC: MMIODevice {
     private func enabledBitmap(offset: UInt64) -> UInt64 {
         var bitmap: UInt32 = 0
         let baseLine = UInt32(offset / 4) * 32
-        for bit in 0..<32 where interruptController.isEnabled(line: baseLine + UInt32(bit)) {
+        for bit in 0..<32 where isEnabled(line: baseLine + UInt32(bit)) {
             bitmap |= UInt32(1) << UInt32(bit)
         }
         return UInt64(bitmap)
@@ -282,16 +512,52 @@ public final class VirtualGIC: MMIODevice {
     private func pendingBitmap(offset: UInt64) -> UInt64 {
         var bitmap: UInt32 = 0
         let baseLine = UInt32(offset / 4) * 32
-        if let pending = interruptController.peekPending(), pending >= baseLine, pending < baseLine + 32 {
+        if let pending = interruptController.peekPending(targetVCPU: currentVCPUID),
+           pending >= baseLine,
+           pending < baseLine + 32 {
             bitmap |= UInt32(1) << UInt32(pending - baseLine)
         }
         return UInt64(bitmap)
     }
 
+    private func targetRegisterValue(offset: UInt64, width: MMIOWidth) -> UInt64 {
+        var value: UInt64 = 0
+        for byte in 0..<width.rawValue {
+            let line = UInt32(offset) + UInt32(byte)
+            let mask: UInt8
+            if line < 32 {
+                mask = UInt8(1) << UInt8(currentVCPUID)
+            } else {
+                mask = interruptController.targetMask(line: line)
+            }
+            value |= UInt64(mask) << UInt64(byte * 8)
+        }
+        return value
+    }
+
+    private func setTargetRegisterValue(offset: UInt64, width: MMIOWidth, value: UInt64) {
+        let availableMask = UInt8((UInt16(1) << UInt16(virtualCPUCount)) - 1)
+        for byte in 0..<width.rawValue {
+            let line = UInt32(offset) + UInt32(byte)
+            guard line >= 32 else { continue }
+            let mask = UInt8(truncatingIfNeeded: value >> UInt64(byte * 8)) & availableMask
+            interruptController.setTargetMask(line: line, mask: mask)
+        }
+    }
+
     private func setLines(offset: UInt64, bitmap: UInt32, enabled: Bool) {
         let baseLine = UInt32(offset / 4) * 32
         for bit in 0..<32 where (bitmap & (UInt32(1) << UInt32(bit))) != 0 {
-            interruptController.setEnabled(line: baseLine + UInt32(bit), enabled: enabled)
+            let line = baseLine + UInt32(bit)
+            if line < 32 {
+                interruptController.setEnabled(
+                    line: line,
+                    enabled: enabled,
+                    targetVCPU: currentVCPUID
+                )
+            } else {
+                interruptController.setEnabled(line: line, enabled: enabled)
+            }
         }
     }
 
@@ -308,6 +574,40 @@ public final class VirtualGIC: MMIODevice {
             interruptController.clear(line: baseLine + UInt32(bit))
         }
     }
+
+    private var currentVCPUID: Int {
+        min(max(0, currentVCPUIDProvider()), virtualCPUCount - 1)
+    }
+
+    private func isEnabled(line: UInt32) -> Bool {
+        line < 32
+            ? interruptController.isEnabled(line: line, targetVCPU: currentVCPUID)
+            : interruptController.isEnabled(line: line)
+    }
+
+    private func sendSoftwareGeneratedInterrupt(value: UInt32) {
+        let line = value & 0xf
+        let targetList = (value >> 16) & 0xff
+        let targetFilter = (value >> 24) & 0x3
+        let sender = currentVCPUID
+
+        for id in 0..<virtualCPUCount {
+            let selected: Bool
+            switch targetFilter {
+            case 0:
+                selected = (targetList & (UInt32(1) << UInt32(id))) != 0
+            case 1:
+                selected = id != sender
+            case 2:
+                selected = id == sender
+            default:
+                selected = false
+            }
+            if selected {
+                interruptController.raise(line: line, targetVCPU: id)
+            }
+        }
+    }
 }
 
 public final class VirtualUART: MMIODevice {
@@ -320,6 +620,7 @@ public final class VirtualUART: MMIODevice {
     public let interruptLine: UInt32?
     public var onByte: ((UInt8) -> Void)?
     private let interruptController: InterruptController?
+    private let lock = NSRecursiveLock()
     private var output: [UInt8] = []
     private var receiveFIFO: [UInt8] = []
     private var receiveStatusErrorClear: UInt32 = 0
@@ -348,32 +649,47 @@ public final class VirtualUART: MMIODevice {
     }
 
     public var outputBytes: [UInt8] {
-        output
+        withLock { output }
     }
 
     public var outputString: String {
-        String(decoding: output, as: UTF8.self)
+        withLock { String(decoding: output, as: UTF8.self) }
     }
 
     public var receiveFIFOAvailableCapacity: Int {
-        max(0, Self.fifoCapacity - receiveFIFO.count)
+        withLock { max(0, Self.fifoCapacity - receiveFIFO.count) }
+    }
+
+    public var receiveFIFOCount: Int {
+        withLock { receiveFIFO.count }
+    }
+
+    public var rawInterruptStatusValue: UInt32 {
+        withLock { rawInterruptStatus }
+    }
+
+    public var interruptMaskValue: UInt32 {
+        withLock { interruptMask }
     }
 
     public func replaceOutput(_ bytes: [UInt8]) {
-        output = bytes
+        withLock { output = bytes }
     }
 
     public func injectReceiveBytes(_ bytes: [UInt8]) {
-        let accepted = bytes.prefix(receiveFIFOAvailableCapacity)
-        receiveFIFO.append(contentsOf: accepted)
-        if !accepted.isEmpty {
-            rawInterruptStatus |= Self.receiveInterrupt
-            updateInterruptLine()
+        withLock {
+            let accepted = bytes.prefix(receiveFIFOAvailableCapacity)
+            receiveFIFO.append(contentsOf: accepted)
+            if !accepted.isEmpty {
+                rawInterruptStatus |= Self.receiveInterrupt
+                updateInterruptLine()
+            }
         }
     }
 
     public func read(offset: UInt64, width: MMIOWidth) throws -> UInt64 {
-        switch offset {
+        withLock {
+            switch offset {
         case 0x00:
             if receiveFIFO.isEmpty {
                 return 0
@@ -434,13 +750,15 @@ public final class VirtualUART: MMIODevice {
             return 0x05
         case 0xffc:
             return 0xb1
-        default:
-            return 0
+            default:
+                return 0
+            }
         }
     }
 
     public func write(offset: UInt64, width: MMIOWidth, value: UInt64) throws {
-        switch offset {
+        withLock {
+            switch offset {
         case 0x00:
             let byte = UInt8(value & 0xff)
             output.append(byte)
@@ -469,24 +787,34 @@ public final class VirtualUART: MMIODevice {
             updateInterruptLine()
         case 0x48:
             dmaControl = UInt32(value & 0x7)
-        default:
-            return
+            default:
+                return
+            }
         }
     }
 
     public func reset() {
-        output.removeAll()
-        receiveFIFO.removeAll()
-        receiveStatusErrorClear = 0
-        integerBaudRateDivisor = 0
-        fractionalBaudRateDivisor = 0
-        lineControl = 0
-        control = 0x0300
-        interruptFIFOLevelSelect = 0x12
-        interruptMask = 0
-        rawInterruptStatus = 0
-        dmaControl = 0
-        updateInterruptLine()
+        withLock {
+            output.removeAll()
+            receiveFIFO.removeAll()
+            receiveStatusErrorClear = 0
+            integerBaudRateDivisor = 0
+            fractionalBaudRateDivisor = 0
+            lineControl = 0
+            control = 0x0300
+            interruptFIFOLevelSelect = 0x12
+            interruptMask = 0
+            rawInterruptStatus = 0
+            dmaControl = 0
+            updateInterruptLine()
+        }
+    }
+
+    @inline(__always)
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
     }
 
     private func updateInterruptLine() {

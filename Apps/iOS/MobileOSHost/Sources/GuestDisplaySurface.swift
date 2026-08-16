@@ -242,6 +242,7 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
     private var sharedBufferAddress: UnsafeRawPointer?
     private var sharedBufferLength = 0
     private var textureUsesSharedStorage = false
+    private var displayLink: CADisplayLink?
     private var pendingPresentation: (
         generation: UInt64,
         uploadedBytes: Int,
@@ -274,10 +275,23 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
         view.clearColor = MTLClearColorMake(0, 0, 0, 1)
         view.framebufferOnly = true
         view.isPaused = true
-        view.enableSetNeedsDisplay = true
+        view.enableSetNeedsDisplay = false
         view.autoResizeDrawable = true
         view.isOpaque = true
         view.backgroundColor = .black
+
+        let target = MetalFramebufferDisplayLinkTarget(owner: self)
+        let displayLink = CADisplayLink(target: target, selector: #selector(
+            MetalFramebufferDisplayLinkTarget.displayRefresh
+        ))
+        displayLink.preferredFramesPerSecond = 60
+        displayLink.isPaused = true
+        displayLink.add(to: .main, forMode: .common)
+        self.displayLink = displayLink
+    }
+
+    deinit {
+        displayLink?.invalidate()
     }
 
     func upload(
@@ -441,15 +455,20 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
         sharedBufferLength = 0
         textureUsesSharedStorage = false
         pendingPresentation = nil
+        displayLink?.isPaused = true
     }
 
     func requestDraw() {
         guard pendingPresentation != nil else { return }
-        view.setNeedsDisplay()
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.pendingPresentation != nil else { return }
-            self.view.draw()
+        displayLink?.isPaused = false
+    }
+
+    fileprivate func displayRefresh() {
+        guard pendingPresentation != nil else {
+            displayLink?.isPaused = true
+            return
         }
+        view.draw()
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -470,6 +489,7 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
         commandBuffer.present(drawable)
         let completedPresentation = pendingPresentation
         pendingPresentation = nil
+        displayLink?.isPaused = true
         if let completedPresentation {
             commandBuffer.addCompletedHandler { _ in
                 let completedAt = DispatchTime.now().uptimeNanoseconds
@@ -527,4 +547,16 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
         return framebuffer.sample(nearestSampler, input.textureCoordinate);
     }
     """
+}
+
+private final class MetalFramebufferDisplayLinkTarget: NSObject {
+    private weak var owner: MetalFramebufferPresenter?
+
+    init(owner: MetalFramebufferPresenter) {
+        self.owner = owner
+    }
+
+    @objc func displayRefresh() {
+        owner?.displayRefresh()
+    }
 }

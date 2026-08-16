@@ -77,6 +77,7 @@ static void write_base_register(AVZNativeCPU *cpu, unsigned index, uint64_t valu
 
 static void clear_exclusive_reservation(AVZNativeCPU *cpu) {
     cpu->exclusive_address = 0;
+    cpu->exclusive_generation = 0;
     cpu->exclusive_size = 0;
     cpu->exclusive_valid = 0;
 }
@@ -1201,6 +1202,29 @@ static int try_execute_simd_solid_fill_loop(
     void *memory_context,
     uint64_t *executed_steps
 );
+static int try_execute_pixman_source_over_prefix(
+    const AVZNativeInstruction *instructions,
+    const uint64_t *instruction_pcs,
+    size_t instruction_count,
+    uint8_t *validated_hint,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    AVZNativeMemoryWriteCallback write_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+);
+static int try_execute_pixman_source_over_tail(
+    const AVZNativeInstruction *instructions,
+    const uint64_t *instruction_pcs,
+    size_t instruction_count,
+    uint8_t *validated_hint,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+);
 
 static uint64_t shifted_register_value(uint64_t value, uint8_t shift_type, uint8_t amount, unsigned bits) {
     uint64_t mask = mask_for_bits(bits);
@@ -2065,6 +2089,8 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
     }
 
     if ((instruction & UINT32_C(0xffe0001f)) == UINT32_C(0xd4000001) ||
+        (instruction & UINT32_C(0xffe0001f)) == UINT32_C(0xd4000002) ||
+        (instruction & UINT32_C(0xffe0001f)) == UINT32_C(0xd4000003) ||
         (instruction & UINT32_C(0xffe0001f)) == UINT32_C(0xd4200000)) {
         decoded->kind = AVZ_NATIVE_OP_SYNCHRONOUS_EXCEPTION;
         return 1;
@@ -3894,6 +3920,29 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         }
     }
 
+    /*
+     * SHLL/SHLL2 widen unsigned lanes and shift each result by the complete
+     * source element width. This is a separate two-register encoding from
+     * USHLL even though both operations share the same widening datapath.
+     */
+    if ((instruction & UINT32_C(0xbf20fc00)) == UINT32_C(0x2e203800)) {
+        unsigned size = (instruction >> 22) & 3u;
+        if (size < 3u) {
+            unsigned source_bits = 8u << size;
+            unsigned source_lane_count = 64u / source_bits;
+            unsigned upper_half = (instruction >> 30) & 1u;
+
+            decoded->kind = AVZ_NATIVE_OP_SIMD_SIGNED_SHIFT_LONG_S_TO_D;
+            decoded->rd = instruction & 0x1f;
+            decoded->rn = (instruction >> 5) & 0x1f;
+            decoded->bits = (uint8_t)source_bits;
+            decoded->flags = 1u;
+            decoded->shift_amount = (uint8_t)source_bits;
+            decoded->condition = (uint8_t)(upper_half ? source_lane_count : 0u);
+            return 1;
+        }
+    }
+
     if ((instruction & UINT32_C(0xbfe08400)) == UINT32_C(0x2e000000)) {
         unsigned q = (instruction >> 30) & 1u;
         unsigned byte_offset = (instruction >> 11) & 0x0fu;
@@ -4129,14 +4178,35 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         break;
     }
 
-    /* CMEQ (Advanced SIMD scalar, zero): only the 64-bit D form is allocated. */
-    if ((instruction & UINT32_C(0xfffffc00)) == UINT32_C(0x5ee09800)) {
+    /* Integer compare with zero (Advanced SIMD scalar, 64-bit D forms). */
+    switch (instruction & UINT32_C(0xfffffc00)) {
+    case UINT32_C(0x5ee09800): /* CMEQ */
+    case UINT32_C(0x5ee08800): /* CMGT */
+    case UINT32_C(0x7ee08800): /* CMGE */
+    case UINT32_C(0x5ee0a800): /* CMLT */
+    case UINT32_C(0x7ee09800): { /* CMLE */
+        uint32_t masked = instruction & UINT32_C(0xfffffc00);
+        unsigned comparison;
+        if (masked == UINT32_C(0x5ee09800)) {
+            comparison = 4u;
+        } else if (masked == UINT32_C(0x5ee08800)) {
+            comparison = 5u;
+        } else if (masked == UINT32_C(0x7ee08800)) {
+            comparison = 6u;
+        } else if (masked == UINT32_C(0x5ee0a800)) {
+            comparison = 7u;
+        } else {
+            comparison = 8u;
+        }
         decoded->kind = AVZ_NATIVE_OP_SIMD_COMPARE_EQUAL_VECTOR;
         decoded->rd = instruction & 0x1f;
         decoded->rn = (instruction >> 5) & 0x1f;
         decoded->bits = 64;
-        decoded->flags = (uint8_t)(4u << 1);
+        decoded->flags = (uint8_t)(comparison << 1);
         return 1;
+    }
+    default:
+        break;
     }
 
     if ((instruction & UINT32_C(0x9f20f400)) == UINT32_C(0x0e203400)) {
@@ -4238,6 +4308,21 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         decoded->rn = (instruction >> 5) & 0x1f;
         decoded->bits = 8;
         decoded->flags = (uint8_t)((instruction >> 30) & 1u);
+        return 1;
+    }
+
+    /* CLZ (Advanced SIMD), integer vector forms with 8/16/32-bit lanes. */
+    if ((instruction & UINT32_C(0xbf3ffc00)) == UINT32_C(0x2e204800)) {
+        unsigned q = (instruction >> 30) & 1u;
+        unsigned element_bits = 8u << ((instruction >> 22) & 3u);
+        if (element_bits > 32u) {
+            return 0;
+        }
+        decoded->kind = AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS;
+        decoded->rd = instruction & 0x1f;
+        decoded->rn = (instruction >> 5) & 0x1f;
+        decoded->bits = (uint8_t)element_bits;
+        decoded->flags = (uint8_t)q;
         return 1;
     }
 
@@ -5319,6 +5404,7 @@ static int execute_decoded_instruction(
             synchronous_exception(
                 memory_context,
                 instruction->raw,
+                cpu->x,
                 &cpu->pstate,
                 &cpu->sp,
                 &cpu->pc
@@ -6960,7 +7046,7 @@ static int execute_decoded_instruction(
         AVZNativeVectorRegister result = {0, 0};
 
         if (!(source_bits == 8u || source_bits == 16u || source_bits == 32u) ||
-            shift >= source_bits) {
+            shift > source_bits) {
             return 0;
         }
 
@@ -7524,6 +7610,23 @@ static int execute_decoded_instruction(
         cpu->pc = pc + 4;
         return 1;
     }
+    case AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS: {
+        unsigned element_bits = instruction->bits;
+        unsigned vector_bits = (instruction->flags & 1u) != 0u ? 128u : 64u;
+        AVZNativeVectorRegister result = {0, 0};
+        for (unsigned lane = 0; lane < vector_bits / element_bits; lane++) {
+            uint64_t value = read_vector_element(
+                cpu, instruction->rn, lane, element_bits
+            );
+            write_vector_element(
+                &result, lane, element_bits,
+                count_leading_zeros_width(value, element_bits)
+            );
+        }
+        cpu->v[instruction->rd] = result;
+        cpu->pc = pc + 4;
+        return 1;
+    }
     case AVZ_NATIVE_OP_SIMD_BITWISE_NOT:
         cpu->v[instruction->rd] = (AVZNativeVectorRegister){
             ~cpu->v[instruction->rn].low,
@@ -7837,7 +7940,18 @@ static int execute_decoded_instruction(
         uint64_t address = read_base_register(cpu, instruction->rn);
         uint64_t value = 0;
         if ((instruction->flags & 1) != 0) {
-            if (read_memory == 0 || !read_memory(memory_context, address, instruction->width, &value)) {
+            if (read_memory == avz_native_fast_memory_read) {
+                if (!avz_native_fast_memory_exclusive_read(
+                        memory_context,
+                        address,
+                        instruction->width,
+                        &value,
+                        &cpu->exclusive_generation
+                    )) {
+                    return 0;
+                }
+            } else if (read_memory == 0 ||
+                       !read_memory(memory_context, address, instruction->width, &value)) {
                 return 0;
             }
             write_register(cpu, instruction->rt, value & mask_for_bits(instruction->bits));
@@ -7849,13 +7963,27 @@ static int execute_decoded_instruction(
                 cpu->exclusive_address == address &&
                 cpu->exclusive_size == instruction->width;
             if (reservation_matches) {
-                if (write_memory == 0 ||
-                    !write_memory(
+                uint64_t store_value = read_register(cpu, instruction->rt) &
+                    mask_for_bits(instruction->bits);
+                if (write_memory == avz_native_fast_memory_write) {
+                    int exclusive_result = avz_native_fast_memory_exclusive_write(
                         memory_context,
                         address,
                         instruction->width,
-                        read_register(cpu, instruction->rt) & mask_for_bits(instruction->bits)
-                    )) {
+                        store_value,
+                        cpu->exclusive_generation
+                    );
+                    if (exclusive_result < 0) {
+                        return 0;
+                    }
+                    reservation_matches = exclusive_result;
+                } else if (write_memory == 0 ||
+                           !write_memory(
+                               memory_context,
+                               address,
+                               instruction->width,
+                               store_value
+                           )) {
                     return 0;
                 }
             }
@@ -7872,9 +8000,20 @@ static int execute_decoded_instruction(
         if ((instruction->flags & 1) != 0) {
             uint64_t first = 0;
             uint64_t second = 0;
-            if (read_memory == 0 ||
-                !read_memory(memory_context, address, instruction->width, &first) ||
-                !read_memory(memory_context, second_address, instruction->width, &second)) {
+            if (read_memory == avz_native_fast_memory_read) {
+                if (!avz_native_fast_memory_exclusive_read_pair(
+                        memory_context,
+                        address,
+                        instruction->width,
+                        &first,
+                        &second,
+                        &cpu->exclusive_generation
+                    )) {
+                    return 0;
+                }
+            } else if (read_memory == 0 ||
+                       !read_memory(memory_context, address, instruction->width, &first) ||
+                       !read_memory(memory_context, second_address, instruction->width, &second)) {
                 return 0;
             }
             write_register(cpu, instruction->rt, first & mask_for_bits(instruction->bits));
@@ -7888,9 +8027,35 @@ static int execute_decoded_instruction(
                 cpu->exclusive_size == reservation_size;
             if (reservation_matches) {
                 uint64_t mask = mask_for_bits(instruction->bits);
-                if (write_memory == 0 ||
-                    !write_memory(memory_context, address, instruction->width, read_register(cpu, instruction->rt) & mask) ||
-                    !write_memory(memory_context, second_address, instruction->width, read_register(cpu, instruction->rd) & mask)) {
+                uint64_t first_value = read_register(cpu, instruction->rt) & mask;
+                uint64_t second_value = read_register(cpu, instruction->rd) & mask;
+                if (write_memory == avz_native_fast_memory_write) {
+                    int exclusive_result =
+                        avz_native_fast_memory_exclusive_write_pair(
+                            memory_context,
+                            address,
+                            instruction->width,
+                            first_value,
+                            second_value,
+                            cpu->exclusive_generation
+                        );
+                    if (exclusive_result < 0) {
+                        return 0;
+                    }
+                    reservation_matches = exclusive_result;
+                } else if (write_memory == 0 ||
+                           !write_memory(
+                               memory_context,
+                               address,
+                               instruction->width,
+                               first_value
+                           ) ||
+                           !write_memory(
+                               memory_context,
+                               second_address,
+                               instruction->width,
+                               second_value
+                           )) {
                     return 0;
                 }
             }
@@ -8611,6 +8776,1046 @@ static int try_execute_simd_solid_fill_loop(
     return 1;
 }
 
+typedef struct {
+    uint16_t offset;
+    uint32_t raw;
+} AVZPixmanSourceOverInstruction;
+
+static int trace_contains_raw_instruction(
+    const AVZNativeInstruction *instructions,
+    const uint64_t *instruction_pcs,
+    size_t instruction_count,
+    uint64_t pc,
+    uint32_t raw
+) {
+    for (size_t index = 0; index < instruction_count; index++) {
+        if (instruction_pcs[index] == pc && instructions[index].raw == raw) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int try_execute_musl_memcmp_loop(
+    const AVZNativeInstruction *trace_instructions,
+    const uint64_t *instruction_pcs,
+    size_t trace_instruction_count,
+    size_t trace_instruction_index,
+    uint64_t base_pc,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+) {
+    static const uint32_t expected[] = {
+        UINT32_C(0x39400003), /* ldrb w3, [x0] */
+        UINT32_C(0xd1000442), /* sub  x2, x2, #1 */
+        UINT32_C(0x39400024), /* ldrb w4, [x1] */
+        UINT32_C(0x91000400), /* add  x0, x0, #1 */
+        UINT32_C(0x91000421), /* add  x1, x1, #1 */
+        UINT32_C(0x6b04007f), /* cmp  w3, w4 */
+        UINT32_C(0x54ffff20)  /* b.eq memcmp */
+    };
+    enum { steps_per_iteration = 7, maximum_bytes = 64 };
+
+    const size_t expected_count = sizeof(expected) / sizeof(expected[0]);
+    if (trace_instructions == NULL || instruction_pcs == NULL ||
+        cpu == NULL || executed_steps == NULL ||
+        cpu->pc != base_pc ||
+        remaining_steps < steps_per_iteration ||
+        read_memory != avz_native_fast_memory_read ||
+        trace_instruction_index == 0 ||
+        trace_instruction_index > trace_instruction_count ||
+        expected_count > trace_instruction_count - trace_instruction_index ||
+        instruction_pcs[trace_instruction_index - 1] != base_pc - 4 ||
+        trace_instructions[trace_instruction_index - 1].raw !=
+            UINT32_C(0xb4000142)) {
+        return 0;
+    }
+    uint64_t code_word = 0;
+    if (!read_memory(memory_context, base_pc - 4, 4, &code_word) ||
+        (uint32_t)code_word != UINT32_C(0xb4000142)) {
+        return 0;
+    }
+    for (size_t index = 0; index < expected_count; index++) {
+        size_t trace_index = trace_instruction_index + index;
+        if (instruction_pcs[trace_index] != base_pc + index * 4 ||
+            trace_instructions[trace_index].raw != expected[index]) {
+            return 0;
+        }
+        code_word = 0;
+        if (!read_memory(
+                memory_context, base_pc + index * 4, 4, &code_word
+            ) || (uint32_t)code_word != expected[index]) {
+            return 0;
+        }
+    }
+
+    uint64_t left_address = read_register(cpu, 0);
+    uint64_t right_address = read_register(cpu, 1);
+    uint64_t remaining = read_register(cpu, 2);
+    uint64_t iterations = (remaining_steps + 1) / 8;
+    if (iterations > remaining) {
+        iterations = remaining;
+    }
+    if (iterations > maximum_bytes) {
+        iterations = maximum_bytes;
+    }
+    uint64_t left_page_bytes = UINT64_C(4096) -
+        (left_address & UINT64_C(4095));
+    uint64_t right_page_bytes = UINT64_C(4096) -
+        (right_address & UINT64_C(4095));
+    if (iterations > left_page_bytes) {
+        iterations = left_page_bytes;
+    }
+    if (iterations > right_page_bytes) {
+        iterations = right_page_bytes;
+    }
+    if (iterations == 0) {
+        return 0;
+    }
+
+    uint8_t *left = NULL;
+    uint8_t *right = NULL;
+    uint64_t ignored_physical = 0;
+    if (!avz_native_fast_memory_map_span(
+            memory_context, left_address, iterations, 0,
+            &left, &ignored_physical
+        ) ||
+        !avz_native_fast_memory_map_span(
+            memory_context, right_address, iterations, 0,
+            &right, &ignored_physical
+        )) {
+        return 0;
+    }
+    uint64_t completed = 0;
+    uint8_t left_byte = 0;
+    uint8_t right_byte = 0;
+    int mismatch = 0;
+    while (completed < iterations) {
+        left_byte = left[completed];
+        right_byte = right[completed];
+        completed++;
+        if (left_byte != right_byte) {
+            mismatch = 1;
+            break;
+        }
+    }
+
+    uint64_t ignored_result = 0;
+    uint64_t flags = add_with_carry_nzcv(
+        left_byte, (~(uint64_t)right_byte) & UINT32_MAX, 1, 32,
+        &ignored_result
+    );
+    write_register(cpu, 0, left_address + completed);
+    write_register(cpu, 1, right_address + completed);
+    write_register(cpu, 2, remaining - completed);
+    write_register(cpu, 3, left_byte);
+    write_register(cpu, 4, right_byte);
+    cpu->pstate = (cpu->pstate & ~UINT64_C(0xf0000000)) |
+        (flags & UINT64_C(0xf0000000));
+    cpu->pc = mismatch ? base_pc + UINT64_C(0x1c) : base_pc - 4;
+    *executed_steps = completed * steps_per_iteration + (completed - 1);
+    return 1;
+}
+
+static int try_execute_pixman_neon_copy_loop(
+    uint8_t *validated_hint,
+    uint64_t base_pc,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    AVZNativeMemoryWriteCallback write_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+) {
+    static const uint32_t expected[] = {
+        UINT32_C(0x0c9f2840), /* st1 {v0.2s-v3.2s}, [x2], #32 */
+        UINT32_C(0x0cdf2880), /* ld1 {v0.2s-v3.2s}, [x4], #32 */
+        UINT32_C(0x9100214a), /* add x10, x10, #8 */
+        UINT32_C(0xf2400d3f), /* tst x9, #15 */
+        UINT32_C(0x54000060), /* b.eq +12 */
+        UINT32_C(0x9100214a), /* add x10, x10, #8 */
+        UINT32_C(0xd1000529), /* sub x9, x9, #1 */
+        UINT32_C(0xeb0e015f), /* cmp x10, x14 */
+        UINT32_C(0xd37ef54f), /* lsl x15, x10, #2 */
+        UINT32_C(0xf8af6960), /* prfm pldl1keep, [x11, x15] */
+        UINT32_C(0x540000cd), /* b.le +24 */
+        UINT32_C(0xcb0e014a), /* sub x10, x10, x14 */
+        UINT32_C(0xf1004129), /* subs x9, x9, #16 */
+        UINT32_C(0x5400006d), /* b.le +12 */
+        UINT32_C(0x8b05096b), /* add x11, x11, x5, lsl #2 */
+        UINT32_C(0x3980016f), /* ldrsb x15, [x11] */
+        UINT32_C(0xf1002000), /* subs x0, x0, #8 */
+        UINT32_C(0x54fffdea)  /* b.ge loop */
+    };
+    enum {
+        minimum_steps_per_iteration = 11,
+        maximum_iterations = 1024,
+        maximum_mapped_chunks = 32
+    };
+
+    if (cpu == NULL || executed_steps == NULL || cpu->pc != base_pc ||
+        remaining_steps < minimum_steps_per_iteration ||
+        read_memory != avz_native_fast_memory_read ||
+        write_memory != avz_native_fast_memory_write) {
+        return 0;
+    }
+    if (validated_hint == NULL || *validated_hint == 0) {
+        for (size_t index = 0;
+             index < sizeof(expected) / sizeof(expected[0]); index++) {
+            uint64_t code_word = 0;
+            if (!read_memory(
+                    memory_context, base_pc + index * 4, 4, &code_word
+                ) || (uint32_t)code_word != expected[index]) {
+                return 0;
+            }
+        }
+        if (validated_hint != NULL) {
+            *validated_hint = 1;
+        }
+    }
+
+    uint64_t source_address = read_base_register(cpu, 4);
+    uint64_t destination_address = read_base_register(cpu, 2);
+    if (((source_address | destination_address) & UINT64_C(31)) != 0) {
+        return 0;
+    }
+    uint64_t max_iterations = remaining_steps /
+        minimum_steps_per_iteration;
+    if (max_iterations > maximum_iterations) {
+        max_iterations = maximum_iterations;
+    }
+    if (max_iterations == 0) {
+        return 0;
+    }
+
+    uint64_t x0 = read_register(cpu, 0);
+    uint64_t x9 = read_register(cpu, 9);
+    uint64_t x10 = read_register(cpu, 10);
+    uint64_t x11 = read_register(cpu, 11);
+    uint64_t x5 = read_register(cpu, 5);
+    uint64_t x14 = read_register(cpu, 14);
+    uint64_t final_x15 = read_register(cpu, 15);
+    uint64_t final_flags = cpu->pstate;
+    uint64_t total_steps = 0;
+    uint64_t iterations = 0;
+    int exits_loop = 0;
+
+    while (iterations < max_iterations) {
+        uint64_t iteration_steps = 5;
+        uint64_t next_x10 = x10 + 8;
+        uint64_t next_x9 = x9;
+        uint64_t next_x11 = x11;
+        uint64_t next_x15 = next_x10 << 2;
+        if ((next_x9 & UINT64_C(15)) != 0) {
+            next_x10 += 8;
+            next_x9 -= 1;
+            iteration_steps += 2;
+        }
+
+        uint64_t ignored_result = 0;
+        uint64_t compare_flags = add_with_carry_nzcv(
+            next_x10, ~x14, 1, 64, &ignored_result
+        );
+        next_x15 = next_x10 << 2;
+        iteration_steps += 4;
+        if (!condition_holds(13, compare_flags)) {
+            next_x10 -= x14;
+            uint64_t decremented_x9 = 0;
+            uint64_t x9_flags = add_with_carry_nzcv(
+                next_x9, ~UINT64_C(16), 1, 64, &decremented_x9
+            );
+            next_x9 = decremented_x9;
+            iteration_steps += 3;
+            if (!condition_holds(13, x9_flags)) {
+                next_x11 += x5 << 2;
+                uint64_t probe_value = 0;
+                if (!read_memory(
+                        memory_context, next_x11, 1, &probe_value
+                    )) {
+                    return 0;
+                }
+                next_x15 = (uint64_t)(int64_t)(int8_t)probe_value;
+                iteration_steps += 2;
+            }
+        }
+
+        uint64_t next_x0 = 0;
+        uint64_t x0_flags = add_with_carry_nzcv(
+            x0, ~UINT64_C(8), 1, 64, &next_x0
+        );
+        iteration_steps += 2;
+        if (iteration_steps > remaining_steps - total_steps) {
+            break;
+        }
+
+        x0 = next_x0;
+        x9 = next_x9;
+        x10 = next_x10;
+        x11 = next_x11;
+        final_x15 = next_x15;
+        final_flags = x0_flags;
+        total_steps += iteration_steps;
+        iterations++;
+        if (!condition_holds(10, x0_flags)) {
+            exits_loop = 1;
+            break;
+        }
+    }
+    if (iterations == 0) {
+        return 0;
+    }
+
+    uint64_t byte_count = iterations * 32;
+    if (source_address > UINT64_MAX - byte_count ||
+        destination_address > UINT64_MAX - byte_count) {
+        return 0;
+    }
+    typedef struct {
+        uint8_t *source;
+        uint8_t *destination;
+        uint64_t destination_physical;
+        size_t byte_count;
+    } AVZPixmanCopyChunk;
+    AVZPixmanCopyChunk chunks[maximum_mapped_chunks];
+    size_t chunk_count = 0;
+    uint64_t mapped_bytes = 0;
+    while (mapped_bytes < byte_count) {
+        if (chunk_count >= maximum_mapped_chunks) {
+            return 0;
+        }
+        uint64_t source_cursor = source_address + mapped_bytes;
+        uint64_t destination_cursor = destination_address + mapped_bytes;
+        uint64_t chunk_bytes = byte_count - mapped_bytes;
+        uint64_t source_page_bytes = UINT64_C(4096) -
+            (source_cursor & UINT64_C(4095));
+        uint64_t destination_page_bytes = UINT64_C(4096) -
+            (destination_cursor & UINT64_C(4095));
+        if (chunk_bytes > source_page_bytes) {
+            chunk_bytes = source_page_bytes;
+        }
+        if (chunk_bytes > destination_page_bytes) {
+            chunk_bytes = destination_page_bytes;
+        }
+        if (chunk_bytes == 0 || (chunk_bytes & UINT64_C(31)) != 0) {
+            return 0;
+        }
+        uint64_t ignored_physical = 0;
+        AVZPixmanCopyChunk *chunk = &chunks[chunk_count];
+        if (!avz_native_fast_memory_map_span(
+                memory_context, source_cursor, (size_t)chunk_bytes, 0,
+                &chunk->source, &ignored_physical
+            ) ||
+            !avz_native_fast_memory_map_span(
+                memory_context, destination_cursor, (size_t)chunk_bytes, 1,
+                &chunk->destination, &chunk->destination_physical
+            )) {
+            return 0;
+        }
+        chunk->byte_count = (size_t)chunk_bytes;
+        chunk_count++;
+        mapped_bytes += chunk_bytes;
+    }
+
+    uint64_t current_vectors[4];
+    for (size_t vector = 0; vector < 4; vector++) {
+        current_vectors[vector] = cpu->v[vector].low;
+    }
+    size_t chunk_index = 0;
+    size_t chunk_offset = 0;
+    for (uint64_t iteration = 0; iteration < iterations; iteration++) {
+        AVZPixmanCopyChunk *chunk = &chunks[chunk_index];
+        memcpy(chunk->destination + chunk_offset, current_vectors, 32);
+        memcpy(current_vectors, chunk->source + chunk_offset, 32);
+        chunk_offset += 32;
+        if (chunk_offset == chunk->byte_count) {
+            chunk_index++;
+            chunk_offset = 0;
+        }
+    }
+    for (size_t chunk_index = 0; chunk_index < chunk_count; chunk_index++) {
+        avz_native_fast_memory_commit_write_span(
+            memory_context,
+            chunks[chunk_index].destination_physical,
+            chunks[chunk_index].byte_count
+        );
+    }
+
+    clear_exclusive_reservation(cpu);
+    write_base_register(cpu, 2, destination_address + byte_count);
+    write_base_register(cpu, 4, source_address + byte_count);
+    write_register(cpu, 0, x0);
+    write_register(cpu, 9, x9);
+    write_register(cpu, 10, x10);
+    write_register(cpu, 11, x11);
+    write_register(cpu, 15, final_x15);
+    for (size_t vector = 0; vector < 4; vector++) {
+        cpu->v[vector].low = current_vectors[vector];
+        cpu->v[vector].high = 0;
+    }
+    cpu->pstate = (cpu->pstate & ~UINT64_C(0xf0000000)) |
+        (final_flags & UINT64_C(0xf0000000));
+    cpu->pc = exits_loop ? base_pc + UINT64_C(0x48) : base_pc;
+    *executed_steps = total_steps;
+    return 1;
+}
+
+static int try_execute_glib_djb2_string_hash_loop(
+    const AVZNativeInstruction *instructions,
+    size_t instruction_count,
+    uint64_t base_pc,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    void *memory_context,
+    uint64_t *executed_steps,
+    int *exited_loop
+) {
+    static const uint32_t expected[] = {
+        UINT32_C(0x11000718), /* add  w24, w24, #1 */
+        UINT32_C(0x0b1a175a), /* add  w26, w26, w26, lsl #5 */
+        UINT32_C(0x0b22835a), /* add  w26, w26, w2, sxtb */
+        UINT32_C(0x38784822), /* ldrb w2, [x1, w24, uxtw] */
+        UINT32_C(0x35ffff82)  /* cbnz w2, loop */
+    };
+    enum { steps_per_iteration = 5, maximum_bytes = 64 };
+
+    if (instructions == NULL || cpu == NULL || executed_steps == NULL ||
+        exited_loop == NULL ||
+        instruction_count != sizeof(expected) / sizeof(expected[0]) ||
+        remaining_steps < steps_per_iteration ||
+        read_memory != avz_native_fast_memory_read || cpu->pc != base_pc) {
+        return 0;
+    }
+    for (size_t index = 0; index < instruction_count; index++) {
+        if (instructions[index].raw != expected[index]) {
+            return 0;
+        }
+    }
+
+    uint64_t string_address = read_register(cpu, 1);
+    uint32_t string_index = (uint32_t)read_register(cpu, 24);
+    uint32_t hash = (uint32_t)read_register(cpu, 26);
+    uint8_t current = (uint8_t)read_register(cpu, 2);
+    uint64_t next_address = string_address + (uint64_t)string_index + 1;
+    if (next_address < string_address) {
+        return 0;
+    }
+
+    uint64_t iterations = remaining_steps / steps_per_iteration;
+    if (iterations > maximum_bytes) {
+        iterations = maximum_bytes;
+    }
+    uint64_t page_bytes = UINT64_C(4096) -
+        (next_address & UINT64_C(4095));
+    if (iterations > page_bytes) {
+        iterations = page_bytes;
+    }
+    if (iterations == 0) {
+        return 0;
+    }
+
+    uint8_t *next_bytes = NULL;
+    uint64_t ignored_physical = 0;
+    if (!avz_native_fast_memory_map_span(
+            memory_context, next_address, (size_t)iterations, 0,
+            &next_bytes, &ignored_physical
+        )) {
+        return 0;
+    }
+
+    uint64_t completed = 0;
+    int completed_string = 0;
+    while (completed < iterations) {
+        string_index++;
+        hash = hash * UINT32_C(33) +
+            (uint32_t)(int32_t)(int8_t)current;
+        current = next_bytes[completed];
+        completed++;
+        if (current == 0) {
+            completed_string = 1;
+            break;
+        }
+    }
+
+    write_register(cpu, 24, string_index);
+    write_register(cpu, 26, hash);
+    write_register(cpu, 2, current);
+    cpu->pc = completed_string ? base_pc + UINT64_C(0x14) : base_pc;
+    *executed_steps = completed * steps_per_iteration;
+    *exited_loop = completed_string;
+    return 1;
+}
+
+static int try_execute_byte_string_scan_loop(
+    const AVZNativeInstruction *instructions,
+    size_t instruction_count,
+    uint64_t base_pc,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+) {
+    static const uint32_t expected[] = {
+        UINT32_C(0x91000421), /* add  x1, x1, #1 */
+        UINT32_C(0x39400022), /* ldrb w2, [x1] */
+        UINT32_C(0x35ffffc2)  /* cbnz w2, loop */
+    };
+    enum { steps_per_iteration = 3, maximum_bytes = 256 };
+
+    if (instructions == NULL || cpu == NULL || executed_steps == NULL ||
+        instruction_count != sizeof(expected) / sizeof(expected[0]) ||
+        remaining_steps < steps_per_iteration ||
+        read_memory != avz_native_fast_memory_read || cpu->pc != base_pc) {
+        return 0;
+    }
+    for (size_t index = 0; index < instruction_count; index++) {
+        if (instructions[index].raw != expected[index]) {
+            return 0;
+        }
+    }
+
+    uint64_t cursor = read_register(cpu, 1);
+    if (cursor == UINT64_MAX) {
+        return 0;
+    }
+    uint64_t first_address = cursor + 1;
+    uint64_t iterations = remaining_steps / steps_per_iteration;
+    if (iterations > maximum_bytes) {
+        iterations = maximum_bytes;
+    }
+    uint64_t page_bytes = UINT64_C(4096) -
+        (first_address & UINT64_C(4095));
+    if (iterations > page_bytes) {
+        iterations = page_bytes;
+    }
+    if (iterations == 0) {
+        return 0;
+    }
+
+    uint8_t *bytes = NULL;
+    uint64_t ignored_physical = 0;
+    if (!avz_native_fast_memory_map_span(
+            memory_context, first_address, (size_t)iterations, 0,
+            &bytes, &ignored_physical
+        )) {
+        return 0;
+    }
+
+    uint64_t completed = 0;
+    uint8_t current = 0;
+    int completed_string = 0;
+    while (completed < iterations) {
+        current = bytes[completed];
+        completed++;
+        if (current == 0) {
+            completed_string = 1;
+            break;
+        }
+    }
+
+    write_register(cpu, 1, cursor + completed);
+    write_register(cpu, 2, current);
+    cpu->pc = completed_string ? base_pc + UINT64_C(0x0c) : base_pc;
+    *executed_steps = completed * steps_per_iteration;
+    return 1;
+}
+
+static int try_execute_musl_symbol_name_compare_loop(
+    const AVZNativeInstruction *trace_instructions,
+    const uint64_t *instruction_pcs,
+    size_t trace_instruction_count,
+    uint64_t base_pc,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+) {
+    static const uint32_t gnu_expected[] = {
+        UINT32_C(0x38616864), /* ldrb w4, [x3, x1] */
+        UINT32_C(0x38616927), /* ldrb w7, [x9, x1] */
+        UINT32_C(0x6b07009f), /* cmp  w4, w7 */
+        UINT32_C(0x54fffd41), /* b.ne next GNU hash chain entry */
+        UINT32_C(0x91000421), /* add  x1, x1, #1 */
+        UINT32_C(0x35ffff64)  /* cbnz w4, loop */
+    };
+    static const uint32_t sysv_expected[] = {
+        UINT32_C(0x38616803), /* ldrb w3, [x0, x1] */
+        UINT32_C(0x386168c4), /* ldrb w4, [x6, x1] */
+        UINT32_C(0x6b04007f), /* cmp  w3, w4 */
+        UINT32_C(0x54fffe21), /* b.ne next SysV hash chain entry */
+        UINT32_C(0x91000421), /* add  x1, x1, #1 */
+        UINT32_C(0x35ffff63)  /* cbnz w3, loop */
+    };
+    enum { steps_per_equal_byte = 6, maximum_bytes = 64 };
+
+    if (trace_instructions == NULL || instruction_pcs == NULL ||
+        cpu == NULL || executed_steps == NULL ||
+        remaining_steps < steps_per_equal_byte ||
+        read_memory != avz_native_fast_memory_read || cpu->pc != base_pc) {
+        return 0;
+    }
+
+    const uint32_t *expected = NULL;
+    unsigned left_base_register = 0;
+    unsigned right_base_register = 0;
+    unsigned left_value_register = 0;
+    unsigned right_value_register = 0;
+    int64_t mismatch_offset = 0;
+    uint64_t first_code_word = 0;
+    if (!read_memory(memory_context, base_pc, 4, &first_code_word)) {
+        return 0;
+    }
+    if ((uint32_t)first_code_word == gnu_expected[0]) {
+        expected = gnu_expected;
+        left_base_register = 3;
+        right_base_register = 9;
+        left_value_register = 4;
+        right_value_register = 7;
+        mismatch_offset = -INT64_C(0x4c);
+    } else if ((uint32_t)first_code_word == sysv_expected[0]) {
+        expected = sysv_expected;
+        left_base_register = 0;
+        right_base_register = 6;
+        left_value_register = 3;
+        right_value_register = 4;
+        mismatch_offset = -INT64_C(0x30);
+    } else {
+        return 0;
+    }
+    for (size_t index = 0; index < 6; index++) {
+        uint64_t code_word = 0;
+        if (!read_memory(
+                memory_context, base_pc + index * 4, 4, &code_word
+            ) || (uint32_t)code_word != expected[index]) {
+            return 0;
+        }
+    }
+
+    uint64_t string_index = read_register(cpu, 1);
+    uint64_t left_base = read_register(cpu, left_base_register);
+    uint64_t right_base = read_register(cpu, right_base_register);
+    if (string_index > UINT64_MAX - left_base ||
+        string_index > UINT64_MAX - right_base) {
+        return 0;
+    }
+    uint64_t left_address = left_base + string_index;
+    uint64_t right_address = right_base + string_index;
+    uint64_t iterations = remaining_steps / steps_per_equal_byte;
+    if (iterations > maximum_bytes) {
+        iterations = maximum_bytes;
+    }
+    uint64_t left_page_bytes = UINT64_C(4096) -
+        (left_address & UINT64_C(4095));
+    uint64_t right_page_bytes = UINT64_C(4096) -
+        (right_address & UINT64_C(4095));
+    if (iterations > left_page_bytes) {
+        iterations = left_page_bytes;
+    }
+    if (iterations > right_page_bytes) {
+        iterations = right_page_bytes;
+    }
+    if (iterations == 0) {
+        return 0;
+    }
+
+    uint8_t *left = NULL;
+    uint8_t *right = NULL;
+    uint64_t ignored_physical = 0;
+    if (!avz_native_fast_memory_map_span(
+            memory_context, left_address, (size_t)iterations, 0,
+            &left, &ignored_physical
+        ) ||
+        !avz_native_fast_memory_map_span(
+            memory_context, right_address, (size_t)iterations, 0,
+            &right, &ignored_physical
+        )) {
+        return 0;
+    }
+
+    uint64_t completed = 0;
+    uint64_t equal_bytes = 0;
+    uint8_t left_byte = 0;
+    uint8_t right_byte = 0;
+    int mismatch = 0;
+    int completed_string = 0;
+    while (completed < iterations) {
+        left_byte = left[completed];
+        right_byte = right[completed];
+        completed++;
+        if (left_byte != right_byte) {
+            mismatch = 1;
+            break;
+        }
+        equal_bytes++;
+        if (left_byte == 0) {
+            completed_string = 1;
+            break;
+        }
+    }
+
+    uint64_t ignored_result = 0;
+    uint64_t flags = add_with_carry_nzcv(
+        left_byte, (~(uint64_t)right_byte) & UINT32_MAX, 1, 32,
+        &ignored_result
+    );
+    write_register(cpu, 1, string_index + equal_bytes);
+    write_register(cpu, left_value_register, left_byte);
+    write_register(cpu, right_value_register, right_byte);
+    cpu->pstate = (cpu->pstate & ~UINT64_C(0xf0000000)) |
+        (flags & UINT64_C(0xf0000000));
+    if (mismatch) {
+        cpu->pc = (uint64_t)((int64_t)base_pc + mismatch_offset);
+        *executed_steps = (completed - 1) * steps_per_equal_byte + 4;
+    } else {
+        cpu->pc = completed_string ? base_pc + UINT64_C(0x18) : base_pc;
+        *executed_steps = completed * steps_per_equal_byte;
+    }
+    return 1;
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static uint64_t vector_low_from_u8x8(uint8x8_t value) {
+    return vget_lane_u64(vreinterpret_u64_u8(value), 0);
+}
+
+static void store_u16x8_vector(
+    AVZNativeVectorRegister *destination,
+    uint16x8_t value
+) {
+    memcpy(destination, &value, sizeof(value));
+}
+
+static uint16x8_t load_u16x8_vector(
+    const AVZNativeVectorRegister *source
+) {
+    uint16x8_t value;
+    memcpy(&value, source, sizeof(value));
+    return value;
+}
+
+#endif
+
+static int try_execute_pixman_source_over_prefix(
+    const AVZNativeInstruction *instructions,
+    const uint64_t *instruction_pcs,
+    size_t instruction_count,
+    uint8_t *validated_hint,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    AVZNativeMemoryWriteCallback write_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+) {
+#if !defined(__aarch64__) || !defined(__ARM_NEON)
+    (void)instructions;
+    (void)instruction_pcs;
+    (void)instruction_count;
+    (void)validated_hint;
+    (void)remaining_steps;
+    (void)cpu;
+    (void)read_memory;
+    (void)write_memory;
+    (void)memory_context;
+    (void)executed_steps;
+    return 0;
+#else
+    enum { minimum_steps = 24, extended_steps = 26 };
+    static const AVZPixmanSourceOverInstruction expected[] = {
+        {0x00, 0x0cdf0104}, {0x04, 0x6f18250e},
+        {0x08, 0x9100214a}, {0x0c, 0xf2400d3f},
+        {0x10, 0x6f18252f}, {0x14, 0x6f182550},
+        {0x18, 0x6f182571}, {0x1c, 0x54000060},
+        {0x20, 0x9100214a}, {0x24, 0xd1000529},
+        {0x28, 0x2e2841dc}, {0x2c, 0x2e2941fd},
+        {0x30, 0xeb0e015f}, {0x34, 0x2e2a421e},
+        {0x38, 0x2e2b423f}, {0x3c, 0x2e3c0c1c},
+        {0x40, 0x2e3d0c3d}, {0x44, 0x2e3e0c5e},
+        {0x48, 0x2e3f0c7f}, {0x4c, 0x0cdf0080},
+        {0x50, 0xd37ef54f}, {0x54, 0xf8af6960},
+        {0x58, 0x2e205876}, {0x5c, 0xd37ef54f},
+        {0x60, 0xf8af6980}, {0x64, 0x0c9f005c}
+    };
+    if (instructions == NULL || instruction_pcs == NULL ||
+        executed_steps == NULL || remaining_steps < minimum_steps ||
+        read_memory != avz_native_fast_memory_read ||
+        write_memory != avz_native_fast_memory_write ||
+        ((validated_hint == NULL || *validated_hint == 0) &&
+         !trace_contains_raw_instruction(
+            instructions,
+            instruction_pcs,
+            instruction_count,
+            cpu->pc,
+            expected[0].raw
+        ))) {
+        return 0;
+    }
+    uint64_t base_pc = cpu->pc;
+    if (validated_hint == NULL || *validated_hint == 0) {
+        for (size_t index = 0;
+             index < sizeof(expected) / sizeof(expected[0]); index++) {
+            if (!trace_contains_raw_instruction(
+                    instructions,
+                    instruction_pcs,
+                    instruction_count,
+                    base_pc + expected[index].offset,
+                    expected[index].raw
+                )) {
+                return 0;
+            }
+        }
+        if (validated_hint != NULL) {
+            *validated_hint = 1;
+        }
+    }
+
+    uint64_t source_address = read_base_register(cpu, 4);
+    uint64_t destination_address = read_base_register(cpu, 8);
+    uint64_t output_address = read_base_register(cpu, 2);
+    uint64_t x9 = read_register(cpu, 9);
+    uint64_t x10 = read_register(cpu, 10);
+    uint64_t x14 = read_register(cpu, 14);
+    int executes_unaligned_adjustment = (x9 & UINT64_C(0xf)) != 0;
+    uint64_t step_count = executes_unaligned_adjustment
+        ? extended_steps : minimum_steps;
+    if (remaining_steps < step_count) {
+        return 0;
+    }
+
+    uint8_t *source = NULL;
+    uint8_t *destination = NULL;
+    uint8_t *output = NULL;
+    uint64_t source_physical = 0;
+    uint64_t destination_physical = 0;
+    uint64_t output_physical = 0;
+    if (!avz_native_fast_memory_map_span(
+            memory_context, destination_address, 32, 0,
+            &destination, &destination_physical
+        ) ||
+        !avz_native_fast_memory_map_span(
+            memory_context, source_address, 32, 0,
+            &source, &source_physical
+        ) ||
+        !avz_native_fast_memory_map_span(
+            memory_context, output_address, 32, 1,
+            &output, &output_physical
+        )) {
+        return 0;
+    }
+    (void)source_physical;
+    (void)destination_physical;
+
+    uint8x8x4_t next_destination = vld4_u8(destination);
+    uint16x8_t products[4];
+    uint16x8_t rounded[4];
+    uint8x8x4_t result;
+    uint8x8x4_t wrapping;
+    int saturated = 0;
+    for (unsigned component = 0; component < 4; component++) {
+        cpu->v[4 + component] = (AVZNativeVectorRegister){
+            vector_low_from_u8x8(next_destination.val[component]), 0
+        };
+        products[component] = load_u16x8_vector(&cpu->v[8 + component]);
+        rounded[component] = vrshrq_n_u16(products[component], 8);
+        store_u16x8_vector(&cpu->v[14 + component], rounded[component]);
+    }
+
+    x10 += 8;
+    if (executes_unaligned_adjustment) {
+        x10 += 8;
+        x9 -= 1;
+    }
+
+    for (unsigned component = 0; component < 4; component++) {
+        uint8x8_t scaled = vraddhn_u16(
+            rounded[component], products[component]
+        );
+        uint8x8_t source_component = vcreate_u8(cpu->v[component].low);
+        result.val[component] = vqadd_u8(source_component, scaled);
+        wrapping.val[component] = vadd_u8(source_component, scaled);
+        saturated |= vmaxv_u8(veor_u8(
+            result.val[component], wrapping.val[component]
+        )) != 0;
+        cpu->v[28 + component] = (AVZNativeVectorRegister){
+            vector_low_from_u8x8(result.val[component]), 0
+        };
+    }
+    if (saturated) {
+        cpu->fpsr |= UINT64_C(1) << 27;
+    }
+
+    uint64_t ignored = 0;
+    uint64_t compare_flags = add_with_carry_nzcv(
+        x10, ~x14, 1, 64, &ignored
+    );
+    uint8x8x4_t next_source = vld4_u8(source);
+    for (unsigned component = 0; component < 4; component++) {
+        cpu->v[component] = (AVZNativeVectorRegister){
+            vector_low_from_u8x8(next_source.val[component]), 0
+        };
+    }
+    uint8x8_t inverse_alpha = vmvn_u8(next_source.val[3]);
+    cpu->v[22] = (AVZNativeVectorRegister){
+        vector_low_from_u8x8(inverse_alpha), 0
+    };
+    vst4_u8(output, result);
+    avz_native_fast_memory_commit_write_span(
+        memory_context, output_physical, 32
+    );
+    clear_exclusive_reservation(cpu);
+    write_base_register(cpu, 4, source_address + 32);
+    write_base_register(cpu, 8, destination_address + 32);
+    write_base_register(cpu, 2, output_address + 32);
+    write_register(cpu, 9, x9);
+    write_register(cpu, 10, x10);
+    write_register(cpu, 15, x10 << 2);
+    cpu->pstate =
+        (cpu->pstate & ~UINT64_C(0xf0000000)) |
+        (compare_flags & UINT64_C(0xf0000000));
+    cpu->pc = base_pc + 0x68;
+    *executed_steps = step_count;
+    return 1;
+#endif
+}
+
+static int try_execute_pixman_source_over_tail(
+    const AVZNativeInstruction *instructions,
+    const uint64_t *instruction_pcs,
+    size_t instruction_count,
+    uint8_t *validated_hint,
+    uint64_t remaining_steps,
+    AVZNativeCPU *cpu,
+    AVZNativeMemoryReadCallback read_memory,
+    void *memory_context,
+    uint64_t *executed_steps
+) {
+#if !defined(__aarch64__) || !defined(__ARM_NEON)
+    (void)instructions;
+    (void)instruction_pcs;
+    (void)instruction_count;
+    (void)validated_hint;
+    (void)remaining_steps;
+    (void)cpu;
+    (void)read_memory;
+    (void)memory_context;
+    (void)executed_steps;
+    return 0;
+#else
+    static const uint32_t expected[] = {
+        UINT32_C(0x5400004d), UINT32_C(0xcb0e014a),
+        UINT32_C(0x2e24c2c8), UINT32_C(0x5400004d),
+        UINT32_C(0xf1004129), UINT32_C(0x2e25c2c9),
+        UINT32_C(0x5400006d), UINT32_C(0x8b05096b),
+        UINT32_C(0x3980016f), UINT32_C(0x2e26c2ca),
+        UINT32_C(0x5400006d), UINT32_C(0x8b03098c),
+        UINT32_C(0x3980018f), UINT32_C(0x2e27c2cb),
+        UINT32_C(0xf1002000), UINT32_C(0x54fffaea)
+    };
+    if (instructions == NULL || instruction_pcs == NULL ||
+        cpu == NULL || executed_steps == NULL ||
+        remaining_steps < 10 ||
+        read_memory != avz_native_fast_memory_read ||
+        ((validated_hint == NULL || *validated_hint == 0) &&
+         !trace_contains_raw_instruction(
+            instructions, instruction_pcs, instruction_count,
+            cpu->pc, expected[0]
+         ))) {
+        return 0;
+    }
+    uint64_t base_pc = cpu->pc;
+    if (validated_hint == NULL || *validated_hint == 0) {
+        for (size_t index = 0;
+             index < sizeof(expected) / sizeof(expected[0]); index++) {
+            if (!trace_contains_raw_instruction(
+                    instructions,
+                    instruction_pcs,
+                    instruction_count,
+                    base_pc + index * 4,
+                    expected[index]
+                )) {
+                return 0;
+            }
+        }
+        if (validated_hint != NULL) {
+            *validated_hint = 1;
+        }
+    }
+
+    uint64_t initial_flags = cpu->pstate;
+    int initial_le = condition_holds(13, initial_flags);
+    uint64_t x9 = read_register(cpu, 9);
+    uint64_t x10 = read_register(cpu, 10);
+    uint64_t tail_flags = initial_flags;
+    uint64_t next_x9 = x9;
+    int reads_probe_addresses = 0;
+    uint64_t step_count = 10;
+    if (!initial_le) {
+        x10 -= read_register(cpu, 14);
+        tail_flags = add_with_carry_nzcv(
+            x9, ~UINT64_C(16), 1, 64, &next_x9
+        );
+        reads_probe_addresses = !condition_holds(13, tail_flags);
+        step_count = 12 + (reads_probe_addresses ? 4 : 0);
+    }
+    if (remaining_steps < step_count) {
+        return 0;
+    }
+
+    uint64_t x11 = read_register(cpu, 11);
+    uint64_t x12 = read_register(cpu, 12);
+    uint64_t x15 = read_register(cpu, 15);
+    if (reads_probe_addresses) {
+        x11 += read_register(cpu, 5) << 2;
+        uint64_t probe_value = 0;
+        if (!read_memory(memory_context, x11, 1, &probe_value)) {
+            return 0;
+        }
+        x15 = (uint64_t)(int64_t)(int8_t)probe_value;
+        x12 += read_register(cpu, 3) << 2;
+        if (!read_memory(memory_context, x12, 1, &probe_value)) {
+            return 0;
+        }
+        x15 = (uint64_t)(int64_t)(int8_t)probe_value;
+    }
+
+    uint8x8_t inverse_alpha = vcreate_u8(cpu->v[22].low);
+    for (unsigned component = 0; component < 4; component++) {
+        uint8x8_t destination = vcreate_u8(cpu->v[4 + component].low);
+        store_u16x8_vector(
+            &cpu->v[8 + component],
+            vmull_u8(inverse_alpha, destination)
+        );
+    }
+
+    uint64_t x0 = read_register(cpu, 0);
+    uint64_t next_x0 = 0;
+    uint64_t final_flags = add_with_carry_nzcv(
+        x0, ~UINT64_C(8), 1, 64, &next_x0
+    );
+    write_register(cpu, 0, next_x0);
+    write_register(cpu, 9, next_x9);
+    write_register(cpu, 10, x10);
+    if (reads_probe_addresses) {
+        write_register(cpu, 11, x11);
+        write_register(cpu, 12, x12);
+        write_register(cpu, 15, x15);
+    }
+    cpu->pstate =
+        (cpu->pstate & ~UINT64_C(0xf0000000)) |
+        (final_flags & UINT64_C(0xf0000000));
+    cpu->pc = condition_holds(10, final_flags)
+        ? base_pc - UINT64_C(0x68)
+        : base_pc + UINT64_C(0x40);
+    *executed_steps = step_count;
+    return 1;
+#endif
+}
+
 static void copy_registers_to_cpu(
     AVZNativeCPU *cpu,
     const uint64_t *x31,
@@ -8639,6 +9844,7 @@ static void copy_registers_to_cpu(
     cpu->fpcr = fpcr;
     cpu->fpsr = fpsr;
     cpu->exclusive_address = exclusive_address;
+    cpu->exclusive_generation = 0;
     cpu->exclusive_size = exclusive_size;
     cpu->exclusive_valid = exclusive_valid;
     cpu->halted = halted;
@@ -8818,7 +10024,7 @@ static AVZNativeBlockResult avz_native_run_decoded_block_full_generic(
             break;
         }
         const AVZNativeInstruction *instruction = &instructions[index64];
-        if (!execute_decoded_instruction(
+        int execution_status = execute_decoded_instruction(
             instruction,
             &cpu,
             read_memory,
@@ -8831,12 +10037,17 @@ static AVZNativeBlockResult avz_native_run_decoded_block_full_generic(
             synchronous_exception,
             wait,
             memory_context
-        )) {
+        );
+        if (execution_status == 0) {
             result.status = AVZ_NATIVE_STATUS_UNSUPPORTED;
             result.unsupported_instruction = instruction->raw;
             break;
         }
         result.steps++;
+        if (execution_status == AVZ_NATIVE_WAIT_YIELD) {
+            result.status = AVZ_NATIVE_STATUS_YIELDED;
+            break;
+        }
     }
     if (result.steps >= max_steps && result.status == AVZ_NATIVE_STATUS_OUTSIDE_BLOCK) {
         result.status = AVZ_NATIVE_STATUS_MAX_STEPS;
@@ -8879,6 +10090,7 @@ static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped(
     AVZNativeSynchronousExceptionCallback synchronous_exception,
     AVZNativeWaitCallback wait,
     void *restrict memory_context,
+    uint8_t *restrict semantic_hints,
     const uint64_t *restrict instruction_pcs,
     const uint16_t *restrict block_offsets,
     size_t fused_block_count,
@@ -8975,7 +10187,111 @@ dispatch:
         }
     }
     int used_semantic_fast_path = 0;
-    if (fast_instruction_count == 3 &&
+    int semantic_fast_path_exits_mapped_block = 0;
+    if (instruction_pcs != NULL &&
+        (instructions[index64].raw == UINT32_C(0x38616864) ||
+         instructions[index64].raw == UINT32_C(0x38616803))) {
+        used_semantic_fast_path = try_execute_musl_symbol_name_compare_loop(
+            instructions,
+            instruction_pcs,
+            instruction_count,
+            cpu.pc,
+            max_steps - result.steps,
+            &cpu,
+            read_memory,
+            memory_context,
+            &fast_steps
+        );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
+    } else if (fast_instruction_count > 0 &&
+        fast_instructions[0].raw == UINT32_C(0x0cdf0104)) {
+        used_semantic_fast_path = try_execute_pixman_source_over_prefix(
+            instructions,
+            instruction_pcs,
+            instruction_count,
+            semantic_hints == NULL ? NULL : &semantic_hints[index64],
+            max_steps - result.steps,
+            &cpu,
+            read_memory,
+            write_memory,
+            memory_context,
+            &fast_steps
+        );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
+    } else if (fast_instruction_count > 0 &&
+        fast_instructions[0].raw == UINT32_C(0x5400004d)) {
+        used_semantic_fast_path = try_execute_pixman_source_over_tail(
+            instructions,
+            instruction_pcs,
+            instruction_count,
+            semantic_hints == NULL ? NULL : &semantic_hints[index64],
+            max_steps - result.steps,
+            &cpu,
+            read_memory,
+            memory_context,
+            &fast_steps
+        );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
+    } else if (fast_instruction_count == 3 &&
+        fast_instructions[0].raw == UINT32_C(0x91000421)) {
+        used_semantic_fast_path = try_execute_byte_string_scan_loop(
+            fast_instructions,
+            fast_instruction_count,
+            fast_base_pc,
+            max_steps - result.steps,
+            &cpu,
+            read_memory,
+            memory_context,
+            &fast_steps
+        );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
+    } else if (fast_instruction_count == 5 &&
+        fast_instructions[0].raw == UINT32_C(0x11000718)) {
+        int exited_hash_loop = 0;
+        used_semantic_fast_path = try_execute_glib_djb2_string_hash_loop(
+            fast_instructions,
+            fast_instruction_count,
+            fast_base_pc,
+            max_steps - result.steps,
+            &cpu,
+            read_memory,
+            memory_context,
+            &fast_steps,
+            &exited_hash_loop
+        );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
+    } else if (instruction_pcs != NULL &&
+        instructions[index64].raw == UINT32_C(0x39400003)) {
+        used_semantic_fast_path = try_execute_musl_memcmp_loop(
+            instructions,
+            instruction_pcs,
+            instruction_count,
+            index64,
+            cpu.pc,
+            max_steps - result.steps,
+            &cpu,
+            read_memory,
+            memory_context,
+            &fast_steps
+        );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
+    } else if (instruction_pcs != NULL &&
+        index64 + 1 < instruction_count &&
+        instructions[index64].raw == UINT32_C(0x0c9f2840) &&
+        instruction_pcs[index64 + 1] == cpu.pc + 4 &&
+        instructions[index64 + 1].raw == UINT32_C(0x0cdf2880)) {
+        used_semantic_fast_path = try_execute_pixman_neon_copy_loop(
+            semantic_hints == NULL ? NULL : &semantic_hints[index64],
+            cpu.pc,
+            max_steps - result.steps,
+            &cpu,
+            read_memory,
+            write_memory,
+            memory_context,
+            &fast_steps
+        );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
+    } else if (fast_instruction_count == 3 &&
         fast_instructions[0].kind ==
             AVZ_NATIVE_OP_SIMD_LOAD_STORE_MULTIPLE_STRUCTURE) {
         used_semantic_fast_path = try_execute_simd_solid_fill_loop(
@@ -9005,6 +10321,9 @@ dispatch:
         result.steps += fast_steps;
         result.fast_path_steps += fast_steps;
         result.fast_path_hits++;
+        if (semantic_fast_path_exits_mapped_block) {
+            AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+        }
         goto dispatch;
     }
 
@@ -9065,6 +10384,7 @@ dispatch:
     case AVZ_NATIVE_OP_SIMD_LOAD_STORE_MULTIPLE_STRUCTURE: goto op_simd_load_store_multiple_structure;
     case AVZ_NATIVE_OP_SIMD_COMPARE_EQUAL_VECTOR: goto op_simd_compare_equal_vector;
     case AVZ_NATIVE_OP_SIMD_COUNT_SET_BITS: goto op_simd_count_set_bits;
+    case AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS: goto op_simd_count_leading_zeros;
     default: goto op_generic;
     }
 
@@ -9633,6 +10953,7 @@ op_synchronous_exception:
         !synchronous_exception(
             memory_context,
             instruction->raw,
+            cpu.x,
             &cpu.pstate,
             &cpu.sp,
             &cpu.pc
@@ -9643,9 +10964,20 @@ op_synchronous_exception:
     AVZ_THREADED_STEP();
 
 op_wait:
-    if (wait == 0 || !wait(memory_context, instruction->raw, &cpu.pc)) {
+    if (wait == 0) {
         result.unsupported_instruction = instruction->raw;
         AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_UNSUPPORTED);
+    }
+    {
+        int wait_status = wait(memory_context, instruction->raw, &cpu.pc);
+        if (wait_status == AVZ_NATIVE_WAIT_UNSUPPORTED) {
+            result.unsupported_instruction = instruction->raw;
+            AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_UNSUPPORTED);
+        }
+        if (wait_status == AVZ_NATIVE_WAIT_YIELD) {
+            result.steps++;
+            AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_YIELDED);
+        }
     }
     AVZ_THREADED_STEP();
 
@@ -9892,13 +11224,23 @@ op_load_store_exclusive: {
     uint64_t address = read_base_register(&cpu, instruction->rn);
     uint64_t value = 0;
     if ((instruction->flags & 1) != 0) {
-        if (read_memory == NULL ||
-            !read_memory(
-                memory_context,
-                address,
-                instruction->width,
-                &value
-            )) {
+        if (read_memory == avz_native_fast_memory_read) {
+            if (!avz_native_fast_memory_exclusive_read(
+                    memory_context,
+                    address,
+                    instruction->width,
+                    &value,
+                    &cpu.exclusive_generation
+                )) {
+                AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+            }
+        } else if (read_memory == NULL ||
+                   !read_memory(
+                       memory_context,
+                       address,
+                       instruction->width,
+                       &value
+                   )) {
             AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
         }
         write_register(
@@ -9913,16 +11255,30 @@ op_load_store_exclusive: {
         int reservation_matches = cpu.exclusive_valid != 0 &&
             cpu.exclusive_address == address &&
             cpu.exclusive_size == instruction->width;
-        if (reservation_matches &&
-            (write_memory == NULL ||
-             !write_memory(
-                 memory_context,
-                 address,
-                 instruction->width,
-                 read_register(&cpu, instruction->rt) &
-                     mask_for_bits(instruction->bits)
-             ))) {
-            AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+        if (reservation_matches) {
+            uint64_t store_value = read_register(&cpu, instruction->rt) &
+                mask_for_bits(instruction->bits);
+            if (write_memory == avz_native_fast_memory_write) {
+                int exclusive_result = avz_native_fast_memory_exclusive_write(
+                    memory_context,
+                    address,
+                    instruction->width,
+                    store_value,
+                    cpu.exclusive_generation
+                );
+                if (exclusive_result < 0) {
+                    AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+                }
+                reservation_matches = exclusive_result;
+            } else if (write_memory == NULL ||
+                       !write_memory(
+                           memory_context,
+                           address,
+                           instruction->width,
+                           store_value
+                       )) {
+                AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+            }
         }
         write_register(&cpu, instruction->rd, reservation_matches ? 0 : 1);
         clear_exclusive_reservation(&cpu);
@@ -10042,6 +11398,24 @@ op_simd_count_set_bits: {
     for (unsigned lane = 0; lane < vector_bits / 8u; lane++) {
         uint8_t byte = (uint8_t)read_vector_element(&cpu, instruction->rn, lane, 8);
         write_vector_element(&vector_result, lane, 8, popcount_u8(byte));
+    }
+    cpu.v[instruction->rd] = vector_result;
+    cpu.pc += 4;
+    AVZ_THREADED_STEP();
+}
+
+op_simd_count_leading_zeros: {
+    unsigned element_bits = instruction->bits;
+    unsigned vector_bits = (instruction->flags & 1u) != 0u ? 128u : 64u;
+    AVZNativeVectorRegister vector_result = {0, 0};
+    for (unsigned lane = 0; lane < vector_bits / element_bits; lane++) {
+        uint64_t value = read_vector_element(
+            &cpu, instruction->rn, lane, element_bits
+        );
+        write_vector_element(
+            &vector_result, lane, element_bits,
+            count_leading_zeros_width(value, element_bits)
+        );
     }
     cpu.v[instruction->rd] = vector_result;
     cpu.pc += 4;
@@ -10178,7 +11552,8 @@ op_load_store_pair: {
 
 op_generic:
     result.generic_dispatches++;
-    if (!execute_decoded_instruction(
+    {
+        int execution_status = execute_decoded_instruction(
         instruction,
         &cpu,
         read_memory,
@@ -10191,10 +11566,16 @@ op_generic:
         synchronous_exception,
         wait,
         memory_context
-    )) {
-        result.status = AVZ_NATIVE_STATUS_UNSUPPORTED;
-        result.unsupported_instruction = instruction == 0 ? 0 : instruction->raw;
-        goto done;
+        );
+        if (execution_status == 0) {
+            result.status = AVZ_NATIVE_STATUS_UNSUPPORTED;
+            result.unsupported_instruction = instruction == 0 ? 0 : instruction->raw;
+            goto done;
+        }
+        if (execution_status == AVZ_NATIVE_WAIT_YIELD) {
+            result.steps++;
+            AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_YIELDED);
+        }
     }
     AVZ_THREADED_STEP();
 
@@ -10241,7 +11622,7 @@ done:
             }
         }
         const AVZNativeInstruction *instruction = &instructions[index64];
-        if (!execute_decoded_instruction(
+        int execution_status = execute_decoded_instruction(
             instruction,
             &cpu,
             read_memory,
@@ -10254,12 +11635,17 @@ done:
             synchronous_exception,
             wait,
             memory_context
-        )) {
+        );
+        if (execution_status == 0) {
             result.status = AVZ_NATIVE_STATUS_UNSUPPORTED;
             result.unsupported_instruction = instruction->raw;
             break;
         }
         result.steps++;
+        if (execution_status == AVZ_NATIVE_WAIT_YIELD) {
+            result.status = AVZ_NATIVE_STATUS_YIELDED;
+            break;
+        }
         if (instruction_pcs != NULL) {
             index64++;
         }
@@ -10308,6 +11694,7 @@ static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_impl(
         synchronous_exception,
         wait,
         memory_context,
+        NULL,
         NULL,
         NULL,
         0,
@@ -10486,6 +11873,7 @@ typedef struct {
     uint64_t serials[AVZ_NATIVE_SUPERBLOCK_MAX_BLOCKS];
     AVZNativeInstruction *instructions;
     uint64_t *instruction_pcs;
+    uint8_t *semantic_hints;
     const uint64_t
         *code_page_generation_tokens[AVZ_NATIVE_SUPERBLOCK_MAX_CODE_PAGES];
     uint64_t
@@ -10533,15 +11921,12 @@ static int avz_native_direct_link_is_current(
         )) {
         return 0;
     }
-    uint64_t code_mutation_epoch =
-        avz_native_block_cache_code_mutation_epoch(cache);
-    if (link->code_mutation_epoch == code_mutation_epoch) {
-        return 1;
-    }
     if (!avz_native_decoded_block_code_is_current(cache, link->source) ||
         !avz_native_decoded_block_code_is_current(cache, link->target)) {
         return 0;
     }
+    uint64_t code_mutation_epoch =
+        avz_native_block_cache_code_mutation_epoch(cache);
     link->code_mutation_epoch = code_mutation_epoch;
     return 1;
 }
@@ -10570,7 +11955,9 @@ static uint64_t avz_native_mix_u64(uint64_t value);
 
 static inline void avz_native_sample_hot_pc(
     AVZNativeExecutionContext *context,
-    uint64_t pc
+    uint64_t pc,
+    const AVZNativeInstruction *instructions,
+    size_t instruction_count
 ) {
     if (!context->hot_pc_profiling_enabled) {
         return;
@@ -10594,6 +11981,17 @@ static inline void avz_native_sample_hot_pc(
         if (entry->samples == 0) {
             entry->pc = pc;
             entry->samples = 1;
+            entry->instruction_count = (uint8_t)(
+                instruction_count < 4 ? instruction_count : 4
+            );
+            entry->instruction0 = entry->instruction_count > 0
+                ? instructions[0].raw : 0;
+            entry->instruction1 = entry->instruction_count > 1
+                ? instructions[1].raw : 0;
+            entry->instruction2 = entry->instruction_count > 2
+                ? instructions[2].raw : 0;
+            entry->instruction3 = entry->instruction_count > 3
+                ? instructions[3].raw : 0;
             return;
         }
         if (entry->samples < context->hot_pcs[victim].samples) {
@@ -10605,6 +12003,21 @@ static inline void avz_native_sample_hot_pc(
     uint64_t inherited_samples = context->hot_pcs[victim].samples;
     context->hot_pcs[victim].pc = pc;
     context->hot_pcs[victim].samples = inherited_samples + 1;
+    context->hot_pcs[victim].instruction_count = (uint8_t)(
+        instruction_count < 4 ? instruction_count : 4
+    );
+    context->hot_pcs[victim].instruction0 =
+        context->hot_pcs[victim].instruction_count > 0
+            ? instructions[0].raw : 0;
+    context->hot_pcs[victim].instruction1 =
+        context->hot_pcs[victim].instruction_count > 1
+            ? instructions[1].raw : 0;
+    context->hot_pcs[victim].instruction2 =
+        context->hot_pcs[victim].instruction_count > 2
+            ? instructions[2].raw : 0;
+    context->hot_pcs[victim].instruction3 =
+        context->hot_pcs[victim].instruction_count > 3
+            ? instructions[3].raw : 0;
 }
 
 static size_t avz_native_direct_link_set_base(
@@ -10873,6 +12286,12 @@ void avz_native_execution_context_load(
     if (context == 0 || x31 == 0) {
         return;
     }
+    const uint64_t preserved_generation =
+        context->cpu.exclusive_valid != 0 && exclusive_valid != 0 &&
+        context->cpu.exclusive_address == exclusive_address &&
+        context->cpu.exclusive_size == exclusive_size
+            ? context->cpu.exclusive_generation
+            : 0;
     copy_registers_to_cpu(
         &context->cpu,
         x31,
@@ -10888,6 +12307,7 @@ void avz_native_execution_context_load(
         exclusive_valid,
         halted
     );
+    context->cpu.exclusive_generation = preserved_generation;
     context->last_block = NULL;
     context->last_block_serial = 0;
 }
@@ -11032,6 +12452,36 @@ static int avz_native_block_is_chain_barrier(
     return 0;
 }
 
+static int avz_native_block_requires_host_checkpoint(
+    const AVZNativeDecodedBlock *block
+) {
+    const AVZNativeInstruction *instructions =
+        avz_native_decoded_block_instructions(block);
+    size_t count = avz_native_decoded_block_instruction_count(block);
+    if (instructions == NULL || count == 0)
+        return 1;
+    for (size_t index = 0; index < count; index++) {
+        switch (instructions[index].kind) {
+        case AVZ_NATIVE_OP_SYSTEM_REGISTER_READ:
+        case AVZ_NATIVE_OP_EXCEPTION_RETURN:
+            break;
+        case AVZ_NATIVE_OP_SYNCHRONOUS_EXCEPTION:
+            if ((instructions[index].raw & 0xffe0001fu) != 0xd4000001u)
+                return 1;
+            break;
+        case AVZ_NATIVE_OP_SYSTEM_REGISTER_WRITE:
+        case AVZ_NATIVE_OP_SYSTEM_INSTRUCTION:
+        case AVZ_NATIVE_OP_PSTATE_IMMEDIATE:
+        case AVZ_NATIVE_OP_WAIT:
+        case AVZ_NATIVE_OP_HALT:
+            return 1;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
 #if defined(__clang__) || defined(__GNUC__)
 __attribute__((always_inline))
 #endif
@@ -11056,6 +12506,15 @@ static inline AVZNativeSuperblock *avz_native_validate_superblock(
         superblock->reset_epoch != reset_epoch) {
         superblock->valid = 0;
         return NULL;
+    }
+    for (size_t slot = 0; slot < superblock->count; slot++) {
+        if (!avz_native_decoded_block_code_is_current(
+                cache,
+                superblock->blocks[slot]
+            )) {
+            superblock->valid = 0;
+            return NULL;
+        }
     }
     if (superblock->requires_cache_residency &&
         superblock->mutation_epoch != mutation_epoch) {
@@ -11223,13 +12682,18 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
 
     size_t instruction_bytes = instruction_count * sizeof(AVZNativeInstruction);
     size_t pc_bytes = instruction_count * sizeof(uint64_t);
-    AVZNativeInstruction *instructions = malloc(instruction_bytes + pc_bytes);
+    size_t hint_bytes = instruction_count * sizeof(uint8_t);
+    AVZNativeInstruction *instructions = malloc(
+        instruction_bytes + pc_bytes + hint_bytes
+    );
     if (instructions == NULL) {
         return NULL;
     }
     uint64_t *instruction_pcs = (uint64_t *)(
         (unsigned char *)instructions + instruction_bytes
     );
+    uint8_t *semantic_hints = (uint8_t *)(instruction_pcs + instruction_count);
+    memset(semantic_hints, 0, hint_bytes);
     size_t destination = 0;
     for (size_t slot = 0; slot < block_count; slot++) {
         const AVZNativeInstruction *block_instructions =
@@ -11308,6 +12772,7 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
     free(composed->instructions);
     composed->instructions = instructions;
     composed->instruction_pcs = instruction_pcs;
+    composed->semantic_hints = semantic_hints;
     composed->key = *key_template;
     composed->cache = cache;
     composed->reset_epoch = avz_native_block_cache_reset_epoch(cache);
@@ -11433,15 +12898,22 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
                 memory_context
             );
         chain.steps += block_result.steps;
+        int native_irq_due = avz_native_memory_fast_path_advance_time(
+            memory_context, block_result.steps, context->cpu.pstate);
         chain.generic_dispatches += block_result.generic_dispatches;
         chain.fast_path_steps += block_result.fast_path_steps;
         chain.fast_path_hits += block_result.fast_path_hits;
         chain.blocks++;
         chain.status = block_result.status;
+        if (native_irq_due &&
+            chain.status != AVZ_NATIVE_STATUS_HALTED &&
+            chain.status != AVZ_NATIVE_STATUS_UNSUPPORTED)
+            chain.status = AVZ_NATIVE_STATUS_YIELDED;
         chain.unsupported_instruction = block_result.unsupported_instruction;
 
-        if (block_result.status == AVZ_NATIVE_STATUS_HALTED ||
-            block_result.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
+        if (chain.status == AVZ_NATIVE_STATUS_HALTED ||
+            chain.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
+            chain.status == AVZ_NATIVE_STATUS_YIELDED ||
             block_result.status == AVZ_NATIVE_STATUS_MAX_STEPS ||
             block_result.steps == 0 ||
             avz_native_block_is_chain_barrier(block)) {
@@ -11619,7 +13091,10 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed(
         int chain_barrier = active_superblock == NULL
             ? avz_native_block_is_chain_barrier(block)
             : 0;
-        if (chain_barrier && checkpoint_steps != 0) {
+        int host_checkpoint_barrier = active_superblock == NULL
+            ? avz_native_block_requires_host_checkpoint(block)
+            : 0;
+        if (host_checkpoint_barrier && checkpoint_steps != 0) {
             uint64_t remaining_steps = max_steps - chain.steps;
             block_step_limit = checkpoint(
                 checkpoint_context,
@@ -11697,6 +13172,7 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed(
                 synchronous_exception,
                 wait,
                 memory_context,
+                active_superblock->semantic_hints,
                 active_superblock->instruction_pcs,
                 active_superblock->block_offsets,
                 fused_block_limit,
@@ -11714,7 +13190,14 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed(
                     context,
                     active_superblock->instruction_pcs[
                         active_superblock->block_offsets[slot]
-                    ]
+                    ],
+                    &active_superblock->instructions[
+                        active_superblock->block_offsets[slot]
+                    ],
+                    (size_t)(
+                        active_superblock->block_offsets[slot + 1] -
+                        active_superblock->block_offsets[slot]
+                    )
                 );
                 executed_blocks++;
             }
@@ -11740,15 +13223,23 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed(
             );
             avz_native_sample_hot_pc(
                 context,
-                avz_native_decoded_block_pc(block)
+                avz_native_decoded_block_pc(block),
+                avz_native_decoded_block_instructions(block),
+                avz_native_decoded_block_instruction_count(block)
             );
         }
         chain.steps += block_result.steps;
+        int native_irq_due = avz_native_memory_fast_path_advance_time(
+            memory_context, block_result.steps, context->cpu.pstate);
         chain.generic_dispatches += block_result.generic_dispatches;
         chain.fast_path_steps += block_result.fast_path_steps;
         chain.fast_path_hits += block_result.fast_path_hits;
         chain.blocks += executed_blocks;
         chain.status = block_result.status;
+        if (native_irq_due &&
+            chain.status != AVZ_NATIVE_STATUS_HALTED &&
+            chain.status != AVZ_NATIVE_STATUS_UNSUPPORTED)
+            chain.status = AVZ_NATIVE_STATUS_YIELDED;
         chain.unsupported_instruction = block_result.unsupported_instruction;
         checkpoint_steps += block_result.steps;
         checkpoint_blocks += executed_blocks;
@@ -11776,17 +13267,22 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed(
             previous_block = block_serial != 0 ? block : NULL;
             previous_serial = block_serial;
         }
+        if (chain_barrier) {
+            previous_block = NULL;
+            previous_serial = 0;
+        }
         active_superblock = NULL;
 
         remaining_steps = max_steps - chain.steps;
         int must_checkpoint =
             checkpoint_steps >= block_step_limit ||
             checkpoint_blocks >= checkpoint_block_interval ||
-            block_result.status == AVZ_NATIVE_STATUS_HALTED ||
-            block_result.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
+            chain.status == AVZ_NATIVE_STATUS_HALTED ||
+            chain.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
+            chain.status == AVZ_NATIVE_STATUS_YIELDED ||
             block_result.steps == 0 ||
             chain.steps >= max_steps ||
-            chain_barrier;
+            host_checkpoint_barrier;
         if (must_checkpoint) {
             block_step_limit = checkpoint(
                 checkpoint_context,
@@ -11801,13 +13297,14 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed(
             checkpoint_blocks = 0;
         }
 
-        if (block_result.status == AVZ_NATIVE_STATUS_HALTED ||
-            block_result.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
+        if (chain.status == AVZ_NATIVE_STATUS_HALTED ||
+            chain.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
+            chain.status == AVZ_NATIVE_STATUS_YIELDED ||
             block_result.steps == 0 ||
             (must_checkpoint && block_step_limit == 0) ||
             chain.steps >= max_steps ||
             (block_result.status != AVZ_NATIVE_STATUS_MAX_STEPS &&
-             chain_barrier)) {
+             host_checkpoint_barrier)) {
             break;
         }
     }
@@ -11905,6 +13402,7 @@ AVZNativeBlockResult avz_native_run_decoded_block_registers(
     cpu.fpcr = 0;
     cpu.fpsr = 0;
     cpu.exclusive_address = 0;
+    cpu.exclusive_generation = 0;
     cpu.exclusive_size = 0;
     cpu.exclusive_valid = 0;
     cpu.halted = *halted;
@@ -12003,6 +13501,7 @@ AVZNativeBlockResult avz_native_run_block_registers(
     cpu.fpcr = 0;
     cpu.fpsr = 0;
     cpu.exclusive_address = 0;
+    cpu.exclusive_generation = 0;
     cpu.exclusive_size = 0;
     cpu.exclusive_valid = 0;
     cpu.halted = *halted;

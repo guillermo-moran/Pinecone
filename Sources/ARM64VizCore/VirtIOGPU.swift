@@ -16,6 +16,7 @@ final class VirtIOGPUDevice {
         case transferToHost2D = 0x0105
         case resourceAttachBacking = 0x0106
         case resourceDetachBacking = 0x0107
+        case submit3D = 0x0207
         case updateCursor = 0x0300
         case moveCursor = 0x0301
     }
@@ -158,20 +159,20 @@ final class VirtIOGPUDevice {
         let width: Int
         let height: Int
         var backing: [BackingEntry] = []
-        var pixels: [UInt8]
+        let pixels: NativeFramebufferStorage
         var hasCompleteHostContents = false
         var pendingTransfers: [Rectangle] = []
         var lastBackingDirtyEpoch: UInt64?
 
-        init(format: PixelFormat, width: Int, height: Int, pixels: [UInt8]) {
+        init(format: PixelFormat, width: Int, height: Int) {
             self.format = format
             self.width = width
             self.height = height
-            self.pixels = pixels
+            self.pixels = NativeFramebufferStorage(byteCount: width * height * 4)
         }
 
         var stride: Int { width * 4 }
-        var byteCount: Int { pixels.count }
+        var byteCount: Int { pixels.byteCount }
     }
 
     private final class NativeFramebufferStorage {
@@ -223,6 +224,26 @@ final class VirtIOGPUDevice {
                 Array(bytes.prefix(byteCount))
             }
         }
+
+        func acceleratorSurface(
+            resourceID: UInt32,
+            width: Int,
+            height: Int,
+            pixelFormat: PineconeGraphicsPixelFormat
+        ) -> PineconeGraphicsSurface {
+            PineconeGraphicsSurface(
+                resourceID: resourceID,
+                width: width,
+                height: height,
+                stride: width * 4,
+                pixelFormat: pixelFormat,
+                bytes: UnsafeMutableRawBufferPointer(
+                    start: baseAddress,
+                    count: byteCount
+                ),
+                allocationByteCount: allocationByteCount
+            )
+        }
     }
 
     private struct Scanout: Equatable {
@@ -270,8 +291,14 @@ final class VirtIOGPUDevice {
     private var backingCopiedByteCount: UInt64 = 0
     private var cleanBackingSkippedByteCount: UInt64 = 0
     private var dirtyBackingRangeCount: UInt64 = 0
+    private var paravirtualCommandCount: UInt64 = 0
+    private var paravirtualBatchCount: UInt64 = 0
+    private var paravirtualAcceleratedCount: UInt64 = 0
+    private var paravirtualPixelCount: UInt64 = 0
+    private var acceleratedDirtyRangeCount: UInt64 = 0
     private var lastTransferSummary = "none"
     private var lastFlushSummary = "none"
+    private weak var graphicsAccelerator: PineconeGraphicsAccelerator?
 
     private static let maximumDamageHistory = 120
     private static let maximumPublishedDamageRectangles = 128
@@ -294,9 +321,17 @@ final class VirtIOGPUDevice {
         )
     }
 
+    func setGraphicsAccelerator(_ accelerator: PineconeGraphicsAccelerator?) {
+        lock.lock()
+        graphicsAccelerator?.reset()
+        graphicsAccelerator = accelerator
+        lock.unlock()
+    }
+
     func reset() {
         lock.lock()
         resources.removeAll(keepingCapacity: true)
+        graphicsAccelerator?.reset()
         scanout = nil
         committedScanout = nil
         cursor = nil
@@ -319,6 +354,11 @@ final class VirtIOGPUDevice {
         backingCopiedByteCount = 0
         cleanBackingSkippedByteCount = 0
         dirtyBackingRangeCount = 0
+        paravirtualCommandCount = 0
+        paravirtualBatchCount = 0
+        paravirtualAcceleratedCount = 0
+        paravirtualPixelCount = 0
+        acceleratedDirtyRangeCount = 0
         lastTransferSummary = "none"
         lastFlushSummary = "none"
         lock.unlock()
@@ -335,6 +375,9 @@ final class VirtIOGPUDevice {
             ":\(dirtyTileChangedByteCount)" +
             " pages=\(dirtyPageTransferCount)/\(dirtyBackingRangeCount)" +
             ":\(backingCopiedByteCount)/\(cleanBackingSkippedByteCount)" +
+            " pv2d=\(paravirtualCommandCount)/\(paravirtualAcceleratedCount)" +
+            ":\(paravirtualPixelCount)/b\(paravirtualBatchCount)" +
+            "/m\(acceleratedDirtyRangeCount)" +
             " tr=\(lastTransferSummary) fl=\(lastFlushSummary)"
     }
 
@@ -493,21 +536,21 @@ final class VirtIOGPUDevice {
             return nil
         }
 
-        var backingPixels = Array(repeating: UInt8(0), count: resource.byteCount)
+        let backingStorage = NativeFramebufferStorage(byteCount: resource.byteCount)
         do {
             try copyBackingBytes(
                 resource.backing,
                 logicalOffset: 0,
                 count: resource.byteCount,
                 memory: memory,
-                destination: &backingPixels,
+                destination: backingStorage,
                 destinationOffset: 0
             )
         } catch {
             return nil
         }
         normalizePixels(
-            in: &backingPixels,
+            in: backingStorage,
             rectangle: Rectangle(
                 x: 0,
                 y: 0,
@@ -517,6 +560,7 @@ final class VirtIOGPUDevice {
             stride: resource.stride,
             format: resource.format
         )
+        let backingPixels = backingStorage.snapshot()
         var visiblePixels = Array(repeating: UInt8(0), count: width * height * 4)
         for row in 0..<scanout.rectangle.height {
             let sourceOffset = (scanout.rectangle.y + row) * resource.stride +
@@ -574,6 +618,8 @@ final class VirtIOGPUDevice {
                 return try attachBacking(request, header: header, memory: memory)
             case .resourceDetachBacking:
                 return try detachBacking(request, header: header)
+            case .submit3D:
+                return try submitParavirtual2D(request, header: header, memory: memory)
             case .updateCursor:
                 return try updateCursor(request, header: header)
             case .moveCursor:
@@ -631,8 +677,7 @@ final class VirtIOGPUDevice {
         resources[resourceID] = Resource(
             format: format,
             width: resourceWidth,
-            height: resourceHeight,
-            pixels: Array(repeating: 0, count: byteCount)
+            height: resourceHeight
         )
         return responseHeader(.okNoData, requestHeader: header)
     }
@@ -646,6 +691,7 @@ final class VirtIOGPUDevice {
         guard resources.removeValue(forKey: resourceID) != nil else {
             throw GPUError.response(.errorInvalidResourceID)
         }
+        graphicsAccelerator?.discardSurface(resourceID: resourceID)
         if scanout?.resourceID == resourceID {
             scanout = nil
             committedScanout = nil
@@ -795,11 +841,11 @@ final class VirtIOGPUDevice {
                         logicalOffset: range.offset,
                         count: range.count,
                         memory: memory,
-                        destination: &resource.pixels,
+                        destination: resource.pixels,
                         destinationOffset: range.offset
                     )
                     normalizePixelBytes(
-                        in: &resource.pixels,
+                        in: resource.pixels,
                         offset: range.offset,
                         count: range.count,
                         format: resource.format
@@ -815,11 +861,11 @@ final class VirtIOGPUDevice {
                     logicalOffset: 0,
                     count: nominalByteCount,
                     memory: memory,
-                    destination: &resource.pixels,
+                    destination: resource.pixels,
                     destinationOffset: 0
                 )
                 normalizePixels(
-                    in: &resource.pixels,
+                    in: resource.pixels,
                     rectangle: rectangle,
                     stride: resource.stride,
                     format: resource.format
@@ -837,7 +883,7 @@ final class VirtIOGPUDevice {
                 logicalOffset: baseSourceOffset,
                 count: byteCount,
                 memory: memory,
-                destination: &resource.pixels,
+                destination: resource.pixels,
                 destinationOffset: rectangle.y * resource.stride
             )
         } else {
@@ -856,14 +902,14 @@ final class VirtIOGPUDevice {
                     logicalOffset: logicalSource,
                     count: rowBytes,
                     memory: memory,
-                    destination: &resource.pixels,
+                    destination: resource.pixels,
                     destinationOffset: destinationOffset
                 )
             }
         }
         if !isCompleteTransfer {
             normalizePixels(
-                in: &resource.pixels,
+                in: resource.pixels,
                 rectangle: rectangle,
                 stride: resource.stride,
                 format: resource.format
@@ -882,6 +928,846 @@ final class VirtIOGPUDevice {
                 "b\(resource.backing.count)r\(dirtyRangeCount):\(copiedByteCount)"
         )
         return responseHeader(.okNoData, requestHeader: header)
+    }
+
+    private struct PreparedParavirtual2D {
+        let command: PineconeGraphicsCommand
+        let source: Resource?
+        let sourceRectangle: Rectangle?
+        let sourceSurface: (surface: PineconeGraphicsSurface, isGuestMemory: Bool)?
+        let destination: Resource
+        let destinationRectangle: Rectangle
+        let destinationSurface: (surface: PineconeGraphicsSurface, isGuestMemory: Bool)
+        let mask: Resource?
+        let maskRectangle: Rectangle?
+        let maskSurface: (surface: PineconeGraphicsSurface, isGuestMemory: Bool)?
+        let sourceContainsAlpha: Bool
+    }
+
+    private func submitParavirtual2D(
+        _ request: [UInt8],
+        header: Header,
+        memory: PhysicalMemory
+    ) throws -> [UInt8] {
+        let payloadOffset = 32
+        try require(request, count: payloadOffset + 8)
+        let payloadSize = Int(Self.readLE32(request, at: 24))
+        guard payloadSize >= 8,
+              request.count >= payloadOffset + payloadSize,
+              Self.readLE32(request, at: payloadOffset) == PineconeGraphicsProtocol.magic else {
+            throw GPUError.response(.errorInvalidParameter)
+        }
+
+        let version = Self.readLE16(request, at: payloadOffset + 4)
+        let prepared: [PreparedParavirtual2D]
+        if version == PineconeGraphicsProtocol.version ||
+            version == PineconeGraphicsProtocol.exactCompositeVersion {
+            guard payloadSize == PineconeGraphicsProtocol.payloadByteCount else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            prepared = [try prepareParavirtual2D(
+                request,
+                payloadOffset: payloadOffset,
+                memory: memory
+            )]
+        } else if version == PineconeGraphicsProtocol.batchVersion {
+            try require(
+                request,
+                count: payloadOffset + PineconeGraphicsProtocol.batchHeaderByteCount
+            )
+            let commandCount = Int(Self.readLE16(request, at: payloadOffset + 6))
+            let recordByteCount = Int(Self.readLE16(request, at: payloadOffset + 8))
+            let batchFlags = Self.readLE16(request, at: payloadOffset + 10)
+            let declaredByteCount = Int(Self.readLE32(request, at: payloadOffset + 12))
+            guard commandCount > 0,
+                  commandCount <= PineconeGraphicsProtocol.maximumBatchCommandCount,
+                  recordByteCount == PineconeGraphicsProtocol.batchRecordByteCount,
+                  batchFlags == 0 else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            let recordsByteCount = commandCount.multipliedReportingOverflow(
+                by: recordByteCount
+            )
+            guard !recordsByteCount.overflow else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            let expectedByteCount = PineconeGraphicsProtocol.batchHeaderByteCount +
+                recordsByteCount.partialValue
+            guard payloadSize == expectedByteCount,
+                  declaredByteCount == expectedByteCount else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            prepared = try (0..<commandCount).map { index in
+                try prepareParavirtual2D(
+                    request,
+                    payloadOffset: payloadOffset +
+                        PineconeGraphicsProtocol.batchHeaderByteCount +
+                        index * recordByteCount,
+                    memory: memory
+                )
+            }
+        } else {
+            throw GPUError.response(.errorInvalidParameter)
+        }
+
+        return try executeParavirtual2D(
+            prepared,
+            header: header,
+            memory: memory
+        )
+    }
+
+    private func prepareParavirtual2D(
+        _ request: [UInt8],
+        payloadOffset: Int,
+        memory: PhysicalMemory
+    ) throws -> PreparedParavirtual2D {
+        try require(
+            request,
+            count: payloadOffset + PineconeGraphicsProtocol.payloadByteCount
+        )
+        let recordVersion = Self.readLE16(request, at: payloadOffset + 4)
+        let rawOperation = Self.readLE16(request, at: payloadOffset + 6)
+        let flags = Self.readLE32(request, at: payloadOffset + 8)
+        let isExactComposite = recordVersion ==
+            PineconeGraphicsProtocol.exactCompositeVersion
+        let blendOperator: PineconeGraphicsBlendOperator
+        let operation: PineconeGraphicsOperation
+        if isExactComposite {
+            guard let exactOperator = PineconeGraphicsBlendOperator(
+                rawValue: rawOperation
+            ) else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            blendOperator = exactOperator
+            let solid = flags & PineconeGraphicsProtocol.solidSourceFlag != 0
+            operation = solid
+                ? (exactOperator == .source ? .fill : .fillOver)
+                : (exactOperator == .source ? .source : .sourceOver)
+        } else {
+            guard recordVersion == PineconeGraphicsProtocol.version,
+                  let legacyOperation = PineconeGraphicsOperation(
+                    rawValue: rawOperation
+                  ) else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            operation = legacyOperation
+            blendOperator = legacyOperation == .source || legacyOperation == .fill
+                ? .source : .sourceOver
+        }
+        let permittedFlags = isExactComposite
+            ? PineconeGraphicsProtocol.supportedFlags
+            : PineconeGraphicsProtocol.legacySupportedFlags
+        guard Self.readLE32(request, at: payloadOffset) == PineconeGraphicsProtocol.magic,
+              flags & ~permittedFlags == 0 else {
+            throw GPUError.response(.errorInvalidParameter)
+        }
+
+        let sourceContainsAlpha = flags &
+            PineconeGraphicsProtocol.sourceContainsAlphaFlag != 0
+        let usesBilinearFiltering = flags &
+            PineconeGraphicsProtocol.bilinearFilterFlag != 0
+        let hasMask = flags & PineconeGraphicsProtocol.hasMaskFlag != 0
+        let hasSolidMask = flags & PineconeGraphicsProtocol.solidMaskFlag != 0
+        let hasSolidSource = flags & PineconeGraphicsProtocol.solidSourceFlag != 0
+        let hasComponentAlphaMask = flags &
+            PineconeGraphicsProtocol.componentAlphaMaskFlag != 0
+        let hasPackedA8Mask = flags &
+            PineconeGraphicsProtocol.packedA8MaskFlag != 0
+        let sourceResourceID = Self.readLE32(request, at: payloadOffset + 12)
+        let destinationResourceID = Self.readLE32(request, at: payloadOffset + 16)
+        let sourceX = Self.readSignedLE32(request, at: payloadOffset + 20)
+        let sourceY = Self.readSignedLE32(request, at: payloadOffset + 24)
+        let destinationRectangle = Rectangle(
+            x: Self.readSignedLE32(request, at: payloadOffset + 28),
+            y: Self.readSignedLE32(request, at: payloadOffset + 32),
+            width: Int(Self.readLE32(request, at: payloadOffset + 36)),
+            height: Int(Self.readLE32(request, at: payloadOffset + 40))
+        )
+        let color = Self.readLE32(request, at: payloadOffset + 44)
+        let sourceWidth = Int(Self.readLE32(request, at: payloadOffset + 48))
+        let sourceHeight = Int(Self.readLE32(request, at: payloadOffset + 52))
+        let maskResourceID = Self.readLE32(request, at: payloadOffset + 56)
+        let maskAlphaValue = Self.readLE32(request, at: payloadOffset + 60)
+        guard (!hasSolidMask || hasMask),
+              (!hasComponentAlphaMask || (hasMask && !hasSolidMask)),
+              (!hasPackedA8Mask || (hasMask && !hasSolidMask)),
+              (isExactComposite ||
+                (!hasSolidSource && !hasComponentAlphaMask && !hasPackedA8Mask)),
+              maskAlphaValue <= UInt32(UInt8.max),
+              (hasMask
+                  ? (hasSolidMask
+                      ? maskResourceID == 0
+                      : maskResourceID != 0 && maskAlphaValue == 0)
+                  : maskResourceID == 0 && maskAlphaValue == 0) else {
+            throw GPUError.response(.errorInvalidParameter)
+        }
+        guard destinationResourceID != 0,
+              let destination = resources[destinationResourceID],
+              Self.paravirtualPixelFormat(destination.format) != nil,
+              !destination.backing.isEmpty,
+              !destinationRectangle.isEmpty,
+              destinationRectangle.isWithin(
+                  width: destination.width,
+                  height: destination.height
+              ) else {
+            throw GPUError.response(
+                resources[destinationResourceID] == nil
+                    ? .errorInvalidResourceID
+                    : .errorInvalidParameter
+            )
+        }
+
+        let source: Resource?
+        let sourceRectangle: Rectangle?
+        let operatorNeedsSource = blendOperator != .clear &&
+            blendOperator != .destination
+        if !operatorNeedsSource || hasSolidSource ||
+            (!isExactComposite && (operation == .fill || operation == .fillOver)) {
+            guard sourceResourceID == 0,
+                  !sourceContainsAlpha,
+                  !usesBilinearFiltering,
+                  sourceWidth == 0,
+                  sourceHeight == 0 else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            guard !hasSolidSource || operatorNeedsSource else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            source = nil
+            sourceRectangle = nil
+        } else {
+            let rectangle = Rectangle(
+                x: sourceX,
+                y: sourceY,
+                width: sourceWidth,
+                height: sourceHeight
+            )
+            guard sourceResourceID != 0,
+                  sourceWidth > 0,
+                  sourceHeight > 0,
+                  let candidate = resources[sourceResourceID],
+                  Self.paravirtualPixelFormat(candidate.format) != nil,
+                  !candidate.backing.isEmpty,
+                  rectangle.isWithin(width: candidate.width, height: candidate.height),
+                  sourceResourceID != destinationResourceID else {
+                throw GPUError.response(
+                    resources[sourceResourceID] == nil
+                        ? .errorInvalidResourceID
+                        : .errorInvalidParameter
+                )
+            }
+            source = candidate
+            sourceRectangle = rectangle
+        }
+
+        let mask: Resource?
+        let maskRectangle: Rectangle?
+        if hasMask && !hasSolidMask {
+            let rectangle = Rectangle(
+                x: 0,
+                y: 0,
+                width: destinationRectangle.width,
+                height: destinationRectangle.height
+            )
+            guard let candidate = resources[maskResourceID],
+                  Self.paravirtualPixelFormat(candidate.format) != nil,
+                  !candidate.backing.isEmpty,
+                  rectangle.isWithin(width: candidate.width, height: candidate.height),
+                  maskResourceID != destinationResourceID,
+                  maskResourceID != sourceResourceID else {
+                throw GPUError.response(
+                    resources[maskResourceID] == nil
+                        ? .errorInvalidResourceID
+                        : .errorInvalidParameter
+                )
+            }
+            mask = candidate
+            maskRectangle = rectangle
+        } else {
+            mask = nil
+            maskRectangle = nil
+        }
+
+        let sourceSurface = source.map {
+            acceleratorSurface(
+                for: $0,
+                resourceID: sourceResourceID,
+                memory: memory
+            )
+        }
+        let destinationSurface = acceleratorSurface(
+            for: destination,
+            resourceID: destinationResourceID,
+            memory: memory
+        )
+        let maskSurface = mask.map {
+            acceleratorSurface(
+                for: $0,
+                resourceID: maskResourceID,
+                memory: memory
+            )
+        }
+        let command = PineconeGraphicsCommand(
+            operation: operation,
+            sourceResourceID: sourceResourceID,
+            destinationResourceID: destinationResourceID,
+            sourceX: sourceX,
+            sourceY: sourceY,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            destinationRectangle: PineconeGraphicsRectangle(
+                x: destinationRectangle.x,
+                y: destinationRectangle.y,
+                width: destinationRectangle.width,
+                height: destinationRectangle.height
+            ),
+            color: color,
+            sourceContainsAlpha: sourceContainsAlpha,
+            usesBilinearFiltering: usesBilinearFiltering,
+            maskResourceID: maskResourceID,
+            maskAlpha: hasSolidMask ? UInt8(maskAlphaValue) : nil,
+            blendOperator: blendOperator,
+            sourceIsSolid: hasSolidSource ||
+                (!isExactComposite && (operation == .fill || operation == .fillOver)),
+            componentAlphaMask: hasComponentAlphaMask,
+            maskIsPackedA8: hasPackedA8Mask
+        )
+
+        return PreparedParavirtual2D(
+            command: command,
+            source: source,
+            sourceRectangle: sourceRectangle,
+            sourceSurface: sourceSurface,
+            destination: destination,
+            destinationRectangle: destinationRectangle,
+            destinationSurface: destinationSurface,
+            mask: mask,
+            maskRectangle: maskRectangle,
+            maskSurface: maskSurface,
+            sourceContainsAlpha: sourceContainsAlpha
+        )
+    }
+
+    private func executeParavirtual2D(
+        _ prepared: [PreparedParavirtual2D],
+        header: Header,
+        memory: PhysicalMemory
+    ) throws -> [UInt8] {
+        for item in prepared {
+            if let source = item.source,
+               let rectangle = item.sourceRectangle,
+               item.sourceSurface?.isGuestMemory == false {
+                try synchronizeResource(
+                    source,
+                    rectangle: rectangle,
+                    from: memory,
+                    preserveAlpha: item.sourceContainsAlpha
+                )
+            }
+            if !item.destinationSurface.isGuestMemory {
+                try synchronizeResource(
+                    item.destination,
+                    rectangle: item.destinationRectangle,
+                    from: memory
+                )
+            }
+            if let mask = item.mask,
+               let rectangle = item.maskRectangle,
+               item.maskSurface?.isGuestMemory == false {
+                try synchronizeResource(
+                    mask,
+                    rectangle: rectangle,
+                    from: memory,
+                    preserveAlpha: true
+                )
+            }
+        }
+
+        let workItems = prepared.map {
+            PineconeGraphicsWorkItem(
+                command: $0.command,
+                source: $0.sourceSurface?.surface,
+                mask: $0.maskSurface?.surface,
+                destination: $0.destinationSurface.surface
+            )
+        }
+        let accelerated = graphicsAccelerator?.executeBatch(workItems) ?? false
+
+        if !accelerated {
+            for item in prepared {
+                if let source = item.source,
+                   let rectangle = item.sourceRectangle,
+                   item.sourceSurface?.isGuestMemory == true {
+                    try synchronizeResource(
+                        source,
+                        rectangle: rectangle,
+                        from: memory,
+                        preserveAlpha: item.sourceContainsAlpha
+                    )
+                }
+                if item.destinationSurface.isGuestMemory {
+                    try synchronizeResource(
+                        item.destination,
+                        rectangle: item.destinationRectangle,
+                        from: memory
+                    )
+                }
+                if let mask = item.mask,
+                   let rectangle = item.maskRectangle,
+                   item.maskSurface?.isGuestMemory == true {
+                    try synchronizeResource(
+                        mask,
+                        rectangle: rectangle,
+                        from: memory,
+                        preserveAlpha: true
+                    )
+                }
+                try executeParavirtual2DInNativeCore(
+                    item.command,
+                    source: item.source,
+                    mask: item.mask,
+                    destination: item.destination
+                )
+                try finishParavirtual2D(item, accelerated: false, memory: memory)
+            }
+        } else {
+            for item in prepared {
+                try finishParavirtual2D(item, accelerated: true, memory: memory)
+            }
+        }
+        if prepared.count > 1 {
+            paravirtualBatchCount &+= 1
+        }
+        return responseHeader(.okNoData, requestHeader: header)
+    }
+
+    private func finishParavirtual2D(
+        _ item: PreparedParavirtual2D,
+        accelerated: Bool,
+        memory: PhysicalMemory
+    ) throws {
+        if accelerated && item.destinationSurface.isGuestMemory {
+            markBackingDirty(
+                item.destination,
+                rectangle: item.destinationRectangle,
+                memory: memory
+            )
+            acceleratedDirtyRangeCount &+= 1
+        } else {
+            try copyResourceBytesToBacking(
+                item.destination,
+                rectangle: item.destinationRectangle,
+                memory: memory
+            )
+        }
+        let hostContentsUpdated = !accelerated || !item.destinationSurface.isGuestMemory
+        item.destination.hasCompleteHostContents = hostContentsUpdated &&
+            item.destinationRectangle.x == 0 && item.destinationRectangle.y == 0 &&
+            item.destinationRectangle.width == item.destination.width &&
+            item.destinationRectangle.height == item.destination.height
+        item.destination.lastBackingDirtyEpoch = nil
+        if hostContentsUpdated {
+            item.destination.pendingTransfers.append(item.destinationRectangle)
+        }
+        paravirtualCommandCount &+= 1
+        paravirtualAcceleratedCount &+= accelerated ? 1 : 0
+        paravirtualPixelCount &+= UInt64(
+            item.destinationRectangle.width * item.destinationRectangle.height
+        )
+    }
+
+    private func acceleratorSurface(
+        for resource: Resource,
+        resourceID: UInt32,
+        memory: PhysicalMemory
+    ) -> (surface: PineconeGraphicsSurface, isGuestMemory: Bool) {
+        let pixelFormat = Self.paravirtualPixelFormat(resource.format)!
+        if resource.backing.count == 1,
+           let backing = resource.backing.first,
+           backing.length >= resource.byteCount,
+           let bytes = try? memory.persistentMutableBytes(
+               at: backing.address,
+               count: resource.byteCount
+           ) {
+            return (
+                PineconeGraphicsSurface(
+                    resourceID: resourceID,
+                    width: resource.width,
+                    height: resource.height,
+                    stride: resource.stride,
+                    pixelFormat: pixelFormat,
+                    bytes: bytes,
+                    allocationByteCount: backing.length
+                ),
+                true
+            )
+        }
+        return (
+            resource.pixels.acceleratorSurface(
+                resourceID: resourceID,
+                width: resource.width,
+                height: resource.height,
+                pixelFormat: pixelFormat
+            ),
+            false
+        )
+    }
+
+    private func markBackingDirty(
+        _ resource: Resource,
+        rectangle: Rectangle,
+        memory: PhysicalMemory
+    ) {
+        guard let backing = resource.backing.first,
+              rectangle.width > 0,
+              rectangle.height > 0 else { return }
+        let offset = rectangle.y * resource.stride + rectangle.x * 4
+        let byteCount = (rectangle.height - 1) * resource.stride + rectangle.width * 4
+        memory.markDirty(
+            at: backing.address + UInt64(offset),
+            count: byteCount
+        )
+    }
+
+    private func executeParavirtual2DInNativeCore(
+        _ command: PineconeGraphicsCommand,
+        source: Resource?,
+        mask: Resource?,
+        destination: Resource
+    ) throws {
+        let rectangle = command.destinationRectangle
+        let result: Int32
+        if command.componentAlphaMask || command.maskIsPackedA8 ||
+            command.blendOperator == .clear ||
+            command.blendOperator == .destination ||
+            command.blendOperator == .add {
+            func executeGeneric(
+                sourceBytes: UnsafeRawBufferPointer?,
+                maskBytes: UnsafeRawBufferPointer?
+            ) -> Int32 {
+                destination.pixels.withUnsafeMutableBytes { destinationBytes in
+                    avz_framebuffer_composite_bgra8(
+                        sourceBytes?.baseAddress,
+                        source?.stride ?? 0,
+                        command.sourceX,
+                        command.sourceY,
+                        command.sourceWidth,
+                        command.sourceHeight,
+                        maskBytes?.baseAddress,
+                        mask?.stride ?? 0,
+                        command.maskAlpha ?? UInt8.max,
+                        destinationBytes.baseAddress,
+                        destination.stride,
+                        rectangle.x,
+                        rectangle.y,
+                        rectangle.width,
+                        rectangle.height,
+                        command.color,
+                        UInt32(command.blendOperator.rawValue),
+                        command.sourceIsSolid ? 1 : 0,
+                        command.usesBilinearFiltering ? 1 : 0,
+                        command.componentAlphaMask ? 1 : 0,
+                        command.maskIsPackedA8 ? 1 : 0
+                    )
+                }
+            }
+            func executeWithMask(
+                sourceBytes: UnsafeRawBufferPointer?
+            ) -> Int32 {
+                if let mask {
+                    return mask.pixels.withUnsafeBytes {
+                        executeGeneric(sourceBytes: sourceBytes, maskBytes: $0)
+                    }
+                }
+                return executeGeneric(sourceBytes: sourceBytes, maskBytes: nil)
+            }
+            if let source {
+                result = source.pixels.withUnsafeBytes {
+                    executeWithMask(sourceBytes: $0)
+                }
+            } else {
+                result = executeWithMask(sourceBytes: nil)
+            }
+        } else if mask != nil || command.maskAlpha != nil {
+            func executeMasked(
+                sourceBytes: UnsafeRawBufferPointer?,
+                maskBytes: UnsafeRawBufferPointer?
+            ) -> Int32 {
+                destination.pixels.withUnsafeMutableBytes { destinationBytes in
+                    avz_framebuffer_masked_composite_bgra8(
+                        sourceBytes?.baseAddress,
+                        source?.stride ?? 0,
+                        command.sourceX,
+                        command.sourceY,
+                        command.sourceWidth,
+                        command.sourceHeight,
+                        maskBytes?.baseAddress,
+                        mask?.stride ?? 0,
+                        command.maskAlpha ?? UInt8.max,
+                        destinationBytes.baseAddress,
+                        destination.stride,
+                        rectangle.x,
+                        rectangle.y,
+                        rectangle.width,
+                        rectangle.height,
+                        command.color,
+                        UInt32(command.operation.rawValue),
+                        command.usesBilinearFiltering ? 1 : 0
+                    )
+                }
+            }
+            func executeWithMask(
+                sourceBytes: UnsafeRawBufferPointer?
+            ) -> Int32 {
+                if let mask {
+                    return mask.pixels.withUnsafeBytes {
+                        executeMasked(sourceBytes: sourceBytes, maskBytes: $0)
+                    }
+                }
+                return executeMasked(sourceBytes: sourceBytes, maskBytes: nil)
+            }
+            if let source {
+                result = source.pixels.withUnsafeBytes {
+                    executeWithMask(sourceBytes: $0)
+                }
+            } else {
+                result = executeWithMask(sourceBytes: nil)
+            }
+        } else { switch command.operation {
+        case .source:
+            guard let source else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            result = source.pixels.withUnsafeBytes { sourceBytes in
+                destination.pixels.withUnsafeMutableBytes { destinationBytes in
+                    if command.usesBilinearFiltering {
+                        avz_framebuffer_bilinear_scale_copy_bgra8(
+                            sourceBytes.baseAddress,
+                            source.stride,
+                            command.sourceX,
+                            command.sourceY,
+                            command.sourceWidth,
+                            command.sourceHeight,
+                            destinationBytes.baseAddress,
+                            destination.stride,
+                            rectangle.x,
+                            rectangle.y,
+                            rectangle.width,
+                            rectangle.height
+                        )
+                    } else if command.sourceWidth == rectangle.width,
+                       command.sourceHeight == rectangle.height {
+                        avz_framebuffer_copy_bgra8(
+                            sourceBytes.baseAddress,
+                            source.stride,
+                            command.sourceX,
+                            command.sourceY,
+                            destinationBytes.baseAddress,
+                            destination.stride,
+                            rectangle.x,
+                            rectangle.y,
+                            rectangle.width,
+                            rectangle.height
+                        )
+                    } else {
+                        avz_framebuffer_scale_copy_bgra8(
+                            sourceBytes.baseAddress,
+                            source.stride,
+                            command.sourceX,
+                            command.sourceY,
+                            command.sourceWidth,
+                            command.sourceHeight,
+                            destinationBytes.baseAddress,
+                            destination.stride,
+                            rectangle.x,
+                            rectangle.y,
+                            rectangle.width,
+                            rectangle.height
+                        )
+                    }
+                }
+            }
+        case .sourceOver:
+            guard let source else {
+                throw GPUError.response(.errorInvalidParameter)
+            }
+            result = source.pixels.withUnsafeBytes { sourceBytes in
+                destination.pixels.withUnsafeMutableBytes { destinationBytes in
+                    if command.usesBilinearFiltering {
+                        avz_framebuffer_bilinear_scale_source_over_bgra8(
+                            sourceBytes.baseAddress,
+                            source.stride,
+                            command.sourceX,
+                            command.sourceY,
+                            command.sourceWidth,
+                            command.sourceHeight,
+                            destinationBytes.baseAddress,
+                            destination.stride,
+                            rectangle.x,
+                            rectangle.y,
+                            rectangle.width,
+                            rectangle.height
+                        )
+                    } else if command.sourceWidth == rectangle.width,
+                       command.sourceHeight == rectangle.height {
+                        avz_framebuffer_source_over_bgra8(
+                            sourceBytes.baseAddress,
+                            source.stride,
+                            command.sourceX,
+                            command.sourceY,
+                            destinationBytes.baseAddress,
+                            destination.stride,
+                            rectangle.x,
+                            rectangle.y,
+                            rectangle.width,
+                            rectangle.height
+                        )
+                    } else {
+                        avz_framebuffer_scale_source_over_bgra8(
+                            sourceBytes.baseAddress,
+                            source.stride,
+                            command.sourceX,
+                            command.sourceY,
+                            command.sourceWidth,
+                            command.sourceHeight,
+                            destinationBytes.baseAddress,
+                            destination.stride,
+                            rectangle.x,
+                            rectangle.y,
+                            rectangle.width,
+                            rectangle.height
+                        )
+                    }
+                }
+            }
+        case .fill:
+            result = destination.pixels.withUnsafeMutableBytes { destinationBytes in
+                avz_framebuffer_fill_bgra8(
+                    destinationBytes.baseAddress,
+                    destination.stride,
+                    rectangle.x,
+                    rectangle.y,
+                    rectangle.width,
+                    rectangle.height,
+                    command.color
+                )
+            }
+        case .fillOver:
+            result = destination.pixels.withUnsafeMutableBytes { destinationBytes in
+                avz_framebuffer_fill_over_bgra8(
+                    destinationBytes.baseAddress,
+                    destination.stride,
+                    rectangle.x,
+                    rectangle.y,
+                    rectangle.width,
+                    rectangle.height,
+                    command.color
+                )
+            }
+        } }
+        guard result != 0 else {
+            throw GPUError.response(.errorInvalidParameter)
+        }
+        if destination.format == .b8g8r8x8UNorm {
+            normalizePixels(
+                in: destination.pixels,
+                rectangle: Rectangle(
+                    x: rectangle.x,
+                    y: rectangle.y,
+                    width: rectangle.width,
+                    height: rectangle.height
+                ),
+                stride: destination.stride,
+                format: destination.format
+            )
+        }
+    }
+
+    private func synchronizeResource(
+        _ resource: Resource,
+        rectangle: Rectangle,
+        from memory: PhysicalMemory,
+        preserveAlpha: Bool = false
+    ) throws {
+        for row in 0..<rectangle.height {
+            let offset = (rectangle.y + row) * resource.stride + rectangle.x * 4
+            try copyBackingBytes(
+                resource.backing,
+                logicalOffset: offset,
+                count: rectangle.width * 4,
+                memory: memory,
+                destination: resource.pixels,
+                destinationOffset: offset
+            )
+        }
+        if !preserveAlpha {
+            normalizePixels(
+                in: resource.pixels,
+                rectangle: rectangle,
+                stride: resource.stride,
+                format: resource.format
+            )
+        }
+    }
+
+    private func copyResourceBytesToBacking(
+        _ resource: Resource,
+        rectangle: Rectangle,
+        memory: PhysicalMemory
+    ) throws {
+        try resource.pixels.withUnsafeBytes { sourceBytes in
+            for row in 0..<rectangle.height {
+                let offset = (rectangle.y + row) * resource.stride + rectangle.x * 4
+                try copyBytesToBacking(
+                    resource.backing,
+                    logicalOffset: offset,
+                    count: rectangle.width * 4,
+                    memory: memory,
+                    source: sourceBytes.baseAddress!.advanced(by: offset)
+                )
+            }
+        }
+    }
+
+    private func copyBytesToBacking(
+        _ entries: [BackingEntry],
+        logicalOffset: Int,
+        count: Int,
+        memory: PhysicalMemory,
+        source: UnsafeRawPointer
+    ) throws {
+        var skipped = logicalOffset
+        var copied = 0
+        for entry in entries {
+            if skipped >= entry.length {
+                skipped -= entry.length
+                continue
+            }
+            let byteCount = min(entry.length - skipped, count - copied)
+            try memory.copyBytes(
+                from: source.advanced(by: copied),
+                count: byteCount,
+                to: entry.address + UInt64(skipped)
+            )
+            copied += byteCount
+            skipped = 0
+            if copied == count { return }
+        }
+        throw GPUError.response(.errorInvalidParameter)
+    }
+
+    private static func paravirtualPixelFormat(
+        _ format: PixelFormat
+    ) -> PineconeGraphicsPixelFormat? {
+        switch format {
+        case .b8g8r8a8UNorm:
+            return .bgra8Premultiplied
+        case .b8g8r8x8UNorm:
+            return .bgrx8
+        default:
+            return nil
+        }
     }
 
     private func updateCursor(_ request: [UInt8], header: Header) throws -> [UInt8] {
@@ -1003,7 +1889,7 @@ final class VirtIOGPUDevice {
     }
 
     private func normalizePixels(
-        in pixels: inout [UInt8],
+        in pixels: NativeFramebufferStorage,
         rectangle: Rectangle,
         stride: Int,
         format: PixelFormat
@@ -1023,13 +1909,13 @@ final class VirtIOGPUDevice {
     }
 
     private func normalizePixelBytes(
-        in pixels: inout [UInt8],
+        in pixels: NativeFramebufferStorage,
         offset: Int,
         count: Int,
         format: PixelFormat
     ) {
         guard count > 0 else { return }
-        precondition(offset >= 0 && count % 4 == 0 && offset <= pixels.count - count)
+        precondition(offset >= 0 && count % 4 == 0 && offset <= pixels.byteCount - count)
         let normalized = pixels.withUnsafeMutableBytes { bytes in
             avz_framebuffer_normalize_bgra8(
                 bytes.baseAddress!.advanced(by: offset),
@@ -1203,14 +2089,18 @@ final class VirtIOGPUDevice {
 
     private func fullScanoutPixels(resource: Resource, rectangle: Rectangle) -> [UInt8] {
         var output = Array(repeating: UInt8(0), count: width * height * 4)
-        for row in 0..<rectangle.height {
-            let sourceOffset = (rectangle.y + row) * resource.stride + rectangle.x * 4
-            let destinationOffset = row * width * 4
-            let byteCount = rectangle.width * 4
-            output.replaceSubrange(
-                destinationOffset..<(destinationOffset + byteCount),
-                with: resource.pixels[sourceOffset..<(sourceOffset + byteCount)]
-            )
+        resource.pixels.withUnsafeBytes { sourceBytes in
+            output.withUnsafeMutableBytes { destinationBytes in
+                for row in 0..<rectangle.height {
+                    let sourceOffset = (rectangle.y + row) * resource.stride + rectangle.x * 4
+                    let destinationOffset = row * width * 4
+                    memcpy(
+                        destinationBytes.baseAddress!.advanced(by: destinationOffset),
+                        sourceBytes.baseAddress!.advanced(by: sourceOffset),
+                        rectangle.width * 4
+                    )
+                }
+            }
         }
         return output
     }
@@ -1220,14 +2110,14 @@ final class VirtIOGPUDevice {
         logicalOffset: Int,
         count: Int,
         memory: PhysicalMemory,
-        destination: inout [UInt8],
+        destination: NativeFramebufferStorage,
         destinationOffset: Int
     ) throws {
         guard logicalOffset >= 0,
               count >= 0,
               destinationOffset >= 0,
-              destinationOffset <= destination.count,
-              count <= destination.count - destinationOffset else {
+              destinationOffset <= destination.byteCount,
+              count <= destination.byteCount - destinationOffset else {
             throw GPUError.response(.errorInvalidParameter)
         }
         guard count > 0 else { return }
@@ -1405,11 +2295,20 @@ final class VirtIOGPUDevice {
             "\(rectangle.width)x\(rectangle.height)\(suffix)"
     }
 
+    private static func readLE16(_ bytes: [UInt8], at offset: Int) -> UInt16 {
+        guard offset >= 0, offset <= bytes.count - 2 else { return 0 }
+        return UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+    }
+
     private static func readLE32(_ bytes: [UInt8], at offset: Int) -> UInt32 {
         UInt32(bytes[offset]) |
             (UInt32(bytes[offset + 1]) << 8) |
             (UInt32(bytes[offset + 2]) << 16) |
             (UInt32(bytes[offset + 3]) << 24)
+    }
+
+    private static func readSignedLE32(_ bytes: [UInt8], at offset: Int) -> Int {
+        Int(Int32(bitPattern: readLE32(bytes, at: offset)))
     }
 
     private static func readLE64(_ bytes: [UInt8], at offset: Int) -> UInt64 {

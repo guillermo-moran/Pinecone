@@ -14,121 +14,252 @@ private struct LinuxConsoleView: View {
     @EnvironmentObject private var model: MobileOSHostModel
     @State private var terminalFocused = false
     @State private var displayFocused = false
+    @State private var controlsPresented = false
     @State private var selectedView: GuestViewMode = .simulatorInitialView
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                ConsoleStatusBar(performanceFeed: model.performanceFeed)
-                Picker("Guest view", selection: $selectedView) {
-                    Label("Terminal", systemImage: "terminal").tag(GuestViewMode.terminal)
-                    Label("Display", systemImage: "display").tag(GuestViewMode.display)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color(.secondarySystemBackground))
+        ZStack(alignment: .trailing) {
+            guestView
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                switch selectedView {
-                case .terminal:
-                    TerminalConsole(text: model.terminalText)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            terminalFocused = true
-                        }
-                    CommandBar(
-                        prompt: model.terminalPromptLabel,
-                        canSend: model.canSendTerminalInput,
-                        focused: $terminalFocused,
-                        sendBytes: model.sendTerminalBytes
-                    )
-                case .display:
-                    GuestFramebufferView(
-                        feed: model.displayFeed,
-                        focused: $displayFocused,
-                        onTouch: model.sendTouch,
-                        copyFrame: model.withDisplayFrameBytes,
-                        onPresented: model.recordDisplayPresented,
-                        sendText: model.sendGuestKeyboardText,
-                        sendKey: model.sendGuestKey
-                    )
+            GuestControlDrawer(
+                isPresented: $controlsPresented,
+                selectedView: selectedView,
+                keyboardVisible: activeKeyboardFocused,
+                status: model.status,
+                selectView: selectView,
+                toggleKeyboard: toggleKeyboard,
+                reset: {
+                    dismissKeyboard()
+                    Task { await model.boot() }
+                },
+                reboot: {
+                    model.sendTerminalBytes(Array("reboot\n".utf8))
+                },
+                stop: {
+                    dismissKeyboard()
+                    model.stop()
                 }
+            )
+            .padding(.trailing, 8)
+        }
+        .padding(.bottom, 8)
+        .background(Color.black.ignoresSafeArea())
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
+        .task {
+            guard model.status == .idle else {
+                return
             }
-            .background(Color.black)
-            .navigationTitle("Pinecone")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if selectedView == .display {
-                        Button {
-                            displayFocused.toggle()
-                            if !displayFocused {
-                                UIApplication.shared.sendAction(
-                                    #selector(UIResponder.resignFirstResponder),
-                                    to: nil,
-                                    from: nil,
-                                    for: nil
-                                )
-                            }
-                        } label: {
-                            Image(systemName: displayFocused ? "keyboard.chevron.compact.down" : "keyboard")
-                        }
-                        .accessibilityLabel(displayFocused ? "Hide guest keyboard" : "Show guest keyboard")
-                    }
-
-                    Button {
-                        Task { await model.boot() }
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                    }
-                    .accessibilityLabel("Reset VM")
-                    .disabled(model.status == .booting)
-
-                    Button {
-                        model.sendTerminalBytes(Array("reboot\n".utf8))
-                    } label: {
-                        Image(systemName: "power")
-                    }
-                    .accessibilityLabel("Reboot guest")
-                    .disabled(model.status != .running)
-
-                    Button {
-                        model.stop()
-                    } label: {
-                        Image(systemName: "stop.fill")
-                    }
-                    .accessibilityLabel("Stop VM")
-                    .disabled(model.status != .running && model.status != .booting)
-                }
+            await model.boot()
+        }
+        .onChange(of: selectedView) { _, _ in
+            dismissKeyboard()
+        }
+        .onChange(of: model.isPhoshReady) { _, isReady in
+            guard isReady else {
+                return
             }
-            .task {
-                guard model.status == .idle else {
-                    return
-                }
-                await model.boot()
-                terminalFocused = true
-            }
-            .onChange(of: model.status) { _, status in
-                if status == .running && selectedView == .terminal {
-                    terminalFocused = true
-                }
-            }
-            .onChange(of: selectedView) { _, view in
-                if view == .terminal {
-                    displayFocused = false
-                    terminalFocused = true
-                } else {
-                    terminalFocused = false
-                    displayFocused = false
-                    UIApplication.shared.sendAction(
-                        #selector(UIResponder.resignFirstResponder),
-                        to: nil,
-                        from: nil,
-                        for: nil
-                    )
-                }
+            dismissKeyboard()
+            controlsPresented = false
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .display
             }
         }
+    }
+
+    @ViewBuilder
+    private var guestView: some View {
+        switch selectedView {
+        case .terminal:
+            ZStack(alignment: .topLeading) {
+                TerminalConsole(text: model.terminalText)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        terminalFocused = true
+                    }
+
+                TerminalKeyboardBridge(
+                    focused: $terminalFocused,
+                    isEnabled: model.canSendTerminalInput,
+                    sendBytes: model.sendTerminalBytes
+                )
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+            }
+        case .display:
+            GuestFramebufferView(
+                feed: model.displayFeed,
+                focused: $displayFocused,
+                onTouch: model.sendTouch,
+                copyFrame: model.withDisplayFrameBytes,
+                onPresented: model.recordDisplayPresented,
+                sendText: model.sendGuestKeyboardText,
+                sendKey: model.sendGuestKey
+            )
+        }
+    }
+
+    private var activeKeyboardFocused: Bool {
+        selectedView == .terminal ? terminalFocused : displayFocused
+    }
+
+    private func selectView(_ view: GuestViewMode) {
+        guard selectedView != view else {
+            controlsPresented = false
+            return
+        }
+        dismissKeyboard()
+        selectedView = view
+        controlsPresented = false
+    }
+
+    private func toggleKeyboard() {
+        switch selectedView {
+        case .terminal:
+            terminalFocused.toggle()
+        case .display:
+            displayFocused.toggle()
+        }
+        if !activeKeyboardFocused {
+            resignFirstResponder()
+        }
+    }
+
+    private func dismissKeyboard() {
+        terminalFocused = false
+        displayFocused = false
+        resignFirstResponder()
+    }
+
+    private func resignFirstResponder() {
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
+    }
+}
+
+private struct GuestControlDrawer: View {
+    @Binding var isPresented: Bool
+    let selectedView: GuestViewMode
+    let keyboardVisible: Bool
+    let status: MobileOSHostModel.HostStatus
+    let selectView: (GuestViewMode) -> Void
+    let toggleKeyboard: () -> Void
+    let reset: () -> Void
+    let reboot: () -> Void
+    let stop: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button {
+                withAnimation(.snappy(duration: 0.22)) {
+                    isPresented.toggle()
+                }
+            } label: {
+                Image(systemName: isPresented ? "chevron.right" : "chevron.left")
+                    .font(.system(size: 13, weight: .bold))
+                    .frame(width: 28, height: 46)
+            }
+            .buttonStyle(PineconeDrawerButtonStyle())
+            .accessibilityLabel(isPresented ? "Close controls" : "Open controls")
+
+            if isPresented {
+                VStack(spacing: 6) {
+                    drawerButton(
+                        image: "terminal",
+                        label: "Show terminal",
+                        selected: selectedView == .terminal
+                    ) {
+                        selectView(.terminal)
+                    }
+                    drawerButton(
+                        image: "display",
+                        label: "Show guest display",
+                        selected: selectedView == .display
+                    ) {
+                        selectView(.display)
+                    }
+
+                    Divider()
+                        .overlay(Color.white.opacity(0.18))
+                        .frame(width: 28)
+                        .padding(.vertical, 2)
+
+                    drawerButton(
+                        image: keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
+                        label: keyboardVisible ? "Hide keyboard" : "Show keyboard",
+                        disabled: status != .running
+                    ) {
+                        toggleKeyboard()
+                    }
+                    drawerButton(
+                        image: "arrow.counterclockwise",
+                        label: "Reset VM",
+                        disabled: status == .booting
+                    ) {
+                        reset()
+                    }
+                    drawerButton(
+                        image: "power",
+                        label: "Reboot guest",
+                        disabled: status != .running
+                    ) {
+                        reboot()
+                    }
+                    drawerButton(
+                        image: "stop.fill",
+                        label: "Stop VM",
+                        disabled: status != .running && status != .booting,
+                        role: .destructive
+                    ) {
+                        stop()
+                    }
+                }
+                .frame(width: 46)
+                .padding(6)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.22), value: isPresented)
+    }
+
+    private func drawerButton(
+        image: String,
+        label: String,
+        selected: Bool = false,
+        disabled: Bool = false,
+        role: ButtonRole? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            Image(systemName: image)
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 34, height: 34)
+                .foregroundStyle(selected ? Color.black : Color.primary)
+                .background(selected ? Color.white : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.34 : 1)
+        .accessibilityLabel(label)
+    }
+}
+
+private struct PineconeDrawerButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(Color.primary)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .opacity(configuration.isPressed ? 0.65 : 1)
     }
 }
 
@@ -154,7 +285,6 @@ private struct GuestFramebufferView: View {
     let onPresented: GuestDisplayPresentedHandler
     let sendText: (String) -> Void
     let sendKey: (UInt16) -> Void
-    @State private var lastTouchPoint: (x: UInt32, y: UInt32)?
 
     var body: some View {
         GeometryReader { geometry in
@@ -178,35 +308,10 @@ private struct GuestFramebufferView: View {
                 DisplayKeyboardBridge(focused: $focused, sendText: sendText, sendKey: sendKey)
                     .frame(width: 1, height: 1)
                     .opacity(0.01)
+                GuestTouchCaptureView(layout: layout, onTouch: onTouch)
+                    .frame(width: geometry.size.width, height: geometry.size.height)
             }
             .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                    .onChanged { value in
-                        guard let layout,
-                              let point = Self.guestPoint(
-                                value.location,
-                                containerSize: geometry.size,
-                                layout: layout
-                              ) else {
-                            return
-                        }
-                        lastTouchPoint = point
-                        onTouch(point.x, point.y, true)
-                    }
-                    .onEnded { value in
-                        let point = layout.flatMap {
-                            Self.guestPoint(value.location, containerSize: geometry.size, layout: $0)
-                        } ?? lastTouchPoint
-                        if let point {
-                            if lastTouchPoint?.x != point.x || lastTouchPoint?.y != point.y {
-                                onTouch(point.x, point.y, true)
-                            }
-                            onTouch(point.x, point.y, false)
-                        }
-                        lastTouchPoint = nil
-                    }
-            )
         }
         .background(Color.black)
         .accessibilityElement(children: .ignore)
@@ -234,27 +339,6 @@ private struct GuestFramebufferView: View {
         }
     }
 
-    private static func guestPoint(
-        _ location: CGPoint,
-        containerSize: CGSize,
-        layout: GuestDisplayLayout
-    ) -> (x: UInt32, y: UInt32)? {
-        let viewport = viewport(in: containerSize, layout: layout)
-        guard viewport.width > 0, viewport.height > 0,
-              viewport.contains(location) else {
-            return nil
-        }
-        let x = min(
-            layout.width - 1,
-            max(0, Int((location.x - viewport.minX) * CGFloat(layout.width) / viewport.width))
-        )
-        let y = min(
-            layout.height - 1,
-            max(0, Int((location.y - viewport.minY) * CGFloat(layout.height) / viewport.height))
-        )
-        return (UInt32(x), UInt32(y))
-    }
-
     private static func viewport(
         in containerSize: CGSize,
         layout: GuestDisplayLayout
@@ -265,9 +349,10 @@ private struct GuestFramebufferView: View {
               layout.height > 0 else {
             return .zero
         }
+        let availableHeight = containerSize.height
         let scale = min(
             containerSize.width / CGFloat(layout.width),
-            containerSize.height / CGFloat(layout.height)
+            availableHeight / CGFloat(layout.height)
         )
         let size = CGSize(
             width: CGFloat(layout.width) * scale,
@@ -275,67 +360,95 @@ private struct GuestFramebufferView: View {
         )
         return CGRect(
             x: (containerSize.width - size.width) / 2,
-            y: (containerSize.height - size.height) / 2,
+            y: 0,
             width: size.width,
             height: size.height
         )
     }
 }
 
-private struct ConsoleStatusBar: View {
-    @EnvironmentObject private var model: MobileOSHostModel
-    @ObservedObject var performanceFeed: HostPerformanceFeed
+private struct GuestTouchCaptureView: UIViewRepresentable {
+    let layout: GuestDisplayLayout?
+    let onTouch: (UInt32, UInt32, Bool) -> Void
 
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "terminal")
-                    .foregroundStyle(Color(red: 0.34, green: 0.86, blue: 0.68))
-                Text("ttyAMA0")
-                    .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-                Spacer()
-                Text(
-                    performanceFeed.snapshot.summary.isEmpty
-                        ? performanceFeed.snapshot.steps.formatted()
-                        : performanceFeed.snapshot.summary
-                )
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-                Text(model.status.rawValue)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(statusColor)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-
-            if let lastError = model.lastError {
-                Text(lastError)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 8)
-            }
-        }
-        .background(Color(.secondarySystemBackground))
+    func makeUIView(context: Context) -> GuestTouchCaptureUIView {
+        let view = GuestTouchCaptureUIView()
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.isMultipleTouchEnabled = false
+        return view
     }
 
-    private var statusColor: Color {
-        switch model.status {
-        case .idle:
-            return .secondary
-        case .booting:
-            return .orange
-        case .running:
-            return Color(red: 0.16, green: 0.62, blue: 0.40)
-        case .stopped:
-            return .secondary
-        case .failed:
-            return .red
+    func updateUIView(_ view: GuestTouchCaptureUIView, context: Context) {
+        view.layout = layout
+        view.onTouch = onTouch
+        view.isUserInteractionEnabled = layout != nil
+    }
+}
+
+private final class GuestTouchCaptureUIView: UIView {
+    var layout: GuestDisplayLayout?
+    var onTouch: ((UInt32, UInt32, Bool) -> Void)?
+    private var lastPoint: (x: UInt32, y: UInt32)?
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first,
+              let point = guestPoint(for: touch.location(in: self)) else { return }
+        lastPoint = point
+        onTouch?(point.x, point.y, true)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first,
+              let point = guestPoint(for: touch.location(in: self)),
+              point.x != lastPoint?.x || point.y != lastPoint?.y else { return }
+        lastPoint = point
+        onTouch?(point.x, point.y, true)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        finishTouch(touches.first)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        finishTouch(touches.first)
+    }
+
+    private func finishTouch(_ touch: UITouch?) {
+        let point = touch.flatMap { guestPoint(for: $0.location(in: self)) } ?? lastPoint
+        if let point {
+            if point.x != lastPoint?.x || point.y != lastPoint?.y {
+                onTouch?(point.x, point.y, true)
+            }
+            onTouch?(point.x, point.y, false)
         }
+        lastPoint = nil
+    }
+
+    private func guestPoint(for location: CGPoint) -> (x: UInt32, y: UInt32)? {
+        guard let layout,
+              bounds.width > 0, bounds.height > 0,
+              layout.width > 0, layout.height > 0 else { return nil }
+        let scale = min(
+            bounds.width / CGFloat(layout.width),
+            bounds.height / CGFloat(layout.height)
+        )
+        let viewport = CGRect(
+            x: (bounds.width - CGFloat(layout.width) * scale) / 2,
+            y: 0,
+            width: CGFloat(layout.width) * scale,
+            height: CGFloat(layout.height) * scale
+        )
+        guard viewport.contains(location) else { return nil }
+        let x = min(layout.width - 1, max(
+            0,
+            Int((location.x - viewport.minX) * CGFloat(layout.width) / viewport.width)
+        ))
+        let y = min(layout.height - 1, max(
+            0,
+            Int((location.y - viewport.minY) * CGFloat(layout.height) / viewport.height)
+        ))
+        return (UInt32(x), UInt32(y))
     }
 }
 
@@ -360,130 +473,6 @@ private struct TerminalConsole: View {
                 proxy.scrollTo("terminal-bottom", anchor: .bottom)
             }
         }
-    }
-}
-
-private struct CommandBar: View {
-    let prompt: String
-    let canSend: Bool
-    @Binding var focused: Bool
-    let sendBytes: ([UInt8]) -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Text(prompt)
-                    .font(.system(.caption, design: .monospaced).weight(.bold))
-                    .foregroundStyle(Color(red: 0.72, green: 0.96, blue: 0.82))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                    .frame(width: 112, alignment: .leading)
-
-                ZStack(alignment: .leading) {
-                    TerminalKeyboardBridge(
-                        focused: $focused,
-                        isEnabled: canSend,
-                        sendBytes: sendBytes
-                    )
-                    .frame(width: 1, height: 1)
-                    .opacity(0.01)
-
-                    HStack(spacing: 6) {
-                        Capsule()
-                            .fill(focused ? Color(red: 0.34, green: 0.86, blue: 0.68) : Color.secondary)
-                            .frame(width: 8, height: 18)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 10)
-                    .background(Color.white.opacity(0.08))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(Color.white.opacity(focused ? 0.30 : 0.16), lineWidth: 1)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        focused = true
-                    }
-                }
-
-                TerminalKeyButton(systemImage: "arrow.left", bytes: [0x1b, 0x5b, 0x44], canSend: canSend, sendBytes: sendBytes)
-                TerminalKeyButton(systemImage: "arrow.right", bytes: [0x1b, 0x5b, 0x43], canSend: canSend, sendBytes: sendBytes)
-                TerminalPasteButton(canSend: canSend, sendBytes: sendBytes)
-                TerminalControlMenu(canSend: canSend, sendBytes: sendBytes)
-            }
-            .padding(.horizontal, 10)
-            .padding(.top, 8)
-
-            HStack(spacing: 8) {
-                TerminalKeyButton(systemImage: "arrow.up", bytes: [0x1b, 0x5b, 0x41], canSend: canSend, sendBytes: sendBytes)
-                TerminalKeyButton(systemImage: "arrow.down", bytes: [0x1b, 0x5b, 0x42], canSend: canSend, sendBytes: sendBytes)
-                TerminalKeyButton(systemImage: "arrow.right.to.line", bytes: [0x09], canSend: canSend, sendBytes: sendBytes)
-                TerminalKeyButton(systemImage: "escape", bytes: [0x1b], canSend: canSend, sendBytes: sendBytes)
-                TerminalKeyButton(systemImage: "delete.left", bytes: [0x7f], canSend: canSend, sendBytes: sendBytes)
-                TerminalKeyButton(systemImage: "return", bytes: [0x0a], canSend: canSend, sendBytes: sendBytes)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-        }
-        .background(Color(red: 0.035, green: 0.043, blue: 0.039))
-    }
-}
-
-private struct TerminalPasteButton: View {
-    let canSend: Bool
-    let sendBytes: ([UInt8]) -> Void
-
-    var body: some View {
-        Button {
-            guard let text = UIPasteboard.general.string, !text.isEmpty else {
-                return
-            }
-            sendBytes(Array(text.utf8))
-        } label: {
-            Image(systemName: "doc.on.clipboard")
-                .frame(minWidth: 26)
-        }
-        .buttonStyle(.bordered)
-        .disabled(!canSend)
-    }
-}
-
-private struct TerminalKeyButton: View {
-    let systemImage: String
-    let bytes: [UInt8]
-    let canSend: Bool
-    let sendBytes: ([UInt8]) -> Void
-
-    var body: some View {
-        Button {
-            sendBytes(bytes)
-        } label: {
-            Image(systemName: systemImage)
-                .frame(minWidth: 26)
-        }
-        .buttonStyle(.bordered)
-        .disabled(!canSend)
-    }
-}
-
-private struct TerminalControlMenu: View {
-    let canSend: Bool
-    let sendBytes: ([UInt8]) -> Void
-
-    var body: some View {
-        Menu {
-            Button("Ctrl-C") { sendBytes([0x03]) }
-            Button("Ctrl-D") { sendBytes([0x04]) }
-            Button("Ctrl-L") { sendBytes([0x0c]) }
-            Button("Ctrl-Z") { sendBytes([0x1a]) }
-        } label: {
-            Image(systemName: "control")
-                .frame(minWidth: 26)
-        }
-        .buttonStyle(.bordered)
-        .disabled(!canSend)
     }
 }
 

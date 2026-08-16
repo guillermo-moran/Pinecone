@@ -11,7 +11,7 @@ MKE2FS="${MKE2FS:-}"
 BUSYBOX_APPLETS=(
   awk basename cat chgrp chmod chown chroot clear cmp cp cut date dd df dirname
   dmesg du echo env false find free grep head hexdump hostname id ifconfig init ip kill
-  killall less ln login ls md5sum mdev mkdir mknod mount mv nslookup passwd ping
+  killall less ln ls md5sum mdev mkdir mknod mount mv nslookup passwd ping
   ping6 pgrep printf ps pwd reboot rm rmdir route sed sh sha256sum sleep sort stty sync
   tail tar tee test touch true tty udhcpc umount uname uniq vi wc wget whoami xargs
 )
@@ -60,14 +60,52 @@ chmod 1777 "${ROOTFS_DIR}/tmp" "${ROOTFS_DIR}/var/tmp"
 if [[ "${ARM64VIZ_GRAPHICAL_ROOTFS:-1}" == "1" ]]; then
   export ARM64VIZ_GRAPHICAL_PROFILE="${ARM64VIZ_GRAPHICAL_PROFILE:-phosh}"
   "${ROOT_DIR}/scripts/stage-alpine-graphical-rootfs.sh" "${ROOTFS_DIR}"
+  "${ROOT_DIR}/scripts/build-pinecone-pixman.sh" \
+    "${OUT_DIR}/libpinecone-pixman.so"
+  "${ROOT_DIR}/scripts/build-pinecone-session-launcher.sh" \
+    "${OUT_DIR}/pinecone-session-launcher"
+  install -m 0755 "${OUT_DIR}/libpinecone-pixman.so" \
+    "${ROOTFS_DIR}/usr/lib/libpinecone-pixman.so"
+  install -d "${ROOTFS_DIR}/usr/include/pinecone"
+  install -m 0644 "${ROOT_DIR}/scripts/rootfs/pinecone-pixman.h" \
+    "${ROOTFS_DIR}/usr/include/pinecone/pinecone-pixman.h"
+  "${ROOT_DIR}/scripts/build-pinecone-pixman-library.sh" \
+    "${OUT_DIR}/libpixman-1.so.0.46.4"
+  install -m 0755 "${OUT_DIR}/libpixman-1.so.0.46.4" \
+    "${ROOTFS_DIR}/usr/lib/libpixman-1.so.0.46.4"
+  OPTIONAL_DBUS_SERVICES="${ROOTFS_DIR}/usr/share/pinecone/dbus-system-services"
+  mkdir -p "${OPTIONAL_DBUS_SERVICES}"
+  for service in org.freedesktop.UPower.service; do
+    active_service="${ROOTFS_DIR}/usr/share/dbus-1/system-services/${service}"
+    if [[ -f "${active_service}" ]]; then
+      mv "${active_service}" "${OPTIONAL_DBUS_SERVICES}/${service}"
+    fi
+  done
   SCHEMA_DIR="${ROOTFS_DIR}/usr/share/glib-2.0/schemas"
   if [[ -d "${SCHEMA_DIR}" ]]; then
     cat > "${SCHEMA_DIR}/99-pinecone.gschema.override" <<'EOF'
 [org.gnome.desktop.session]
 idle-delay=uint32 0
 
+[org.gnome.desktop.screensaver]
+lock-enabled=false
+picture-options='none'
+picture-uri=''
+primary-color='#000000'
+secondary-color='#000000'
+color-shading-type='solid'
+
+[org.gnome.desktop.background]
+picture-options='none'
+picture-uri=''
+picture-uri-dark=''
+primary-color='#000000'
+secondary-color='#000000'
+color-shading-type='solid'
+
 [org.gnome.desktop.interface]
 enable-animations=false
+toolkit-accessibility=false
 
 [sm.puri.phosh.lockscreen]
 require-unlock=false
@@ -95,6 +133,26 @@ EOF
       exit 1
     fi
     update-mime-database "${MIME_DIR}"
+  fi
+
+  # Fontconfig caches are architecture-compatible between the ARM64 build host
+  # and guest. Build them into the image so Phosh does not scan every font on
+  # its first frame. The sysroot keeps cached paths guest-relative.
+  if command -v fc-cache >/dev/null 2>&1 && \
+     [[ -f "${ROOTFS_DIR}/etc/fonts/fonts.conf" ]]; then
+    FONTCONFIG_FILE="${ROOTFS_DIR}/etc/fonts/fonts.conf" \
+      fc-cache --really-force --system-only --sysroot="${ROOTFS_DIR}"
+  fi
+
+  # GTK icon caches are platform-independent. Use a host utility when present;
+  # builders without GTK still produce a valid image and can supply the tool
+  # explicitly through GTK_UPDATE_ICON_CACHE.
+  GTK_ICON_CACHE_TOOL="${GTK_UPDATE_ICON_CACHE:-$(command -v gtk-update-icon-cache || true)}"
+  if [[ -n "${GTK_ICON_CACHE_TOOL}" ]]; then
+    for theme_dir in "${ROOTFS_DIR}"/usr/share/icons/*; do
+      [[ -f "${theme_dir}/index.theme" ]] || continue
+      "${GTK_ICON_CACHE_TOOL}" --force --ignore-theme-index "${theme_dir}"
+    done
   fi
 
   PHOSH_DESKTOP="${ROOTFS_DIR}/usr/share/applications/mobi.phosh.Shell.desktop"
@@ -156,12 +214,12 @@ EOF
 
   # Alpine's packaged Phoc profile targets an x86 QXL virtual display and
   # forces Virtual-1 to 720x1440 at scale 2. Pinecone's virtio-gpu advertises
-  # a native 480x800 panel; using the QXL mode puts Phosh's layer surfaces on
+  # a native 480x1024 panel; using the QXL mode puts Phosh's layer surfaces on
   # the wrong output geometry and leaves the host scanout black.
   mkdir -p "${ROOTFS_DIR}/etc/phosh"
   cat > "${ROOTFS_DIR}/etc/phosh/phoc.ini" <<'EOF'
 [output:Virtual-1]
-mode = 480x800
+mode = 480x1024
 scale = 1
 EOF
 
@@ -227,6 +285,16 @@ geoclue:!:0:0:99999:7:::
 nobody:*:0:0:99999:7:::
 EOF
 chmod 0600 "${ROOTFS_DIR}/etc/shadow"
+mkdir -p "${ROOTFS_DIR}/etc/pam.d"
+cat > "${ROOTFS_DIR}/etc/pam.d/login" <<'EOF'
+#%PAM-1.0
+auth       sufficient pam_rootok.so
+auth       include    base-auth
+account    include    base-account
+password   include    base-password
+session    include    base-session
+session    optional   pam_elogind.so
+EOF
 cat > "${ROOTFS_DIR}/etc/profile" <<'EOF'
 export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin
 export PAGER=less
@@ -283,6 +351,9 @@ if ! grep -qs ' /run ' /proc/mounts; then
 fi
 mkdir -p /run/dbus /run/user/0
 chmod 0700 /run/user/0
+if [ ! -S /run/dbus/system_bus_socket ] && command -v dbus-daemon >/dev/null 2>&1; then
+  dbus-daemon --system --fork --nopidfile
+fi
 /bin/ifconfig lo 127.0.0.1 up 2>/dev/null || true
 for _ in 1 2 3 4 5; do
   [ -e /sys/class/net/eth0 ] && break
@@ -322,7 +393,7 @@ chmod 0700 /run/user/0
 export XDG_RUNTIME_DIR=/run/user/0
 export WLR_BACKENDS=drm
 export WLR_RENDERER=pixman
-export WLR_LOG=1
+export WLR_LOG="${PINECONE_WLR_LOG:-0}"
 export XKB_DEFAULT_LAYOUT=us
 ulimit -c unlimited
 if [ -e /proc/sys/kernel/core_pattern ]; then
@@ -356,9 +427,17 @@ export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=Phosh:GNOME
 export WLR_BACKENDS=drm
 export WLR_RENDERER=pixman
-export WLR_LOG=1
+export WLR_LOG="${PINECONE_WLR_LOG:-0}"
 export XKB_DEFAULT_LAYOUT=us
 export LIBSEAT_BACKEND=noop
+# GTK otherwise activates org.a11y.Bus on first widget construction. This
+# compact session does not start the AT-SPI bus, and D-Bus waits 120 seconds
+# before failing that activation. Keep accessibility opt-in until Pinecone has
+# a supervised accessibility service stack.
+if [ "${PINECONE_ENABLE_ACCESSIBILITY:-0}" != "1" ]; then
+  export NO_AT_BRIDGE=1
+  export GTK_A11Y=none
+fi
 ulimit -c unlimited
 mkdir -p /var/log
 if [ -e /proc/sys/kernel/core_pattern ]; then
@@ -379,6 +458,20 @@ pinecone_start_system_bus()
   rm -f /run/dbus/system_bus_socket /run/dbus/pid
   mkdir -p /run/dbus
   dbus-daemon --system --fork --nopidfile
+}
+
+pinecone_configure_optional_system_services()
+{
+  active_dir=/usr/share/dbus-1/system-services
+  optional_dir=/usr/share/pinecone/dbus-system-services
+  for service in org.freedesktop.UPower.service; do
+    if [ "${PINECONE_ENABLE_SYSTEM_SERVICES:-0}" = "1" ]; then
+      [ ! -f "$optional_dir/$service" ] || \
+        cp "$optional_dir/$service" "$active_dir/$service"
+    else
+      rm -f "$active_dir/$service"
+    fi
+  done
 }
 
 pinecone_prepare_input()
@@ -429,7 +522,7 @@ pinecone_start_system_bus || \
   echo 'pinecone-phoc: system bus unavailable; continuing with session bus' >&2
 pinecone_prepare_input || echo 'pinecone-phoc: input discovery unavailable' >&2
 
-echo 'pinecone-phoc: starting compositor at 480x800' >&2
+echo 'pinecone-phoc: starting compositor at 480x1024' >&2
 set +e
 dbus-run-session -- phoc -E foot
 PHOC_STATUS=$?
@@ -451,7 +544,7 @@ if ! command -v weston-simple-shm >/dev/null 2>&1; then
   exit 127
 fi
 
-echo 'pinecone-wayland-test: starting shared-memory client at 480x800' >&2
+echo 'pinecone-wayland-test: starting shared-memory client at 480x1024' >&2
 exec dbus-run-session -- phoc -E weston-simple-shm
 EOF
 chmod 0755 "${ROOTFS_DIR}/usr/local/bin/start-pinecone-wayland-test"
@@ -473,6 +566,7 @@ fi
 if command -v dbus-uuidgen >/dev/null 2>&1; then
   dbus-uuidgen --ensure 2>/dev/null || true
 fi
+pinecone_configure_optional_system_services
 pinecone_start_system_bus || echo 'pinecone-phosh: system bus unavailable' >&2
 pinecone_prepare_input || echo 'pinecone-phosh: input discovery unavailable' >&2
 
@@ -498,7 +592,7 @@ if [ ! -e "$CACHE_STAMP" ]; then
   touch "$CACHE_STAMP"
 fi
 
-echo 'pinecone-phosh: starting mobile shell at 480x800' >&2
+echo 'pinecone-phosh: starting mobile shell at 480x1024' >&2
 if ! grep -q ' /dev/shm tmpfs ' /proc/mounts 2>/dev/null; then
   echo 'pinecone-phosh: /dev/shm is not backed by tmpfs' >&2
   exit 1
@@ -525,6 +619,7 @@ export _GNOME_SESSION_ACCELERATED=1
 export _GNOME_IS_SOFTWARE_RENDERING=1
 export _GNOME_SESSION_RENDERER=pixman
 export GSK_RENDERER=cairo
+export LD_PRELOAD=/usr/lib/libpinecone-pixman.so
 # virtio-gpu exposes a virtual connector. Phosh must treat that connector as
 # the device's built-in panel so it can select a primary mobile monitor.
 export PHOSH_DEBUG=fake-builtin
@@ -541,7 +636,11 @@ fi
 # Keep compositor and shell logs separate. Do not request Phoc's opaque startup
 # shield: interpreted guests can take minutes to initialize Phosh, and a shield
 # would replace otherwise valid DRM output with an indistinguishable black VM.
-dbus-run-session -- phoc -v -C "$PHOC_INI" \
+PHOC_VERBOSE=
+if [ "${PINECONE_PHOC_VERBOSE:-0}" = "1" ]; then
+  PHOC_VERBOSE=-v
+fi
+dbus-run-session -- phoc ${PHOC_VERBOSE} -C "$PHOC_INI" \
   -E /usr/local/bin/pinecone-phosh-client \
   > /var/log/pinecone/phoc.log 2>&1
 SESSION_STATUS=$?
@@ -555,6 +654,12 @@ done
 exit "$SESSION_STATUS"
 EOF
 chmod 0755 "${ROOTFS_DIR}/usr/local/bin/start-pinecone-phosh"
+install -m 0755 "${OUT_DIR}/pinecone-session-launcher" \
+  "${ROOTFS_DIR}/usr/local/bin/pinecone-session-launcher"
+ln -sf pinecone-session-launcher \
+  "${ROOTFS_DIR}/usr/local/bin/start-pinecone-phosh"
+ln -sf pinecone-session-launcher \
+  "${ROOTFS_DIR}/usr/local/bin/pinecone-phosh-client"
 cat > "${ROOTFS_DIR}/etc/shells" <<'EOF'
 /bin/sh
 /bin/ash
@@ -622,7 +727,17 @@ truncate -s "${SIZE_MIB}M" "${IMAGE}"
 find "${ROOTFS_DIR}" -exec touch -h -t 197001010000.00 {} +
 "${MKE2FS}" -q -t ext4 -L arm64viz-root -d "${ROOTFS_DIR}" "${IMAGE}"
 
+if command -v shasum >/dev/null 2>&1; then
+  shasum -a 256 "${IMAGE}" | awk '{ print $1 }' > "${IMAGE}.sha256"
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha256sum "${IMAGE}" | awk '{ print $1 }' > "${IMAGE}.sha256"
+else
+  echo "error: shasum or sha256sum is required to fingerprint the rootfs" >&2
+  exit 1
+fi
+
 echo "Built root filesystem image:"
 echo "  ${IMAGE}"
+echo "  identity: ${IMAGE}.sha256"
 echo "  size: ${SIZE_MIB} MiB"
 echo "  staged: ${STAGED_MIB} MiB"

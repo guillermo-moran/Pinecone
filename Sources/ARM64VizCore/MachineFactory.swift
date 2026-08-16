@@ -12,9 +12,9 @@ public enum ARM64VizMachineLayout {
     public static let uartBase: GuestAddress = 0x0900_0000
     public static let framebufferBase: GuestAddress = 0x1000_0000
     public static let framebufferWidth = 480
-    public static let framebufferHeight = 800
+    public static let framebufferHeight = 1024
     public static let framebufferBytesPerPixel = 4
-    public static let touchBase: GuestAddress = 0x1018_0000
+    public static let touchBase: GuestAddress = 0x101e_0000
     public static let blockBase: GuestAddress = 0x1020_0000
     public static let networkBase: GuestAddress = 0x1031_0000
 }
@@ -32,6 +32,7 @@ public struct ResearchMachine {
     public let touch: VirtualTouchInput
     public let block: VirtualBlockDevice
     public let network: VirtualNetworkDevice
+    public let parallelVCPUCluster: ParallelVCPUCluster?
 
     public init(
         vm: VirtualMachine,
@@ -45,7 +46,8 @@ public struct ResearchMachine {
         framebuffer: VirtualFramebuffer,
         touch: VirtualTouchInput,
         block: VirtualBlockDevice,
-        network: VirtualNetworkDevice
+        network: VirtualNetworkDevice,
+        parallelVCPUCluster: ParallelVCPUCluster? = nil
     ) {
         self.vm = vm
         self.gic = gic
@@ -59,6 +61,7 @@ public struct ResearchMachine {
         self.touch = touch
         self.block = block
         self.network = network
+        self.parallelVCPUCluster = parallelVCPUCluster
     }
 }
 
@@ -73,13 +76,27 @@ public enum MachineFactory {
         blockStorageSize: Int = 1024 * 1024,
         blockStorage: VirtIOBlockStorage? = nil,
         backend: VirtualMachineBackend = SoftwareARM64Backend(),
+        virtualCPUCount: Int = 1,
+        parallelVCPUExecution: Bool = false,
         publishedDevices: ResearchMachineDevicePublication = .full
     ) throws -> ResearchMachine {
         let memory = PhysicalMemory(base: ARM64VizMachineLayout.ramBase, size: memorySize)
         let interruptController = SimpleInterruptController()
-        let vm = VirtualMachine(memory: memory, interruptController: interruptController, backend: backend)
+        let vm = VirtualMachine(
+            memory: memory,
+            interruptController: interruptController,
+            backend: backend,
+            virtualCPUCount: virtualCPUCount
+        )
 
-        let gic = VirtualGIC(base: ARM64VizMachineLayout.gicBase, interruptController: interruptController)
+        let gic = VirtualGIC(
+            base: ARM64VizMachineLayout.gicBase,
+            interruptController: interruptController,
+            virtualCPUCount: virtualCPUCount
+        )
+        gic.setCurrentVCPUIDProvider { [weak mmio = vm.mmio] in
+            mmio?.currentVCPUID ?? 0
+        }
         let uart = VirtualUART(
             base: ARM64VizMachineLayout.uartBase,
             interruptLine: 33,
@@ -279,6 +296,10 @@ public enum MachineFactory {
             vm.bootDevices = requiredLinuxDevices
         }
 
+        let parallelVCPUCluster = parallelVCPUExecution && virtualCPUCount > 1
+            ? ParallelVCPUCluster(primary: vm)
+            : nil
+
         return ResearchMachine(
             vm: vm,
             gic: gic,
@@ -291,7 +312,8 @@ public enum MachineFactory {
             framebuffer: framebuffer,
             touch: touch,
             block: block,
-            network: network
+            network: network,
+            parallelVCPUCluster: parallelVCPUCluster
         )
     }
 }

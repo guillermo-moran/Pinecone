@@ -183,6 +183,20 @@ public final class PhysicalMemory {
         )
     }
 
+    func copyBytes(
+        from source: UnsafeRawPointer,
+        count: Int,
+        to address: GuestAddress
+    ) throws {
+        guard count >= 0 else {
+            throw VMError.invalidMemoryAccess(address: address, width: count)
+        }
+        guard count > 0 else { return }
+        let destinationIndex = try index(for: address, width: count)
+        memcpy(bytes.baseAddress!.advanced(by: destinationIndex), source, count)
+        markDirty(offset: destinationIndex, count: count)
+    }
+
     public func snapshotBytes() -> [UInt8] {
         Array(bytes)
     }
@@ -215,6 +229,17 @@ public final class PhysicalMemory {
         bytes
     }
 
+    func persistentMutableBytes(
+        at address: GuestAddress,
+        count: Int
+    ) throws -> UnsafeMutableRawBufferPointer {
+        let startIndex = try index(for: address, width: count)
+        return UnsafeMutableRawBufferPointer(
+            start: bytes.baseAddress!.advanced(by: startIndex),
+            count: count
+        )
+    }
+
     var nativeMemoryHandle: OpaquePointer {
         nativeMemory
     }
@@ -229,6 +254,14 @@ public final class PhysicalMemory {
 
     func advanceDirtyEpoch() -> UInt64 {
         avz_guest_memory_advance_dirty_epoch(nativeMemory)
+    }
+
+    func invalidateSharedTranslationCaches() {
+        avz_guest_memory_invalidate_translations(nativeMemory)
+    }
+
+    var sharedTranslationEpoch: UInt64 {
+        avz_guest_memory_translation_epoch(nativeMemory)
     }
 
     func dirtyRanges(
@@ -288,7 +321,7 @@ public final class PhysicalMemory {
     }
 
     private func markDirty(offset: Int, count: Int) {
-        avz_guest_memory_mark_dirty(nativeMemory, offset, count)
+        avz_guest_memory_note_write(nativeMemory, offset, count)
     }
 
     private func index(for address: GuestAddress, width: Int) throws -> Int {

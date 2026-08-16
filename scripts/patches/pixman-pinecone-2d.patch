@@ -1,0 +1,127 @@
+diff --git a/pixman/pixman.c b/pixman/pixman.c
+--- a/pixman/pixman.c
++++ b/pixman/pixman.c
+@@ -30,6 +30,22 @@
+ 
+ #include <stdlib.h>
+ 
++extern pixman_bool_t pinecone_pixman_composite (
++    pixman_op_t     op,
++    pixman_image_t *src,
++    pixman_image_t *mask,
++    pixman_image_t *dest,
++    int32_t         src_x,
++    int32_t         src_y,
++    int32_t         mask_x,
++    int32_t         mask_y,
++    int32_t         dest_x,
++    int32_t         dest_y,
++    uint32_t        width,
++    uint32_t        height) __attribute__((weak));
++extern void pinecone_pixman_begin_composite (void) __attribute__((weak));
++extern pixman_bool_t pinecone_pixman_end_composite (void) __attribute__((weak));
++
+ pixman_implementation_t *global_implementation;
+ 
+ #ifdef TOOLCHAIN_SUPPORTS_ATTRIBUTE_CONSTRUCTOR
+@@ -698,6 +714,9 @@
+ 
+     pbox = pixman_region32_rectangles (&region, &n);
+ 
++    if (pinecone_pixman_begin_composite)
++	pinecone_pixman_begin_composite ();
++
+     while (n--)
+     {
+ 	info.src_x = pbox->x1 + src_x - dest_x;
+@@ -712,11 +731,21 @@
+ 	info.width = pbox->x2 - pbox->x1;
+ 	info.height = pbox->y2 - pbox->y1;
+ 
+-	func (imp, &info);
++	if (!pinecone_pixman_composite ||
++	    !pinecone_pixman_composite (
++		info.op, info.src_image, info.mask_image, info.dest_image,
++		info.src_x, info.src_y, info.mask_x, info.mask_y,
++		info.dest_x, info.dest_y, info.width, info.height))
++	{
++	    func (imp, &info);
++	}
+ 
+ 	pbox++;
+     }
++
++    if (pinecone_pixman_end_composite)
++	pinecone_pixman_end_composite ();
+ 
+ out:
+     pixman_region32_fini (&region);
+ }
+diff --git a/pixman/pixman-bits-image.c b/pixman/pixman-bits-image.c
+--- a/pixman/pixman-bits-image.c
++++ b/pixman/pixman-bits-image.c
+@@ -37,5 +37,11 @@
+ #include "pixman-inlines.h"
+ #include "dither/blue-noise-64x64.h"
+ 
++extern pixman_image_t *pinecone_pixman_create_bits (
++    pixman_format_code_t format,
++    int                  width,
++    int                  height,
++    pixman_bool_t        clear) __attribute__((weak));
++
+ /*
+  * By default, just evaluate the image directly. If the image has a
+@@ -1365,6 +1371,14 @@ pixman_image_create_bits (pixman_format_code_t format,
+                           uint32_t *           bits,
+                           int                  rowstride_bytes)
+ {
++    if (!bits && pinecone_pixman_create_bits)
++    {
++        pixman_image_t *image =
++            pinecone_pixman_create_bits (format, width, height, TRUE);
++        if (image)
++            return image;
++    }
++
+     return create_bits_image_internal (
+ 	format, width, height, bits, rowstride_bytes, TRUE);
+ }
+@@ -1378,6 +1392,14 @@ pixman_image_create_bits_no_clear (pixman_format_code_t format,
+ 				   uint32_t *           bits,
+ 				   int                  rowstride_bytes)
+ {
++    if (!bits && pinecone_pixman_create_bits)
++    {
++        pixman_image_t *image =
++            pinecone_pixman_create_bits (format, width, height, FALSE);
++        if (image)
++            return image;
++    }
++
+     return create_bits_image_internal (
+ 	format, width, height, bits, rowstride_bytes, FALSE);
+ }
+diff --git a/pixman/pixman-solid-fill.c b/pixman/pixman-solid-fill.c
+--- a/pixman/pixman-solid-fill.c
++++ b/pixman/pixman-solid-fill.c
+@@ -27,6 +27,10 @@
+ #endif
+ #include "pixman-private.h"
+ 
++extern void pinecone_pixman_created_solid (
++    pixman_image_t       *image,
++    const pixman_color_t *color) __attribute__((weak));
++
+ static uint32_t
+ color_to_uint32 (const pixman_color_t *color)
+ {
+@@ -61,5 +65,8 @@ pixman_image_create_solid_fill (const pixman_color_t *color)
+     img->solid.color_32 = color_to_uint32 (color);
+     img->solid.color_float = color_to_float (color);
+ 
++    if (pinecone_pixman_created_solid)
++        pinecone_pixman_created_solid (img, color);
++
+     return img;
+ }

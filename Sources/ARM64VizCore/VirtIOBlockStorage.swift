@@ -1,3 +1,4 @@
+import ARM64VizNative
 import Foundation
 
 #if canImport(Darwin)
@@ -11,6 +12,8 @@ public protocol VirtIOBlockStorage: AnyObject {
 
     func read(at offset: Int, count: Int) throws -> [UInt8]
     func write(_ bytes: [UInt8], at offset: Int) throws
+    func read(into buffers: [UnsafeMutableRawBufferPointer], at offset: Int) throws
+    func write(from buffers: [UnsafeRawBufferPointer], at offset: Int) throws
     func zero(at offset: Int, count: Int) throws
     func flush() throws
     func snapshot() throws -> [UInt8]
@@ -37,6 +40,34 @@ final class InMemoryVirtIOBlockStorage: VirtIOBlockStorage {
         bytes.replaceSubrange(offset..<(offset + source.count), with: source)
     }
 
+    func read(into buffers: [UnsafeMutableRawBufferPointer], at offset: Int) throws {
+        let byteCount = try totalByteCount(buffers.map(\.count), offset: offset)
+        try validateRange(offset: offset, count: byteCount)
+        var sourceOffset = offset
+        for buffer in buffers where !buffer.isEmpty {
+            _ = bytes.withUnsafeBytes { source in
+                memcpy(
+                    buffer.baseAddress!,
+                    source.baseAddress!.advanced(by: sourceOffset),
+                    buffer.count
+                )
+            }
+            sourceOffset += buffer.count
+        }
+    }
+
+    func write(from buffers: [UnsafeRawBufferPointer], at offset: Int) throws {
+        let byteCount = try totalByteCount(buffers.map(\.count), offset: offset)
+        try validateRange(offset: offset, count: byteCount)
+        var destinationOffset = offset
+        for buffer in buffers where !buffer.isEmpty {
+            _ = bytes.withUnsafeMutableBytes { destination in
+                memcpy(destination.baseAddress!.advanced(by: destinationOffset), buffer.baseAddress!, buffer.count)
+            }
+            destinationOffset += buffer.count
+        }
+    }
+
     func zero(at offset: Int, count: Int) throws {
         try validateRange(offset: offset, count: count)
         guard count > 0 else {
@@ -61,6 +92,16 @@ final class InMemoryVirtIOBlockStorage: VirtIOBlockStorage {
             throw VMError.deviceError(
                 "block storage range offset=\(offset) count=\(requestedCount) exceeds \(bytes.count) bytes"
             )
+        }
+    }
+
+
+    private func totalByteCount(_ counts: [Int], offset: Int) throws -> Int {
+        try counts.reduce(0) { total, count in
+            guard count >= 0, total <= Int.max - count else {
+                throw VMError.deviceError("block storage vector length overflow at offset \(offset)")
+            }
+            return total + count
         }
     }
 }
@@ -134,6 +175,51 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
         }
     }
 
+    public func read(into buffers: [UnsafeMutableRawBufferPointer], at offset: Int) throws {
+        let byteCount = try validatedVectorByteCount(buffers.map(\.count), offset: offset)
+        guard byteCount > 0 else { return }
+        try lock.withLock {
+            let segments = buffers.map {
+                AVZBlockIOSegment(base: $0.baseAddress, length: $0.count)
+            }
+            let result = segments.withUnsafeBufferPointer { segmentBuffer in
+                avz_block_io_preadv(
+                    fileDescriptor,
+                    segmentBuffer.baseAddress,
+                    segmentBuffer.count,
+                    UInt64(offset)
+                )
+            }
+            guard result == Int64(byteCount) else {
+                throw Self.nativeIOError(operation: "preadv", result: result)
+            }
+        }
+    }
+
+    public func write(from buffers: [UnsafeRawBufferPointer], at offset: Int) throws {
+        let byteCount = try validatedVectorByteCount(buffers.map(\.count), offset: offset)
+        guard byteCount > 0 else { return }
+        try lock.withLock {
+            let segments = buffers.map {
+                AVZBlockIOSegment(
+                    base: UnsafeMutableRawPointer(mutating: $0.baseAddress),
+                    length: $0.count
+                )
+            }
+            let result = segments.withUnsafeBufferPointer { segmentBuffer in
+                avz_block_io_pwritev(
+                    fileDescriptor,
+                    segmentBuffer.baseAddress,
+                    segmentBuffer.count,
+                    UInt64(offset)
+                )
+            }
+            guard result == Int64(byteCount) else {
+                throw Self.nativeIOError(operation: "pwritev", result: result)
+            }
+        }
+    }
+
     public func zero(at offset: Int, count requestedCount: Int) throws {
         try validateRange(offset: offset, count: requestedCount)
         guard requestedCount > 0 else {
@@ -185,6 +271,26 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
             }
             completed += result
         }
+    }
+
+    private func validatedVectorByteCount(_ counts: [Int], offset: Int) throws -> Int {
+        let byteCount = try counts.reduce(0) { total, count in
+            guard count >= 0, total <= Int.max - count else {
+                throw VMError.deviceError("block storage vector length overflow at offset \(offset)")
+            }
+            return total + count
+        }
+        try validateRange(offset: offset, count: byteCount)
+        return byteCount
+    }
+
+    private static func nativeIOError(operation: String, result: Int64) -> Error {
+        let code = result < 0 ? Int32(clamping: -result) : EIO
+        return NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(code),
+            userInfo: [NSLocalizedDescriptionKey: "\(operation) failed: \(String(cString: strerror(code)))"]
+        )
     }
 
     private func writeFully(from source: UnsafeRawPointer, count: Int, offset: Int) throws {

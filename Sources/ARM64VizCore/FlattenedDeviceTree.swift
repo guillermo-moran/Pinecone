@@ -51,9 +51,19 @@ public enum FlattenedDeviceTree {
             writer.property("device_type", string: "cpu")
             writer.property("compatible", strings: ["arm,armv8"])
             writer.property("reg", cells: [UInt32(cpu)])
+            if let cpuEnableMethod = configuration.cpuEnableMethod {
+                writer.property("enable-method", string: cpuEnableMethod)
+            }
             writer.endNode()
         }
         writer.endNode()
+
+        if let psciMethod = configuration.psciMethod {
+            writer.beginNode("psci")
+            writer.property("compatible", strings: ["arm,psci-1.0", "arm,psci-0.2"])
+            writer.property("method", string: psciMethod)
+            writer.endNode()
+        }
 
         writer.beginNode("aliases")
         if let uart = configuration.devices.first(where: { $0.name.contains("uart") }) {

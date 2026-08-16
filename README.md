@@ -17,7 +17,7 @@ The project can currently:
 - Mount a persistent Alpine Linux ext4 root filesystem through virtio-mmio.
 - Reach a BusyBox/Alpine shell on the emulated PL011 `ttyAMA0` console.
 - Start Phoc and Phosh using Pixman software rendering at a guest resolution of
-  480x800.
+  480x1024.
 - Present the guest framebuffer through Metal in the Pinecone iOS app.
 - Deliver iOS touch and keyboard events through virtio-input.
 - Expose virtio block, network, input, keyboard, and GPU devices.
@@ -47,6 +47,10 @@ flowchart TB
     subgraph Core["ARM64VizCore: Swift VM and platform model"]
         Boot["LinuxDirectBootAdapter"]
         VM["VirtualMachine"]
+        Scheduler["Cooperative vCPU scheduler"]
+        VCPU0["vCPU 0 state"]
+        VCPU1["vCPU 1 state"]
+        PSCI["PSCI v1.1 over HVC"]
         FDT["Generated flattened device tree"]
         MMIO["MMIO bus"]
         IRQ["GIC and generic timer"]
@@ -67,7 +71,7 @@ flowchart TB
         VBlock["virtio-block"]
         VNet["virtio-net"]
         VInput["virtio-input touch and keyboard"]
-        VGPU["virtio-gpu 480x800 scanout"]
+        VGPU["virtio-gpu 480x1024 scanout"]
     end
 
     subgraph Guest["ARM64 guest"]
@@ -88,7 +92,12 @@ flowchart TB
 
     Boot --> FDT
     Boot --> VM
-    VM --> CPU
+    VM --> Scheduler
+    Scheduler --> VCPU0
+    Scheduler --> VCPU1
+    PSCI --> VCPU1
+    VCPU0 --> CPU
+    VCPU1 --> CPU
     CPU --> Decoder
     Decoder --> Blocks
     CPU --> Memory
@@ -138,17 +147,21 @@ gaps rather than silently relying on it during normal Linux execution.
 
 ## Virtual Machine Layout
 
-The default research machine is a single-vCPU ARM64 platform with RAM beginning
-at `0x40000000`. Its Linux-visible devices include:
+The generic research-machine API defaults to one vCPU for compatibility. The
+Pinecone runtime configures two Linux-visible vCPUs with separate architectural,
+system-register, MMU-cache, timer, and interrupt-interface state. Linux starts
+vCPU 1 through PSCI v1.1 over `HVC`; the current host scheduler runs vCPUs
+cooperatively rather than on parallel host threads. RAM begins at `0x40000000`.
+Its Linux-visible devices include:
 
 | Device | Guest address | Purpose |
 | --- | ---: | --- |
-| GIC | `0x08000000` | Interrupt distribution and CPU interface |
+| GICv2 | `0x08000000` | Banked CPU interfaces, SGIs/PPIs, and targeted SPIs |
 | PL011 UART | `0x09000000` | Linux boot and interactive console |
 | virtio-block | `0x0a000000` | Persistent Alpine root filesystem |
 | virtio-net | `0x0a001000` | Host-bridged guest networking |
 | virtio-input | `0x0a002000` | Absolute touchscreen events |
-| virtio-gpu | `0x0a003000` | 480x800 DRM scanout |
+| virtio-gpu | `0x0a003000` | 480x1024 DRM scanout |
 | virtio-input | `0x0a004000` | Keyboard events |
 
 The Linux boot adapter places the raw kernel `Image`, initramfs, and generated

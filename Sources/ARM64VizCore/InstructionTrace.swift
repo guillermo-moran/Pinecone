@@ -60,6 +60,12 @@ public enum ARM64InstructionClassifier {
         if (instruction & 0xffe0_001f) == 0xd400_0001 {
             return "svc"
         }
+        if (instruction & 0xffe0_001f) == 0xd400_0002 {
+            return "hvc"
+        }
+        if (instruction & 0xffe0_001f) == 0xd400_0003 {
+            return "smc"
+        }
         if (instruction & 0xffe0_001f) == 0xd420_0000 {
             return "brk"
         }
