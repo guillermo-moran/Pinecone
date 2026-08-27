@@ -1,0 +1,32 @@
+diff --git a/src/metainfo-cache.c b/src/metainfo-cache.c
+index f3dfe8f..e9f8a89 100644
+--- a/src/metainfo-cache.c
++++ b/src/metainfo-cache.c
+@@ -88,6 +88,16 @@ phosh_metainfo_cache_constructed (GObject *object)
+ 
+   G_OBJECT_CLASS (phosh_metainfo_cache_parent_class)->constructed (object);
+ 
++  /* Pinecone has a fixed, image-owned application set. Loading AppStream's
++   * OS catalogs, Flatpak metadata and directory monitors here adds no launch
++   * functionality, but competes with the shell's first frame for CPU time.
++   * Desktop-file discovery remains handled by GAppInfo and the app grid. */
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0) {
++    self->ready = TRUE;
++    g_message ("Pinecone profile: optional AppStream catalog disabled");
++    return;
++  }
++
+   self->as_pool = as_pool_new ();
+   /* We only bother about metainfo in a non-system cache */
+   as_pool_set_flags (self->as_pool,
+@@ -188,6 +198,10 @@ phosh_metainfo_get_data_id (PhoshMetainfoCache *self, const char *app_id)
+ {
+   g_autoptr (AsComponentBox) result = NULL;
+ 
++  g_return_val_if_fail (PHOSH_IS_METAINFO_CACHE (self), NULL);
++  if (self->as_pool == NULL)
++    return NULL;
++
+   result = as_pool_get_components_by_launchable (self->as_pool, AS_LAUNCHABLE_KIND_DESKTOP_ID,
+                                                  app_id);
+ 

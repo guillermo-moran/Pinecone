@@ -6,12 +6,8 @@ import SwiftUI
 import UIKit
 
 typealias GuestDisplayFrameSource = (
-    _ previousGeneration: UInt64?,
-    _ body: (
-        _ metadata: VirtualFramebufferFrameMetadata,
-        _ bytes: UnsafeRawBufferPointer
-    ) -> Void
-) -> VirtualFramebufferFrameMetadata?
+    _ previousGeneration: UInt64?
+) -> VirtualFramebufferFrameLease?
 
 typealias GuestDisplayPresentedHandler = (
     _ generation: UInt64,
@@ -164,33 +160,35 @@ final class GuestDisplaySurfaceView: UIView {
         }
 
         if let metalPresenter {
-            var uploadedBytes = 0
-            let copiedMetadata = copyFrame(uploadedGeneration) { metadata, bytes in
-                uploadedBytes = metalPresenter.upload(metadata: metadata, bytes: bytes)
+            guard let lease = copyFrame(uploadedGeneration) else { return }
+            let metadata = lease.metadata
+            let uploadedBytes = lease.withUnsafeBytes {
+                metalPresenter.upload(metadata: metadata, bytes: $0)
             }
-            guard let copiedMetadata else { return }
-            uploadedGeneration = copiedMetadata.generation
+            let retainedLease = metalPresenter.requiresSourceLease ? lease : nil
+            uploadedGeneration = metadata.generation
             metalPresenter.submit(
-                generation: copiedMetadata.generation,
+                generation: metadata.generation,
                 uploadedBytes: uploadedBytes,
+                frameLease: retainedLease,
                 onPresented: onPresented
             )
             return
         }
 
-        var frameData: Data?
-        let copiedMetadata = copyFrame(uploadedGeneration) { metadata, bytes in
-            guard bytes.count >= metadata.stride * metadata.height,
+        guard let lease = copyFrame(uploadedGeneration) else { return }
+        let copiedMetadata = lease.metadata
+        let frameData: Data? = lease.withUnsafeBytes { bytes in
+            guard bytes.count >= copiedMetadata.stride * copiedMetadata.height,
                   let baseAddress = bytes.baseAddress else {
-                return
+                return nil
             }
-            frameData = Data(
+            return Data(
                 bytes: baseAddress,
-                count: metadata.stride * metadata.height
+                count: copiedMetadata.stride * copiedMetadata.height
             )
         }
-        guard let copiedMetadata,
-              let frameData,
+        guard let frameData,
               let image = Self.makeFallbackImage(metadata: copiedMetadata, data: frameData) else {
             return
         }
@@ -246,8 +244,11 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
     private var pendingPresentation: (
         generation: UInt64,
         uploadedBytes: Int,
+        frameLease: VirtualFramebufferFrameLease?,
         handler: GuestDisplayPresentedHandler
     )?
+
+    var requiresSourceLease: Bool { textureUsesSharedStorage }
 
     init?(device: MTLDevice) {
         guard let commandQueue = device.makeCommandQueue(),
@@ -441,10 +442,11 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
     func submit(
         generation: UInt64,
         uploadedBytes: Int,
+        frameLease: VirtualFramebufferFrameLease?,
         onPresented: @escaping GuestDisplayPresentedHandler
     ) {
         let accumulatedBytes = uploadedBytes + (pendingPresentation?.uploadedBytes ?? 0)
-        pendingPresentation = (generation, accumulatedBytes, onPresented)
+        pendingPresentation = (generation, accumulatedBytes, frameLease, onPresented)
         requestDraw()
     }
 

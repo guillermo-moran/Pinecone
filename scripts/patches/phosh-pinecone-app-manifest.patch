@@ -1,0 +1,84 @@
+diff --git a/src/app-list-model.c b/src/app-list-model.c
+index 05a26c8..2bd5fb9 100644
+--- a/src/app-list-model.c
++++ b/src/app-list-model.c
+@@ -39,5 +39,6 @@ struct _PhoshAppListModelPrivate {
+   GHashTable *startup_wm_class;
+   GHashTable *exec_to_id;
++  gboolean    initial_refresh_done;
+ };
+ 
+ static void list_iface_init (GListModelInterface *iface);
+@@ -168,6 +169,46 @@ emit_items_changed (PhoshAppListModel *self)
+ }
+ 
+ 
++static GList *
++load_initial_app_manifest (gboolean *loaded)
++{
++  const char *path = g_getenv ("PINECONE_PHOSH_APP_MANIFEST");
++  g_autofree char *contents = NULL;
++  g_auto (GStrv) lines = NULL;
++  g_autoptr (GError) err = NULL;
++  GList *apps = NULL;
++
++  *loaded = FALSE;
++  if (path == NULL || *path == '\0')
++    return NULL;
++
++  if (!g_file_get_contents (path, &contents, NULL, &err)) {
++    g_warning ("Failed to load Pinecone app manifest '%s': %s", path, err->message);
++    return NULL;
++  }
++
++  lines = g_strsplit (contents, "\n", -1);
++  for (int i = 0; lines[i] != NULL; i++) {
++    g_autoptr (GDesktopAppInfo) info = NULL;
++    char *desktop_id = g_strstrip (lines[i]);
++
++    if (*desktop_id == '\0' || *desktop_id == '#')
++      continue;
++
++    info = g_desktop_app_info_new (desktop_id);
++    if (info == NULL) {
++      g_warning ("Pinecone app manifest entry '%s' is unavailable", desktop_id);
++      continue;
++    }
++    apps = g_list_prepend (apps, g_steal_pointer (&info));
++  }
++
++  *loaded = TRUE;
++  g_message ("Pinecone app manifest loaded with %u entries", g_list_length (apps));
++  return g_list_reverse (apps);
++}
++
++
+ static gboolean
+ items_changed (gpointer data)
+ {
+@@ -176,11 +217,23 @@ items_changed (gpointer data)
+   g_auto (GStrv) folder_paths = NULL;
+   g_autolist (GAppInfo) new_apps = NULL;
+   int removed;
++  gboolean manifest_loaded = FALSE;
+   int added = 0;
+ 
+-  new_apps = g_app_info_get_all ();
++  /* The immutable image can provide a prevalidated first-boot list. A later
++   * GAppInfoMonitor notification still performs the normal full discovery,
++   * so applications added or removed by apk are reflected without rebooting. */
++  if (!priv->initial_refresh_done) {
++    new_apps = load_initial_app_manifest (&manifest_loaded);
++    priv->initial_refresh_done = TRUE;
++  }
++  if (!manifest_loaded)
++    new_apps = g_app_info_get_all ();
++
++  if (manifest_loaded && new_apps == NULL)
++    g_warning ("Pinecone app manifest did not contain any usable applications");
+ 
+-  g_return_val_if_fail (new_apps != NULL, G_SOURCE_REMOVE);
++  g_return_val_if_fail (new_apps != NULL || manifest_loaded, G_SOURCE_REMOVE);
+ 
+   removed = g_sequence_get_length (priv->items);
+   g_sequence_remove_range (g_sequence_get_begin_iter (priv->items),

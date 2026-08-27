@@ -156,6 +156,7 @@ typedef struct {
     uint64_t generic_dispatches;
     uint64_t fast_path_steps;
     uint64_t fast_path_hits;
+    uint64_t mapped_blocks;
     uint32_t status;
     uint32_t unsupported_instruction;
 } AVZNativeBlockResult;
@@ -178,7 +179,7 @@ typedef struct {
 } AVZNativeInstruction;
 
 enum {
-    AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS = 32,
+    AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS = 16,
     AVZ_NATIVE_BLOCK_MAX_CODE_PAGES = 2,
     AVZ_NATIVE_BLOCK_DECODE_OK = 0,
     AVZ_NATIVE_BLOCK_DECODE_FETCH_FAULT = 1,
@@ -197,8 +198,21 @@ typedef struct {
 typedef struct AVZNativeBlockCache AVZNativeBlockCache;
 typedef struct AVZNativeDecodedBlock AVZNativeDecodedBlock;
 typedef struct AVZGuestMemory AVZGuestMemory;
+
+typedef struct {
+    uint64_t reads;
+    uint64_t nonzero_reads;
+    uint64_t write_successes;
+    uint64_t write_conflicts;
+} AVZGuestExclusiveStatistics;
 typedef struct AVZNativeMemoryFastPath AVZNativeMemoryFastPath;
 typedef struct AVZNativeExecutionContext AVZNativeExecutionContext;
+typedef struct AVZFileBlockStorage AVZFileBlockStorage;
+
+typedef struct {
+    uint64_t physical_address;
+    size_t byte_count;
+} AVZNativePhysicalSpan;
 
 typedef struct {
     void *base;
@@ -217,6 +231,33 @@ int64_t avz_block_io_pwritev(
     size_t segment_count,
     uint64_t offset
 );
+
+AVZFileBlockStorage *avz_file_block_storage_open(
+    const char *path,
+    int32_t *error_code
+);
+void avz_file_block_storage_close(AVZFileBlockStorage *storage);
+uint64_t avz_file_block_storage_size(
+    const AVZFileBlockStorage *storage
+);
+int64_t avz_file_block_storage_readv(
+    AVZFileBlockStorage *storage,
+    const AVZBlockIOSegment *segments,
+    size_t segment_count,
+    uint64_t offset
+);
+int64_t avz_file_block_storage_writev(
+    AVZFileBlockStorage *storage,
+    const AVZBlockIOSegment *segments,
+    size_t segment_count,
+    uint64_t offset
+);
+int32_t avz_file_block_storage_zero(
+    AVZFileBlockStorage *storage,
+    uint64_t offset,
+    uint64_t byte_count
+);
+int32_t avz_file_block_storage_flush(AVZFileBlockStorage *storage);
 
 typedef int (*AVZNativeInstructionFetchCallback)(
     void *context,
@@ -266,6 +307,8 @@ typedef struct {
 typedef struct {
     uint64_t pc;
     uint64_t samples;
+    uint64_t link_register;
+    uint64_t link_register_votes;
     uint32_t instruction0;
     uint32_t instruction1;
     uint32_t instruction2;
@@ -327,9 +370,21 @@ AVZNativeBlockCacheStatistics avz_native_block_cache_statistics(
 const AVZNativeInstruction *avz_native_decoded_block_instructions(
     const AVZNativeDecodedBlock *block
 );
+const uint8_t *avz_native_decoded_block_semantic_candidates(
+    const AVZNativeDecodedBlock *block
+);
+const uint8_t *avz_native_decoded_block_trace_semantic_candidates(
+    const AVZNativeDecodedBlock *block
+);
 size_t avz_native_decoded_block_instruction_count(const AVZNativeDecodedBlock *block);
 uint64_t avz_native_decoded_block_pc(const AVZNativeDecodedBlock *block);
 int avz_native_decoded_block_uses_vector_state(const AVZNativeDecodedBlock *block);
+int avz_native_decoded_block_is_chain_barrier(
+    const AVZNativeDecodedBlock *block
+);
+int avz_native_decoded_block_requires_host_checkpoint(
+    const AVZNativeDecodedBlock *block
+);
 size_t avz_native_decoded_block_code_page_count(
     const AVZNativeDecodedBlock *block
 );
@@ -355,6 +410,27 @@ const uint64_t *avz_native_decoded_block_serial_token(
     const AVZNativeBlockCache *cache,
     const AVZNativeDecodedBlock *block
 );
+const AVZNativeDecodedBlock *avz_native_decoded_block_find_successor(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *source,
+    uint64_t source_serial,
+    const AVZNativeBlockKey *target_key,
+    uint64_t *target_serial
+);
+const AVZNativeDecodedBlock *avz_native_decoded_block_find_recent_successor(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *source,
+    uint64_t source_serial,
+    const AVZNativeBlockKey *target_context,
+    uint64_t *target_serial
+);
+void avz_native_decoded_block_record_successor(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *source,
+    uint64_t source_serial,
+    const AVZNativeDecodedBlock *target,
+    uint64_t target_serial
+);
 int avz_native_decoded_block_code_is_current(
     AVZNativeBlockCache *cache,
     const AVZNativeDecodedBlock *block
@@ -374,8 +450,22 @@ uint64_t avz_native_block_cache_mutation_epoch(
 uint64_t avz_native_block_cache_code_mutation_epoch(
     const AVZNativeBlockCache *cache
 );
+uint64_t avz_native_block_cache_shared_code_mutation_epoch(
+    const AVZNativeBlockCache *cache
+);
+const uint64_t *avz_native_block_cache_shared_code_mutation_epoch_token(
+    const AVZNativeBlockCache *cache
+);
 const uint64_t *avz_native_block_cache_code_mutation_epoch_token(
     const AVZNativeBlockCache *cache
+);
+
+uint8_t avz_native_classify_semantic_candidate(
+    const AVZNativeInstruction *instructions,
+    size_t instruction_count,
+    size_t instruction_index,
+    int is_block_start,
+    int has_mapped_trace
 );
 uint64_t avz_native_block_cache_reset_epoch(
     const AVZNativeBlockCache *cache
@@ -514,6 +604,10 @@ typedef struct {
     uint64_t instruction_fetch_hits;
     uint64_t instruction_tlb_hits;
     uint64_t instruction_tlb_misses;
+    uint64_t instruction_tlb_hot_hits;
+    uint64_t instruction_tlb_cold_misses;
+    uint64_t instruction_tlb_conflict_misses;
+    uint64_t instruction_tlb_invalidation_misses;
     uint64_t native_page_table_walks;
     uint64_t native_page_table_faults;
     uint64_t translation_callback_walks;
@@ -577,11 +671,54 @@ uint64_t avz_guest_memory_page_write_generation(
     uint64_t physical_page,
     uint64_t ram_base
 );
+const uint64_t *avz_guest_memory_page_write_generation_token(
+    const AVZGuestMemory *memory,
+    uint64_t physical_page,
+    uint64_t ram_base
+);
+AVZGuestExclusiveStatistics avz_guest_memory_exclusive_statistics(
+    const AVZGuestMemory *memory
+);
+int avz_guest_memory_exclusive_read(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t *value,
+    uint64_t *generation
+);
+int avz_guest_memory_exclusive_read_pair(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t *first_value,
+    uint64_t *second_value,
+    uint64_t *generation
+);
+int avz_guest_memory_exclusive_write(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t value,
+    uint64_t expected_generation
+);
+int avz_guest_memory_exclusive_write_pair(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t first_value,
+    uint64_t second_value,
+    uint64_t expected_generation
+);
 
 typedef struct {
     size_t offset;
     size_t length;
 } AVZGuestDirtyRange;
+
+typedef struct {
+    size_t offset;
+    size_t byte_count;
+} AVZGuestMemorySpan;
 
 void avz_guest_memory_mark_dirty(
     AVZGuestMemory *memory,
@@ -592,6 +729,103 @@ void avz_guest_memory_note_write(
     AVZGuestMemory *memory,
     size_t offset,
     size_t byte_count
+);
+void avz_guest_memory_note_device_write(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+/*
+ * Virtio ownership transfers guarantee that the guest is not concurrently
+ * accessing this range. These DMA copies therefore avoid permanently marking
+ * guest pages as host-observed while retaining publication and invalidation.
+ */
+int avz_guest_memory_dma_read_owned(
+    AVZGuestMemory *memory,
+    size_t offset,
+    void *destination,
+    size_t byte_count
+);
+int avz_guest_memory_dma_write_owned(
+    AVZGuestMemory *memory,
+    size_t offset,
+    const void *source,
+    size_t byte_count
+);
+uint8_t *avz_guest_memory_dma_owned_pointer(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+void avz_guest_memory_dma_write_owned_complete(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+int avz_guest_memory_load_u16_acquire(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint16_t *value
+);
+int avz_guest_memory_store_u16_release(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint16_t value
+);
+void avz_guest_memory_lock(AVZGuestMemory *memory);
+void avz_guest_memory_unlock(AVZGuestMemory *memory);
+void avz_guest_memory_lock_range(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+void avz_guest_memory_unlock_range(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+int avz_guest_memory_register_host_range(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+int avz_guest_memory_host_range_is_registered(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+int avz_guest_memory_range_requires_serialization(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+);
+int avz_guest_memory_lock_spans(
+    AVZGuestMemory *memory,
+    const AVZGuestMemorySpan *spans,
+    size_t span_count
+);
+void avz_guest_memory_unlock_spans(
+    AVZGuestMemory *memory,
+    const AVZGuestMemorySpan *spans,
+    size_t span_count
+);
+void avz_guest_memory_clear_host_observations(AVZGuestMemory *memory);
+void avz_guest_memory_mark_code_page(
+    AVZGuestMemory *memory,
+    uint64_t physical_page,
+    uint64_t ram_base
+);
+int avz_guest_memory_range_may_contain_code(
+    const AVZGuestMemory *memory,
+    uint64_t physical_address,
+    size_t byte_count,
+    uint64_t ram_base
+);
+uint64_t avz_guest_memory_code_mutation_epoch(
+    const AVZGuestMemory *memory
+);
+const uint64_t *avz_guest_memory_code_mutation_epoch_token(
+    const AVZGuestMemory *memory
 );
 void avz_guest_memory_invalidate_translations(AVZGuestMemory *memory);
 uint64_t avz_guest_memory_translation_epoch(const AVZGuestMemory *memory);
@@ -628,6 +862,15 @@ void avz_native_memory_fast_path_destroy(AVZNativeMemoryFastPath *fast_path);
 void avz_native_memory_fast_path_set_ram(
     AVZNativeMemoryFastPath *fast_path,
     uint8_t *ram
+);
+void avz_native_memory_fast_path_set_detailed_statistics_enabled(
+    AVZNativeMemoryFastPath *fast_path,
+    int enabled
+);
+/* Controls raw guest-pointer mapping only; atomic bulk copy/fill stays active. */
+void avz_native_memory_fast_path_set_direct_bulk_mapping_enabled(
+    AVZNativeMemoryFastPath *fast_path,
+    int enabled
 );
 int avz_native_memory_fast_path_set_guest_memory(
     AVZNativeMemoryFastPath *fast_path,
@@ -697,6 +940,20 @@ int avz_native_fast_memory_write(
     uint8_t width,
     uint64_t value
 );
+int avz_native_fast_memory_read_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *first_value,
+    uint64_t *second_value
+);
+int avz_native_fast_memory_write_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t first_value,
+    uint64_t second_value
+);
 int avz_native_fast_memory_reservation_generation(
     void *context,
     uint64_t virtual_address,
@@ -752,6 +1009,28 @@ int avz_native_fast_memory_map_span(
     uint8_t is_write,
     uint8_t **host_address,
     uint64_t *physical_address
+);
+void avz_native_fast_memory_lock(void *context);
+void avz_native_fast_memory_unlock(void *context);
+void avz_native_fast_memory_lock_physical_span(
+    void *context,
+    uint64_t physical_address,
+    size_t byte_count
+);
+void avz_native_fast_memory_unlock_physical_span(
+    void *context,
+    uint64_t physical_address,
+    size_t byte_count
+);
+int avz_native_fast_memory_lock_physical_spans(
+    void *context,
+    const AVZNativePhysicalSpan *spans,
+    size_t span_count
+);
+void avz_native_fast_memory_unlock_physical_spans(
+    void *context,
+    const AVZNativePhysicalSpan *spans,
+    size_t span_count
 );
 void avz_native_fast_memory_commit_write_span(
     void *context,
@@ -905,6 +1184,7 @@ AVZNativeBlockResult avz_native_run_threaded_decoded_block_full_registers_with_e
     uint64_t *fpcr,
     uint64_t *fpsr,
     uint64_t *exclusive_address,
+    uint64_t *exclusive_generation,
     uint8_t *exclusive_size,
     uint8_t *exclusive_valid,
     uint8_t *halted,
@@ -938,6 +1218,22 @@ void avz_native_execution_context_load(
     uint8_t exclusive_valid,
     uint8_t halted
 );
+void avz_native_execution_context_load_with_exclusive_generation(
+    AVZNativeExecutionContext *context,
+    const uint64_t *x31,
+    const uint64_t *v32_low,
+    const uint64_t *v32_high,
+    uint64_t sp,
+    uint64_t pc,
+    uint64_t pstate,
+    uint64_t fpcr,
+    uint64_t fpsr,
+    uint64_t exclusive_address,
+    uint64_t exclusive_generation,
+    uint8_t exclusive_size,
+    uint8_t exclusive_valid,
+    uint8_t halted
+);
 void avz_native_execution_context_store(
     const AVZNativeExecutionContext *context,
     uint64_t *x31,
@@ -949,6 +1245,22 @@ void avz_native_execution_context_store(
     uint64_t *fpcr,
     uint64_t *fpsr,
     uint64_t *exclusive_address,
+    uint8_t *exclusive_size,
+    uint8_t *exclusive_valid,
+    uint8_t *halted
+);
+void avz_native_execution_context_store_with_exclusive_generation(
+    const AVZNativeExecutionContext *context,
+    uint64_t *x31,
+    uint64_t *v32_low,
+    uint64_t *v32_high,
+    uint64_t *sp,
+    uint64_t *pc,
+    uint64_t *pstate,
+    uint64_t *fpcr,
+    uint64_t *fpsr,
+    uint64_t *exclusive_address,
+    uint64_t *exclusive_generation,
     uint8_t *exclusive_size,
     uint8_t *exclusive_valid,
     uint8_t *halted
@@ -995,6 +1307,30 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
     void *memory_context
 );
 AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed(
+    AVZNativeExecutionContext *context,
+    AVZNativeBlockCache *cache,
+    const AVZNativeBlockKey *key_template,
+    uint64_t initial_block_step_limit,
+    uint64_t max_steps,
+    uint64_t max_blocks,
+    uint64_t checkpoint_block_interval,
+    AVZNativeChainCheckpointCallback checkpoint,
+    void *checkpoint_context,
+    AVZNativeInstructionFetchCallback fetch_instruction,
+    void *fetch_context,
+    AVZNativeMemoryReadCallback read_memory,
+    AVZNativeMemoryWriteCallback write_memory,
+    AVZNativeMemoryCanAccessCallback can_access_memory,
+    AVZNativeMemoryFillCallback fill_memory,
+    AVZNativeSystemRegisterReadCallback read_system_register,
+    AVZNativeSystemRegisterWriteCallback write_system_register,
+    AVZNativeSystemInstructionCallback execute_system_instruction,
+    AVZNativeExceptionReturnCallback exception_return,
+    AVZNativeSynchronousExceptionCallback synchronous_exception,
+    AVZNativeWaitCallback wait,
+    void *memory_context
+);
+AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkpointed_fast_memory(
     AVZNativeExecutionContext *context,
     AVZNativeBlockCache *cache,
     const AVZNativeBlockKey *key_template,
@@ -1195,7 +1531,9 @@ int avz_framebuffer_composite_bgra8(
     int source_is_solid,
     int bilinear_filtering,
     int component_alpha_mask,
-    int mask_is_packed_a8
+    int mask_is_packed_a8,
+    int source_is_packed_a8,
+    int destination_is_packed_a8
 );
 
 size_t avz_framebuffer_commit_dirty_tiles(

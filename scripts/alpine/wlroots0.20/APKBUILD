@@ -1,0 +1,71 @@
+# Pinecone build of Alpine's wlroots0.20 package.
+maintainer="Pinecone Project <internal@pinecone.invalid>"
+pkgname=wlroots0.20
+pkgver=0.20.2
+_pkgver=${pkgver/_/-}
+pkgrel=3
+pkgdesc="Modular Wayland compositor library with Pinecone render-pass integration"
+url="https://gitlab.freedesktop.org/wlroots/wlroots"
+license="MIT"
+arch="aarch64"
+makedepends="
+	eudev-dev
+	glslang-dev
+	hwdata-dev
+	libcap-dev
+	libdisplay-info-dev
+	libinput-dev
+	libseat-dev
+	libliftoff-dev
+	libxcb-dev
+	libxkbcommon-dev
+	lcms2-dev
+	mesa-dev
+	meson
+	ninja
+	pixman-dev
+	vulkan-loader-dev
+	wayland-dev
+	wayland-protocols
+	xcb-util-image-dev
+	xcb-util-renderutil-dev
+	xcb-util-wm-dev
+	xkeyboard-config-dev
+	xwayland-dev
+	"
+depends_dev="$pkgname=$pkgver-r$pkgrel"
+subpackages="$pkgname-dbg $pkgname-static $pkgname-dev"
+source="https://gitlab.freedesktop.org/wlroots/wlroots/-/archive/$_pkgver/wlroots-$_pkgver.tar.gz
+	e8c983808d8b98a71f991c16c24367494386958b.patch
+	wlroots-pinecone-0.20.2.patch
+	"
+builddir="$srcdir/wlroots-$_pkgver"
+options="!check"
+provides="wlroots=$pkgver-r$pkgrel"
+replaces="wlroots"
+
+dev() {
+	default_dev
+	provides="wlroots-dev=$pkgver-r$pkgrel"
+	replaces="wlroots-dev"
+}
+
+build() {
+	abuild-meson \
+		-Db_lto=true \
+		-Dexamples=false \
+		-Dcolor-management=enabled \
+		-Ddefault_library=both \
+		. build
+	meson compile -C build
+}
+
+package() {
+	DESTDIR="$pkgdir" meson install --no-rebuild -C build
+}
+
+sha512sums="
+e96523a2b215e7d1f36bbe5e7fa3e65d15cb87e2f0d9c304d3c2fdc81b0ac0c7202cd955635c01072b34e70f08c6c00fa2cde8c277bd73fcabdcb19f7b579a12  wlroots-0.20.2.tar.gz
+2eb70aa7d57fea7e7e36917d73f2a1a9b304c28a331cac32756cb61f8926c51e989887811037cfb76e29452f0dcbe61fa4980c39553c7433a6f6fc3a8b69c7d7  e8c983808d8b98a71f991c16c24367494386958b.patch
+2d1cd36e63a596e18b25554d032e792459b8314c6743486e0e68d998ac1674467b7b4ee448c6a8b70f8bb2994c60cdaee4c94d61e25ba43eb26d2664abceca99  wlroots-pinecone-0.20.2.patch
+"

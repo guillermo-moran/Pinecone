@@ -20,6 +20,8 @@ public enum PineconeGraphicsProtocol {
     public static let batchHeaderByteCount = 16
     public static let batchRecordByteCount = payloadByteCount
     public static let maximumBatchCommandCount = 64
+    public static let exactOperatorMask: UInt64 =
+        (UInt64(1) << UInt64(PineconeGraphicsBlendOperator.saturate.rawValue + 1)) - 1
 
     public static let sourceContainsAlphaFlag: UInt32 = 1 << 0
     public static let bilinearFilterFlag: UInt32 = 1 << 1
@@ -28,10 +30,13 @@ public enum PineconeGraphicsProtocol {
     public static let solidSourceFlag: UInt32 = 1 << 4
     public static let componentAlphaMaskFlag: UInt32 = 1 << 5
     public static let packedA8MaskFlag: UInt32 = 1 << 6
+    public static let packedA8SourceFlag: UInt32 = 1 << 7
+    public static let packedA8DestinationFlag: UInt32 = 1 << 8
     public static let legacySupportedFlags = sourceContainsAlphaFlag |
         bilinearFilterFlag | hasMaskFlag | solidMaskFlag
     public static let supportedFlags = legacySupportedFlags | solidSourceFlag |
-        componentAlphaMaskFlag | packedA8MaskFlag
+        componentAlphaMaskFlag | packedA8MaskFlag | packedA8SourceFlag |
+        packedA8DestinationFlag
 }
 
 /// Pixman's stable operator values used by protocol v5.
@@ -40,7 +45,35 @@ public enum PineconeGraphicsBlendOperator: UInt16, Sendable {
     case source = 0x01
     case destination = 0x02
     case sourceOver = 0x03
+    case destinationOver = 0x04
+    case sourceIn = 0x05
+    case destinationIn = 0x06
+    case sourceOut = 0x07
+    case destinationOut = 0x08
+    case sourceAtop = 0x09
+    case destinationAtop = 0x0a
+    case xor = 0x0b
     case add = 0x0c
+    case saturate = 0x0d
+}
+
+public struct PineconeGraphicsCapabilities: OptionSet, Sendable {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) {
+        self.rawValue = rawValue
+    }
+
+    public static let componentAlphaMask = Self(rawValue: 1 << 0)
+    public static let packedA8Source = Self(rawValue: 1 << 1)
+    public static let packedA8Mask = Self(rawValue: 1 << 2)
+    public static let packedA8Destination = Self(rawValue: 1 << 3)
+    public static let bilinearScaling = Self(rawValue: 1 << 4)
+    public static let orderedBatch = Self(rawValue: 1 << 5)
+    public static let all: Self = [
+        .componentAlphaMask, .packedA8Source, .packedA8Mask,
+        .packedA8Destination, .bilinearScaling, .orderedBatch,
+    ]
 }
 
 public enum PineconeGraphicsOperation: UInt16, Sendable {
@@ -95,6 +128,8 @@ public struct PineconeGraphicsCommand: Equatable, Sendable {
     public let maskAlpha: UInt8?
     public let componentAlphaMask: Bool
     public let maskIsPackedA8: Bool
+    public let sourceIsPackedA8: Bool
+    public let destinationIsPackedA8: Bool
 
     public init(
         operation: PineconeGraphicsOperation,
@@ -113,7 +148,9 @@ public struct PineconeGraphicsCommand: Equatable, Sendable {
         blendOperator: PineconeGraphicsBlendOperator? = nil,
         sourceIsSolid: Bool? = nil,
         componentAlphaMask: Bool = false,
-        maskIsPackedA8: Bool = false
+        maskIsPackedA8: Bool = false,
+        sourceIsPackedA8: Bool = false,
+        destinationIsPackedA8: Bool = false
     ) {
         self.operation = operation
         self.blendOperator = blendOperator ?? (
@@ -136,6 +173,8 @@ public struct PineconeGraphicsCommand: Equatable, Sendable {
         self.maskAlpha = maskAlpha
         self.componentAlphaMask = componentAlphaMask
         self.maskIsPackedA8 = maskIsPackedA8
+        self.sourceIsPackedA8 = sourceIsPackedA8
+        self.destinationIsPackedA8 = destinationIsPackedA8
     }
 }
 
@@ -205,6 +244,15 @@ public protocol PineconeGraphicsAccelerator: AnyObject {
     /// result means no command may have modified a destination.
     func executeBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool
 
+    /// Submits work without blocking the calling vCPU. Returning true transfers
+    /// completion ownership to the accelerator, which must invoke `completion`
+    /// exactly once after all destination writes are visible to the CPU. A
+    /// false return guarantees that no command was submitted or modified.
+    func executeBatchAsync(
+        _ workItems: [PineconeGraphicsWorkItem],
+        completion: @escaping @Sendable (Bool) -> Void
+    ) -> Bool
+
     func discardSurface(resourceID: UInt32)
     func reset()
 }
@@ -220,6 +268,13 @@ public extension PineconeGraphicsAccelerator {
             mask: item.mask,
             destination: item.destination
         )
+    }
+
+    func executeBatchAsync(
+        _ workItems: [PineconeGraphicsWorkItem],
+        completion: @escaping @Sendable (Bool) -> Void
+    ) -> Bool {
+        false
     }
 
     func discardSurface(resourceID: UInt32) {}

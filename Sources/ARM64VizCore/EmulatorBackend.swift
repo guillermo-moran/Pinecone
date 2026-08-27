@@ -51,6 +51,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     public private(set) var nativeInstructionFetchHits = 0
     public private(set) var nativeInstructionTLBHits = 0
     public private(set) var nativeInstructionTLBMisses = 0
+    public private(set) var nativeInstructionTLBHotHits = 0
+    public private(set) var nativeInstructionTLBColdMisses = 0
+    public private(set) var nativeInstructionTLBConflictMisses = 0
+    public private(set) var nativeInstructionTLBInvalidationMisses = 0
     public private(set) var nativePageTableWalks = 0
     public private(set) var nativePageTableFaults = 0
     public private(set) var nativeTranslationCallbackWalks = 0
@@ -74,10 +78,12 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     private let nativeBlockCache: OpaquePointer?
     private let nativeExecutionContext: OpaquePointer?
     private var nativeMemorySession: NativeMemorySession?
+    private var nativeDetailedMemoryStatisticsEnabled = false
+    private var nativeDirectBulkMappingEnabled = true
     private var decodedBasicBlockKeysByCodePage: [GuestAddress: Set<BasicBlockCacheKey>] = [:]
     private var codeCacheGeneration: UInt64 = 0
     private let maxBasicBlockInstructions = 32
-    private let nativeChainBlockLimit: UInt64 = 1_024
+    private let nativeChainBlockLimit: UInt64 = 262_144
     private let decodeScratch = DecodeScratch(capacity: 32)
     public init() {
         nativeBlockCache = avz_native_block_cache_create()
@@ -102,33 +108,48 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         fallbackLimit: Int = 16,
         ineligibleLimit: Int = 16
     ) -> ARM64BackendPerformanceSnapshot {
-        let unsupported = unsupportedInstructionCounts
-            .map { ARM64BackendInstructionCount(instruction: $0.key, count: $0.value) }
-            .sorted {
-                if $0.count == $1.count {
-                    return $0.instruction < $1.instruction
+        let unsupported: [ARM64BackendInstructionCount]
+        if unsupportedLimit > 0 {
+            unsupported = Array(unsupportedInstructionCounts
+                .map { ARM64BackendInstructionCount(instruction: $0.key, count: $0.value) }
+                .sorted {
+                    if $0.count == $1.count {
+                        return $0.instruction < $1.instruction
+                    }
+                    return $0.count > $1.count
                 }
-                return $0.count > $1.count
-            }
-            .prefix(max(0, unsupportedLimit))
-        let fallbackGadgets = decodedFallbackGadgetCounts
-            .map { ARM64BackendNamedCount(name: $0.key, count: $0.value) }
-            .sorted {
-                if $0.count == $1.count {
-                    return $0.name < $1.name
+                .prefix(unsupportedLimit))
+        } else {
+            unsupported = []
+        }
+        let fallbackGadgets: [ARM64BackendNamedCount]
+        if fallbackLimit > 0 {
+            fallbackGadgets = Array(decodedFallbackGadgetCounts
+                .map { ARM64BackendNamedCount(name: $0.key, count: $0.value) }
+                .sorted {
+                    if $0.count == $1.count {
+                        return $0.name < $1.name
+                    }
+                    return $0.count > $1.count
                 }
-                return $0.count > $1.count
-            }
-            .prefix(max(0, fallbackLimit))
-        let ineligibleGadgets = nativeIneligibleGadgetCounts
-            .map { ARM64BackendNamedCount(name: $0.key, count: $0.value) }
-            .sorted {
-                if $0.count == $1.count {
-                    return $0.name < $1.name
+                .prefix(fallbackLimit))
+        } else {
+            fallbackGadgets = []
+        }
+        let ineligibleGadgets: [ARM64BackendNamedCount]
+        if ineligibleLimit > 0 {
+            ineligibleGadgets = Array(nativeIneligibleGadgetCounts
+                .map { ARM64BackendNamedCount(name: $0.key, count: $0.value) }
+                .sorted {
+                    if $0.count == $1.count {
+                        return $0.name < $1.name
+                    }
+                    return $0.count > $1.count
                 }
-                return $0.count > $1.count
-            }
-            .prefix(max(0, ineligibleLimit))
+                .prefix(ineligibleLimit))
+        } else {
+            ineligibleGadgets = []
+        }
         let blockCacheStatistics = avz_native_block_cache_statistics(nativeBlockCache)
         return ARM64BackendPerformanceSnapshot(
             decodedBasicBlockExecutions: decodedBasicBlockExecutions,
@@ -156,6 +177,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             nativeInstructionFetchHits: nativeInstructionFetchHits,
             nativeInstructionTLBHits: nativeInstructionTLBHits,
             nativeInstructionTLBMisses: nativeInstructionTLBMisses,
+            nativeInstructionTLBHotHits: nativeInstructionTLBHotHits,
+            nativeInstructionTLBColdMisses: nativeInstructionTLBColdMisses,
+            nativeInstructionTLBConflictMisses: nativeInstructionTLBConflictMisses,
+            nativeInstructionTLBInvalidationMisses: nativeInstructionTLBInvalidationMisses,
             nativePageTableWalks: nativePageTableWalks,
             nativePageTableFaults: nativePageTableFaults,
             nativeTranslationCallbackWalks: nativeTranslationCallbackWalks,
@@ -179,15 +204,23 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             nativeBatchPrefetchUnused: blockCacheStatistics.batch_prefetch_unused,
             nativeBatchPrefetchLimitChanges: blockCacheStatistics.batch_prefetch_limit_changes,
             nativeBatchPrefetchLimit: blockCacheStatistics.batch_prefetch_limit,
-            nativeIneligibleGadgets: Array(ineligibleGadgets),
-            decodedFallbackGadgets: Array(fallbackGadgets),
-            unsupportedInstructions: Array(unsupported)
+            nativeIneligibleGadgets: ineligibleGadgets,
+            decodedFallbackGadgets: fallbackGadgets,
+            unsupportedInstructions: unsupported
+        )
+    }
+
+    @inline(__always)
+    public func executionTotals() -> ARM64BackendExecutionTotals {
+        ARM64BackendExecutionTotals(
+            nativeSteps: nativeBasicBlockSteps,
+            fallbackSteps: decodedBasicBlockSteps + swiftFallbackSingleInstructionSteps
         )
     }
 
     public func nativeHotPCSnapshot(
         limit: Int = 8
-    ) -> [(pc: GuestAddress, samples: UInt64, instructions: [UInt32])] {
+    ) -> [(pc: GuestAddress, samples: UInt64, linkRegister: GuestAddress, instructions: [UInt32])] {
         guard let nativeExecutionContext, limit > 0 else {
             return []
         }
@@ -213,6 +246,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             return (
                 pc: GuestAddress(entry.pc),
                 samples: entry.samples,
+                linkRegister: GuestAddress(entry.link_register),
                 instructions: Array(words.prefix(available))
             )
         }
@@ -227,6 +261,26 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             nativeExecutionContext,
             enabled ? 1 : 0
         )
+    }
+
+    public func setNativeDetailedMemoryStatisticsEnabled(_ enabled: Bool) {
+        nativeDetailedMemoryStatisticsEnabled = enabled
+        if let session = nativeMemorySession {
+            avz_native_memory_fast_path_set_detailed_statistics_enabled(
+                session.fastPath,
+                enabled ? 1 : 0
+            )
+        }
+    }
+
+    public func setNativeDirectBulkMappingEnabled(_ enabled: Bool) {
+        nativeDirectBulkMappingEnabled = enabled
+        if let session = nativeMemorySession {
+            avz_native_memory_fast_path_set_direct_bulk_mapping_enabled(
+                session.fastPath,
+                enabled ? 1 : 0
+            )
+        }
     }
 
     public func invalidateCodeCache(physicalAddress: GuestAddress, byteCount: UInt64) {
@@ -1005,7 +1059,6 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 return 0
             }
 
-            memoryContext.resetTransientState()
             let limit = min(maxSteps - totalSteps, 65_536)
             if limit == 0 {
                 shouldYield = true
@@ -1161,6 +1214,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             ttbr: 0
         )
         var physicalPage: GuestAddress = 0
+        var generation: UInt64 = 0
         var valid = false
     }
 
@@ -1169,6 +1223,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         private static let indexMask = entryCount - 1
 
         private let entries: UnsafeMutableBufferPointer<NativePageCacheEntry>
+        private var generation: UInt64 = 1
 
         init() {
             let storage = UnsafeMutablePointer<NativePageCacheEntry>.allocate(
@@ -1202,6 +1257,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         func physicalPage(for key: NativePageCacheKey) -> GuestAddress? {
             let entry = entries[index(for: key)]
             guard entry.valid,
+                  entry.generation == generation,
                   entry.key.virtualPage == key.virtualPage,
                   entry.key.access == key.access,
                   entry.key.exceptionLevel == key.exceptionLevel,
@@ -1218,13 +1274,18 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             entries[index(for: key)] = NativePageCacheEntry(
                 key: key,
                 physicalPage: physicalPage,
+                generation: generation,
                 valid: true
             )
         }
 
         func removeAll() {
-            for index in entries.indices {
-                entries[index].valid = false
+            generation &+= 1
+            if generation == 0 {
+                for index in entries.indices {
+                    entries[index].valid = false
+                }
+                generation = 1
             }
         }
     }
@@ -1539,14 +1600,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 let byte = UInt8((value >> UInt64(Int(byteOffset) * 8)) & 0xff)
 
                 if containsRAM(physicalAddress, width: 1) {
-                    let offset = Int(physicalAddress - ramBase)
-                    if let ramBytes {
-                        ramBytes[offset] = byte
-                    } else {
-                        vm.memory.withUnsafeMutableBytesWithoutDirtyTracking { ramBytes in
-                            ramBytes[offset] = byte
-                        }
-                    }
+                    try vm.memory.write8(byte, at: physicalAddress)
                     invalidatedPhysicalAddresses.append(physicalAddress)
                 } else {
                     guard !shouldBlockPinnedDeviceAccess(physicalAddress, width: .byte) else {
@@ -1558,7 +1612,6 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             }
 
             for physicalAddress in invalidatedPhysicalAddresses {
-                vm.memory.markDirty(at: physicalAddress, count: 1)
                 backend.invalidateCodeCache(physicalAddress: physicalAddress, byteCount: 1)
             }
             if !invalidatedPhysicalAddresses.isEmpty {
@@ -1950,6 +2003,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         var instructionFetchHits: UInt64 = 0
         var instructionTLBHits: UInt64 = 0
         var instructionTLBMisses: UInt64 = 0
+        var instructionTLBHotHits: UInt64 = 0
+        var instructionTLBColdMisses: UInt64 = 0
+        var instructionTLBConflictMisses: UInt64 = 0
+        var instructionTLBInvalidationMisses: UInt64 = 0
         var pageTableWalks: UInt64 = 0
         var pageTableFaults: UInt64 = 0
         var translationCallbackWalks: UInt64 = 0
@@ -1968,6 +2025,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             instructionFetchHits = statistics.instruction_fetch_hits
             instructionTLBHits = statistics.instruction_tlb_hits
             instructionTLBMisses = statistics.instruction_tlb_misses
+            instructionTLBHotHits = statistics.instruction_tlb_hot_hits
+            instructionTLBColdMisses = statistics.instruction_tlb_cold_misses
+            instructionTLBConflictMisses = statistics.instruction_tlb_conflict_misses
+            instructionTLBInvalidationMisses = statistics.instruction_tlb_invalidation_misses
             pageTableWalks = statistics.native_page_table_walks
             pageTableFaults = statistics.native_page_table_faults
             translationCallbackWalks = statistics.translation_callback_walks
@@ -1986,6 +2047,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             result.instructionFetchHits = instructionFetchHits &- previous.instructionFetchHits
             result.instructionTLBHits = instructionTLBHits &- previous.instructionTLBHits
             result.instructionTLBMisses = instructionTLBMisses &- previous.instructionTLBMisses
+            result.instructionTLBHotHits = instructionTLBHotHits &- previous.instructionTLBHotHits
+            result.instructionTLBColdMisses = instructionTLBColdMisses &- previous.instructionTLBColdMisses
+            result.instructionTLBConflictMisses = instructionTLBConflictMisses &- previous.instructionTLBConflictMisses
+            result.instructionTLBInvalidationMisses = instructionTLBInvalidationMisses &- previous.instructionTLBInvalidationMisses
             result.pageTableWalks = pageTableWalks &- previous.pageTableWalks
             result.pageTableFaults = pageTableFaults &- previous.pageTableFaults
             result.translationCallbackWalks = translationCallbackWalks &- previous.translationCallbackWalks
@@ -2076,6 +2141,14 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             avz_native_memory_fast_path_destroy(fastPath)
             return nil
         }
+        avz_native_memory_fast_path_set_detailed_statistics_enabled(
+            fastPath,
+            nativeDetailedMemoryStatisticsEnabled ? 1 : 0
+        )
+        avz_native_memory_fast_path_set_direct_bulk_mapping_enabled(
+            fastPath,
+            nativeDirectBulkMappingEnabled ? 1 : 0
+        )
         memoryContext.fastPath = fastPath
         avz_native_memory_fast_path_set_instruction_translator(
             fastPath,
@@ -2112,6 +2185,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         nativeInstructionFetchHits += Int(clamping: statistics.instructionFetchHits)
         nativeInstructionTLBHits += Int(clamping: statistics.instructionTLBHits)
         nativeInstructionTLBMisses += Int(clamping: statistics.instructionTLBMisses)
+        nativeInstructionTLBHotHits += Int(clamping: statistics.instructionTLBHotHits)
+        nativeInstructionTLBColdMisses += Int(clamping: statistics.instructionTLBColdMisses)
+        nativeInstructionTLBConflictMisses += Int(clamping: statistics.instructionTLBConflictMisses)
+        nativeInstructionTLBInvalidationMisses += Int(clamping: statistics.instructionTLBInvalidationMisses)
         nativePageTableWalks += Int(clamping: statistics.pageTableWalks)
         nativePageTableFaults += Int(clamping: statistics.pageTableFaults)
         nativeTranslationCallbackWalks += Int(clamping: statistics.translationCallbackWalks)
@@ -2534,6 +2611,18 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
     }
 
+    @inline(__always)
+    private func nativeInstructionRequiresSharedExclusiveMemory(_ kind: UInt16) -> Bool {
+        switch Int(kind) {
+        case AVZ_NATIVE_OP_LOAD_ACQUIRE_STORE_RELEASE,
+             AVZ_NATIVE_OP_LOAD_STORE_EXCLUSIVE,
+             AVZ_NATIVE_OP_LOAD_STORE_EXCLUSIVE_PAIR:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func coalescedCodeRanges(_ ranges: [CodeCachePhysicalRange]) -> [CodeCachePhysicalRange] {
         guard !ranges.isEmpty else {
             return []
@@ -2607,6 +2696,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         var pstate = vm.cpu.pstate
         var halted: UInt8 = vm.cpu.halted ? 1 : 0
         var exclusiveAddress = vm.cpu.exclusiveReservationAddress ?? 0
+        var exclusiveGeneration = vm.cpu.exclusiveReservationGeneration ?? 0
         var exclusiveSize = UInt8(vm.cpu.exclusiveReservationSize ?? 0)
         var exclusiveValid: UInt8 = vm.cpu.exclusiveReservationAddress == nil ? 0 : 1
 
@@ -2620,6 +2710,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             pc: &pc,
             pstate: &pstate,
             exclusiveAddress: &exclusiveAddress,
+            exclusiveGeneration: &exclusiveGeneration,
             exclusiveSize: &exclusiveSize,
             exclusiveValid: &exclusiveValid,
             halted: &halted
@@ -2638,9 +2729,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if exclusiveValid != 0 {
             vm.cpu.exclusiveReservationAddress = exclusiveAddress
             vm.cpu.exclusiveReservationSize = Int(exclusiveSize)
+            vm.cpu.exclusiveReservationGeneration = exclusiveGeneration
         } else {
             vm.cpu.exclusiveReservationAddress = nil
             vm.cpu.exclusiveReservationSize = nil
+            vm.cpu.exclusiveReservationGeneration = nil
         }
         vm.cpu.halted = halted != 0
         if let fault = outcome.translationFault {
@@ -2660,6 +2753,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         pc: inout UInt64,
         pstate: inout UInt64,
         exclusiveAddress: inout UInt64,
+        exclusiveGeneration: inout UInt64,
         exclusiveSize: inout UInt8,
         exclusiveValid: inout UInt8,
         halted: inout UInt8
@@ -2791,7 +2885,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         registers.withUnsafeBufferPointer { registerBuffer in
             vectorLows.withUnsafeBufferPointer { lowBuffer in
                 vectorHighs.withUnsafeBufferPointer { highBuffer in
-                    avz_native_execution_context_load(
+                    avz_native_execution_context_load_with_exclusive_generation(
                         nativeExecutionContext,
                         registerBuffer.baseAddress,
                         lowBuffer.baseAddress,
@@ -2802,6 +2896,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                         fpcr,
                         fpsr,
                         exclusiveAddress,
+                        exclusiveGeneration,
                         exclusiveSize,
                         exclusiveValid,
                         halted
@@ -2815,7 +2910,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     registers.withUnsafeMutableBufferPointer { registerBuffer in
                         vectorLows.withUnsafeMutableBufferPointer { lowBuffer in
                             vectorHighs.withUnsafeMutableBufferPointer { highBuffer in
-                                avz_native_execution_context_store(
+                                avz_native_execution_context_store_with_exclusive_generation(
                                     nativeExecutionContext,
                                     registerBuffer.baseAddress,
                                     lowBuffer.baseAddress,
@@ -2826,6 +2921,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                                     &fpcr,
                                     &fpsr,
                                     &exclusiveAddress,
+                                    &exclusiveGeneration,
                                     &exclusiveSize,
                                     &exclusiveValid,
                                     &halted
@@ -2855,7 +2951,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     )
                     let nativeStepLimit = nativeStepLimitBeforeTimerDeadline(
                         vm,
-                        requestedSteps: min(maxSteps - totalSteps, 16_384),
+                        requestedSteps: min(maxSteps - totalSteps, 65_536),
                         pstate: residentPState
                     )
                     guard nativeStepLimit > 0 else {
@@ -2876,7 +2972,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                         hostPreemptionGeneration: hostPreemptionGeneration
                     )
                     let nativeStart = collectPerformanceTimings ? DispatchTime.now().uptimeNanoseconds : 0
-                    let result = avz_native_execution_context_run_cached_chain_checkpointed(
+                    let result = avz_native_execution_context_run_cached_chain_checkpointed_fast_memory(
                         nativeExecutionContext,
                         nativeBlockCache,
                         &blockKey,
@@ -2972,6 +3068,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     pc: pc,
                     pstate: livePState,
                     exclusiveAddress: exclusiveAddress,
+                    exclusiveGeneration: exclusiveGeneration,
                     exclusiveSize: exclusiveSize,
                     exclusiveValid: exclusiveValid,
                     halted: halted
@@ -2993,6 +3090,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     pc: &pc,
                     pstate: &livePState,
                     exclusiveAddress: &exclusiveAddress,
+                    exclusiveGeneration: &exclusiveGeneration,
                     exclusiveSize: &exclusiveSize,
                     exclusiveValid: &exclusiveValid,
                     halted: &halted
@@ -3001,7 +3099,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 registers.withUnsafeBufferPointer { registerBuffer in
                     vectorLows.withUnsafeBufferPointer { lowBuffer in
                         vectorHighs.withUnsafeBufferPointer { highBuffer in
-                            avz_native_execution_context_load(
+                            avz_native_execution_context_load_with_exclusive_generation(
                                 nativeExecutionContext,
                                 registerBuffer.baseAddress,
                                 lowBuffer.baseAddress,
@@ -3012,6 +3110,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                                 fpcr,
                                 fpsr,
                                 exclusiveAddress,
+                                exclusiveGeneration,
                                 exclusiveSize,
                                 exclusiveValid,
                                 halted
@@ -3056,6 +3155,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         pc: UInt64,
         pstate: UInt64,
         exclusiveAddress: UInt64,
+        exclusiveGeneration: UInt64,
         exclusiveSize: UInt8,
         exclusiveValid: UInt8,
         halted: UInt8
@@ -3070,9 +3170,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if exclusiveValid != 0 {
             vm.cpu.exclusiveReservationAddress = exclusiveAddress
             vm.cpu.exclusiveReservationSize = Int(exclusiveSize)
+            vm.cpu.exclusiveReservationGeneration = exclusiveGeneration
         } else {
             vm.cpu.exclusiveReservationAddress = nil
             vm.cpu.exclusiveReservationSize = nil
+            vm.cpu.exclusiveReservationGeneration = nil
         }
         vm.cpu.halted = halted != 0
     }
@@ -3086,6 +3188,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         pc: inout UInt64,
         pstate: inout UInt64,
         exclusiveAddress: inout UInt64,
+        exclusiveGeneration: inout UInt64,
         exclusiveSize: inout UInt8,
         exclusiveValid: inout UInt8,
         halted: inout UInt8
@@ -3099,10 +3202,12 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if let reservedAddress = vm.cpu.exclusiveReservationAddress,
            let reservedSize = vm.cpu.exclusiveReservationSize {
             exclusiveAddress = reservedAddress
+            exclusiveGeneration = vm.cpu.exclusiveReservationGeneration ?? 0
             exclusiveSize = UInt8(reservedSize)
             exclusiveValid = 1
         } else {
             exclusiveAddress = 0
+            exclusiveGeneration = 0
             exclusiveSize = 0
             exclusiveValid = 0
         }
@@ -3129,6 +3234,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         var pstate = vm.cpu.pstate
         var halted: UInt8 = vm.cpu.halted ? 1 : 0
         var exclusiveAddress = vm.cpu.exclusiveReservationAddress ?? 0
+        var exclusiveGeneration = vm.cpu.exclusiveReservationGeneration ?? 0
         var exclusiveSize = UInt8(vm.cpu.exclusiveReservationSize ?? 0)
         var exclusiveValid: UInt8 = vm.cpu.exclusiveReservationAddress == nil ? 0 : 1
         let nativeStepLimit = nativeStepLimitBeforeTimerDeadline(vm, requestedSteps: maxSteps)
@@ -3137,12 +3243,16 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
 
         let nativeStart = collectPerformanceTimings ? DispatchTime.now().uptimeNanoseconds : 0
-        let memoryContext = NativeMemoryContext(
-            backend: self,
-            vm: vm,
-            ramBytes: nil,
-            translatedPageCache: NativeTranslatedPageCache()
-        )
+        guard let memorySession = memorySession(for: vm) else {
+            return nil
+        }
+        let memoryContext = memorySession.memoryContext
+        memorySession.pstateBox.value = pstate
+        memoryContext.resetTransientState()
+        memoryContext.syncNativeTranslationState()
+        defer {
+            recordNativeMemoryStatistics(memorySession.takeStatisticsDelta())
+        }
         let result = block.nativeInstructions.withUnsafeBufferPointer { instructionBuffer in
             registers.withUnsafeMutableBufferPointer { registerBuffer in
                 runNativeDecodedBlock(
@@ -3157,6 +3267,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     pc: &pc,
                     pstate: &pstate,
                     exclusiveAddress: &exclusiveAddress,
+                    exclusiveGeneration: &exclusiveGeneration,
                     exclusiveSize: &exclusiveSize,
                     exclusiveValid: &exclusiveValid,
                     halted: &halted,
@@ -3191,9 +3302,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if exclusiveValid != 0 {
             vm.cpu.exclusiveReservationAddress = exclusiveAddress
             vm.cpu.exclusiveReservationSize = Int(exclusiveSize)
+            vm.cpu.exclusiveReservationGeneration = exclusiveGeneration
         } else {
             vm.cpu.exclusiveReservationAddress = nil
             vm.cpu.exclusiveReservationSize = nil
+            vm.cpu.exclusiveReservationGeneration = nil
         }
         vm.cpu.halted = halted != 0
         if let nativeTranslationFault {
@@ -3286,6 +3399,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         pc: inout UInt64,
         pstate: inout UInt64,
         exclusiveAddress: inout UInt64,
+        exclusiveGeneration: inout UInt64,
         exclusiveSize: inout UInt8,
         exclusiveValid: inout UInt8,
         halted: inout UInt8,
@@ -3347,6 +3461,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                         &fpcr,
                         &fpsr,
                         &exclusiveAddress,
+                        &exclusiveGeneration,
                         &exclusiveSize,
                         &exclusiveValid,
                         &halted,
@@ -3379,6 +3494,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 &fpcr,
                 &fpsr,
                 &exclusiveAddress,
+                &exclusiveGeneration,
                 &exclusiveSize,
                 &exclusiveValid,
                 &halted,
@@ -4018,15 +4134,35 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         var nativePC = pc
         var pstate = vm.cpu.pstate
         var exclusiveAddress = vm.cpu.exclusiveReservationAddress ?? 0
+        var exclusiveGeneration = vm.cpu.exclusiveReservationGeneration ?? 0
         var exclusiveSize = UInt8(vm.cpu.exclusiveReservationSize ?? 0)
         var exclusiveValid: UInt8 = vm.cpu.exclusiveReservationAddress == nil ? 0 : 1
         var halted: UInt8 = vm.cpu.halted ? 1 : 0
-        let memoryContext = NativeMemoryContext(
-            backend: self,
-            vm: vm,
-            ramBytes: nil,
-            translatedPageCache: NativeTranslatedPageCache()
-        )
+        let sharedMemorySession: NativeMemorySession?
+        let memoryContext: NativeMemoryContext
+        if nativeInstructionRequiresSharedExclusiveMemory(cachedNative.nativeInstruction.kind) {
+            guard let session = memorySession(for: vm) else {
+                return false
+            }
+            sharedMemorySession = session
+            memoryContext = session.memoryContext
+            session.pstateBox.value = pstate
+        } else {
+            sharedMemorySession = nil
+            memoryContext = NativeMemoryContext(
+                backend: self,
+                vm: vm,
+                ramBytes: nil,
+                translatedPageCache: NativeTranslatedPageCache()
+            )
+        }
+        memoryContext.resetTransientState()
+        memoryContext.syncNativeTranslationState()
+        defer {
+            if let sharedMemorySession {
+                recordNativeMemoryStatistics(sharedMemorySession.takeStatisticsDelta())
+            }
+        }
 
         vm.recordInstruction(pc: pc, instruction: instruction)
         let result = nativeInstructions.withUnsafeBufferPointer { instructionBuffer in
@@ -4043,6 +4179,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     pc: &nativePC,
                     pstate: &pstate,
                     exclusiveAddress: &exclusiveAddress,
+                    exclusiveGeneration: &exclusiveGeneration,
                     exclusiveSize: &exclusiveSize,
                     exclusiveValid: &exclusiveValid,
                     halted: &halted,
@@ -4068,9 +4205,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if exclusiveValid != 0 {
             vm.cpu.exclusiveReservationAddress = exclusiveAddress
             vm.cpu.exclusiveReservationSize = Int(exclusiveSize)
+            vm.cpu.exclusiveReservationGeneration = exclusiveGeneration
         } else {
             vm.cpu.exclusiveReservationAddress = nil
             vm.cpu.exclusiveReservationSize = nil
+            vm.cpu.exclusiveReservationGeneration = nil
         }
         vm.cpu.halted = halted != 0
 
@@ -6330,6 +6469,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         ))
 
         vm.switchActiveStackPointer(from: previousPState, to: newPState)
+        vm.clearExclusiveReservation()
         vm.cpu.pstate = newPState
         vm.cpu.pc = vectorAddress
     }
@@ -6394,6 +6534,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         ))
 
         vm.switchActiveStackPointer(from: previousPState, to: newPState)
+        vm.clearExclusiveReservation()
         vm.cpu.pstate = newPState
         vm.cpu.pc = vectorAddress
     }
@@ -8633,22 +8774,31 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         do {
             if isLoad {
                 let physicalAddress = try vm.translateAddress(address, access: .dataRead)
-                writeRegister(vm, rt, try vm.readPhysical(physicalAddress, width: width))
+                let reservation = try vm.memory.exclusiveRead(
+                    at: physicalAddress,
+                    width: width
+                )
+                writeRegister(vm, rt, reservation.value)
                 vm.cpu.exclusiveReservationAddress = physicalAddress
                 vm.cpu.exclusiveReservationSize = width.rawValue
+                vm.cpu.exclusiveReservationGeneration = reservation.generation
             } else {
                 let physicalAddress = try vm.translateAddress(address, access: .dataWrite)
                 let reservationMatches = vm.cpu.exclusiveReservationAddress == physicalAddress &&
-                    vm.cpu.exclusiveReservationSize == width.rawValue
+                    vm.cpu.exclusiveReservationSize == width.rawValue &&
+                    vm.cpu.exclusiveReservationGeneration != nil
 
-                if reservationMatches {
-                    try vm.writePhysical(
-                        physicalAddress,
+                let stored = if reservationMatches {
+                    try vm.memory.exclusiveWrite(
+                        readRegister(vm, rt) & maskForBits(width.rawValue * 8),
+                        at: physicalAddress,
                         width: width,
-                        value: readRegister(vm, rt) & maskForBits(width.rawValue * 8)
+                        expectedGeneration: vm.cpu.exclusiveReservationGeneration!
                     )
+                } else {
+                    false
                 }
-                writeRegister(vm, rs, reservationMatches ? 0 : 1)
+                writeRegister(vm, rs, stored ? 0 : 1)
                 vm.clearExclusiveReservation()
             }
             vm.cpu.pc = pc + 4
@@ -8682,22 +8832,43 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             if isLoad {
                 let firstPhysicalAddress = try vm.translateAddress(address, access: .dataRead)
                 let secondPhysicalAddress = try vm.translateAddress(address &+ stride, access: .dataRead)
-                writeRegister(vm, rt, try vm.readPhysical(firstPhysicalAddress, width: width))
-                writeRegister(vm, rt2, try vm.readPhysical(secondPhysicalAddress, width: width))
+                guard secondPhysicalAddress == firstPhysicalAddress &+ stride else {
+                    throw VMError.invalidMemoryAccess(
+                        address: secondPhysicalAddress,
+                        width: width.rawValue
+                    )
+                }
+                let reservation = try vm.memory.exclusiveReadPair(
+                    at: firstPhysicalAddress,
+                    width: width
+                )
+                writeRegister(vm, rt, reservation.first)
+                writeRegister(vm, rt2, reservation.second)
                 vm.cpu.exclusiveReservationAddress = firstPhysicalAddress
                 vm.cpu.exclusiveReservationSize = reservationSize
+                vm.cpu.exclusiveReservationGeneration = reservation.generation
             } else {
                 let firstPhysicalAddress = try vm.translateAddress(address, access: .dataWrite)
                 let secondPhysicalAddress = try vm.translateAddress(address &+ stride, access: .dataWrite)
                 let reservationMatches = vm.cpu.exclusiveReservationAddress == firstPhysicalAddress &&
-                    vm.cpu.exclusiveReservationSize == reservationSize
+                    vm.cpu.exclusiveReservationSize == reservationSize &&
+                    vm.cpu.exclusiveReservationGeneration != nil &&
+                    secondPhysicalAddress == firstPhysicalAddress &+ stride
 
+                let stored: Bool
                 if reservationMatches {
                     let mask = maskForBits(width.rawValue * 8)
-                    try vm.writePhysical(firstPhysicalAddress, width: width, value: readRegister(vm, rt) & mask)
-                    try vm.writePhysical(secondPhysicalAddress, width: width, value: readRegister(vm, rt2) & mask)
+                    stored = try vm.memory.exclusiveWritePair(
+                        first: readRegister(vm, rt) & mask,
+                        second: readRegister(vm, rt2) & mask,
+                        at: firstPhysicalAddress,
+                        width: width,
+                        expectedGeneration: vm.cpu.exclusiveReservationGeneration!
+                    )
+                } else {
+                    stored = false
                 }
-                writeRegister(vm, rs, reservationMatches ? 0 : 1)
+                writeRegister(vm, rs, stored ? 0 : 1)
                 vm.clearExclusiveReservation()
             }
             vm.cpu.pc = pc + 4

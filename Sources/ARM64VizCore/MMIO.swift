@@ -1,4 +1,36 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+private final class MMIOVCPUContext {
+    private var key = pthread_key_t()
+
+    init() {
+        precondition(pthread_key_create(&key, nil) == 0)
+    }
+
+    deinit {
+        pthread_key_delete(key)
+    }
+
+    @inline(__always)
+    var current: Int {
+        guard let encoded = pthread_getspecific(key) else { return 0 }
+        return Int(bitPattern: encoded) - 1
+    }
+
+    @inline(__always)
+    func withValue<T>(_ vcpuID: Int, _ body: () throws -> T) rethrows -> T {
+        let previous = pthread_getspecific(key)
+        let encoded = UnsafeMutableRawPointer(bitPattern: max(0, vcpuID) + 1)
+        pthread_setspecific(key, encoded)
+        defer { pthread_setspecific(key, previous) }
+        return try body()
+    }
+}
 
 public protocol MMIODevice: AnyObject {
     var name: String { get }
@@ -12,7 +44,7 @@ public protocol MMIODevice: AnyObject {
 public final class MMIOBus {
     private let lock = NSRecursiveLock()
     private var devices: [MMIODevice] = []
-    private var callingVCPUID = 0
+    private let vcpuContext = MMIOVCPUContext()
 
     public init() {}
 
@@ -42,15 +74,19 @@ public final class MMIOBus {
         width: MMIOWidth,
         targetVCPU: Int = 0
     ) throws -> UInt64 {
+        let target: MMIODevice
         lock.lock()
-        defer { lock.unlock() }
-        guard let target = device(containing: address, width: width) else {
+        guard let resolved = devices.first(where: {
+            $0.range.contains(address, width: UInt64(width.rawValue))
+        }) else {
+            lock.unlock()
             throw VMError.invalidMMIOAccess(address: address, width: width.rawValue)
         }
-        let previousVCPUID = callingVCPUID
-        callingVCPUID = targetVCPU
-        defer { callingVCPUID = previousVCPUID }
-        return try target.read(offset: address - target.range.start, width: width)
+        target = resolved
+        lock.unlock()
+        return try vcpuContext.withValue(targetVCPU) {
+            try target.read(offset: address - target.range.start, width: width)
+        }
     }
 
     public func write(
@@ -59,27 +95,34 @@ public final class MMIOBus {
         value: UInt64,
         targetVCPU: Int = 0
     ) throws {
+        let target: MMIODevice
         lock.lock()
-        defer { lock.unlock() }
-        guard let target = device(containing: address, width: width) else {
+        guard let resolved = devices.first(where: {
+            $0.range.contains(address, width: UInt64(width.rawValue))
+        }) else {
+            lock.unlock()
             throw VMError.invalidMMIOAccess(address: address, width: width.rawValue)
         }
-        let previousVCPUID = callingVCPUID
-        callingVCPUID = targetVCPU
-        defer { callingVCPUID = previousVCPUID }
-        try target.write(offset: address - target.range.start, width: width, value: value)
+        target = resolved
+        lock.unlock()
+        try vcpuContext.withValue(targetVCPU) {
+            try target.write(
+                offset: address - target.range.start,
+                width: width,
+                value: value
+            )
+        }
     }
 
     public var currentVCPUID: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return callingVCPUID
+        vcpuContext.current
     }
 
     public func reset() {
         lock.lock()
-        defer { lock.unlock() }
-        for device in devices {
+        let registeredDevices = devices
+        lock.unlock()
+        for device in registeredDevices {
             device.reset()
         }
     }

@@ -1875,6 +1875,9 @@ public final class VirtualVirtIODevice: MMIODevice {
     private var touchContactActive = false
     private var nextTouchTrackingID: Int32 = 0
     private let gpu: VirtIOGPUDevice?
+    private var pendingGPUQueueCounts: [UInt32: Int] = [:]
+
+    private static let maximumInFlightGPUCommands = 3
 
     public private(set) var lastNotifiedQueue: UInt32?
     public private(set) var completedBlockRequests: Int = 0
@@ -1891,6 +1894,29 @@ public final class VirtualVirtIODevice: MMIODevice {
 
     public var pendingInputEventCount: Int {
         withDeviceLock { max(0, pendingInputEvents.count - pendingInputReadIndex) }
+    }
+
+    public var deliveredInputFrameCount: Int {
+        withDeviceLock { inputFramesDelivered }
+    }
+
+    public var generatedInputFrameCount: Int {
+        withDeviceLock { inputFramesGenerated }
+    }
+
+    public var inputFrameDeliveryProgress: (delivered: Int, target: Int) {
+        withDeviceLock {
+            let pendingFrames = pendingInputEvents[pendingInputReadIndex...]
+                .reduce(into: 0) { count, event in
+                    if event.type == 0, event.code == 0 {
+                        count += 1
+                    }
+                }
+            return (
+                delivered: inputFramesDelivered,
+                target: inputFramesDelivered + pendingFrames
+            )
+        }
     }
 
     public var inputDiagnostics: String {
@@ -1985,10 +2011,26 @@ public final class VirtualVirtIODevice: MMIODevice {
     }
 
     public func enqueueTouch(x: UInt32, y: UInt32, isDown: Bool) {
+        enqueueTouches([TouchEvent(x: x, y: y, isDown: isDown)])
+    }
+
+    public func enqueueTouches(_ touches: [TouchEvent]) {
+        guard !touches.isEmpty else { return }
         withDeviceLock {
         guard kind == .input, inputRole == .touchscreen else {
             return
         }
+        for touch in touches {
+            appendTouchLocked(x: touch.x, y: touch.y, isDown: touch.isDown)
+        }
+        if ((try? processInputEventQueue()) ?? 0) > 0 {
+            interruptStatus |= Self.usedBufferInterrupt
+            updateInterruptLine()
+        }
+        }
+    }
+
+    private func appendTouchLocked(x: UInt32, y: UInt32, isDown: Bool) {
         inputSamplesReceived += 1
         let clampedX = Int32(clamping: min(x, inputMaximumX))
         let clampedY = Int32(clamping: min(y, inputMaximumY))
@@ -2038,11 +2080,6 @@ public final class VirtualVirtIODevice: MMIODevice {
             ])
             inputFramesGenerated += 1
             touchContactActive = false
-        }
-        if ((try? processInputEventQueue()) ?? 0) > 0 {
-            interruptStatus |= Self.usedBufferInterrupt
-            updateInterruptLine()
-        }
         }
     }
 
@@ -2102,6 +2139,13 @@ public final class VirtualVirtIODevice: MMIODevice {
     ) -> VirtualFramebufferFrameMetadata? {
         guard kind == .gpu else { return nil }
         return gpu?.withFrameBytes(afterGeneration: previousGeneration, body)
+    }
+
+    public func displayFrameLease(
+        afterGeneration previousGeneration: UInt64? = nil
+    ) -> VirtualFramebufferFrameLease? {
+        guard kind == .gpu else { return nil }
+        return gpu?.frameLease(afterGeneration: previousGeneration)
     }
 
     public var displayGeneration: UInt64? {
@@ -2231,7 +2275,7 @@ public final class VirtualVirtIODevice: MMIODevice {
     }
 
     public func write(offset: UInt64, width: MMIOWidth, value: UInt64) throws {
-        withDeviceLock {
+        try withDeviceLock {
         switch offset {
         case 0x014:
             selectedDeviceFeatures = UInt32(value & 0xffff_ffff)
@@ -2244,7 +2288,11 @@ public final class VirtualVirtIODevice: MMIODevice {
         case 0x038:
             updateSelectedQueue { $0.size = UInt32(value & 0xffff) }
         case 0x044:
-            updateSelectedQueue { $0.ready = (value & 1) != 0 }
+            let ready = (value & 1) != 0
+            if ready {
+                try registerSelectedQueueMemory()
+            }
+            updateSelectedQueue { $0.ready = ready }
         case 0x050:
             notify(queue: UInt32(value & 0xffff))
         case 0x064:
@@ -2315,6 +2363,7 @@ public final class VirtualVirtIODevice: MMIODevice {
         pendingTouchMoveStart = nil
         touchContactActive = false
         nextTouchTrackingID = 0
+        pendingGPUQueueCounts.removeAll(keepingCapacity: true)
         gpu?.reset()
         updateInterruptLine()
     }
@@ -2350,13 +2399,19 @@ public final class VirtualVirtIODevice: MMIODevice {
 
     private func processGPUQueue(_ queue: UInt32) throws -> Int {
         guard var state = queues[queue], state.ready, state.size > 0,
-              let memory, let gpu else {
+              let memory, let gpu,
+              pendingGPUQueueCounts[queue, default: 0] <
+                Self.maximumInFlightGPUCommands else {
             return 0
         }
-        let availableIndex = try readMemory16(memory, at: state.driverAddress + 2)
+        let availableIndex = try readMemory16Acquire(memory, at: state.driverAddress + 2)
         let initialDisplayGeneration = gpu.generation
         var completed = 0
         while state.lastAvailableIndex != availableIndex {
+            if pendingGPUQueueCounts[queue, default: 0] >=
+                Self.maximumInFlightGPUCommands {
+                break
+            }
             let ringOffset = UInt64(4 + (UInt32(state.lastAvailableIndex) % state.size) * 2)
             let descriptorIndex = try readMemory16(memory, at: state.driverAddress + ringOffset)
             let descriptors = try descriptorChain(startingAt: descriptorIndex, queueState: state, memory: memory)
@@ -2379,9 +2434,45 @@ public final class VirtualVirtIODevice: MMIODevice {
             var requestOffset = 0
             for descriptor in requestDescriptors {
                 let count = Int(descriptor.length)
-                try memory.copyBytes(from: descriptor.address, count: count, to: &request, destinationOffset: requestOffset)
+                try memory.copyOwnedDeviceBytes(
+                    from: descriptor.address,
+                    count: count,
+                    to: &request,
+                    destinationOffset: requestOffset
+                )
                 requestOffset += count
             }
+            if queue == VirtIOGPUDevice.controlQueue {
+                let synchronousState = state
+                state.lastAvailableIndex &+= 1
+                let deferredQueueState = state
+                queues[queue] = state
+                pendingGPUQueueCounts[queue, default: 0] += 1
+                if gpu.processDeferred(
+                    request: request,
+                    memory: memory,
+                    completion: { [weak self] response in
+                        self?.completeDeferredGPUCommand(
+                            queue: queue,
+                            descriptorIndex: descriptorIndex,
+                            responseDescriptors: responseDescriptors,
+                            queueState: deferredQueueState,
+                            response: response
+                        )
+                    }
+                ) {
+                    continue
+                }
+                let pendingCount = pendingGPUQueueCounts[queue, default: 0]
+                if pendingCount <= 1 {
+                    pendingGPUQueueCounts.removeValue(forKey: queue)
+                } else {
+                    pendingGPUQueueCounts[queue] = pendingCount - 1
+                }
+                queues[queue] = synchronousState
+                state = synchronousState
+            }
+
             let response = gpu.process(request: request, memory: memory)
             var usedLength: UInt32 = 0
             if queue == VirtIOGPUDevice.controlQueue {
@@ -2392,7 +2483,12 @@ public final class VirtualVirtIODevice: MMIODevice {
                 var responseOffset = 0
                 for descriptor in responseDescriptors where responseOffset < response.count {
                     let count = min(Int(descriptor.length), response.count - responseOffset)
-                    try memory.copyBytes(from: response, sourceOffset: responseOffset, count: count, to: descriptor.address)
+                    try memory.copyOwnedDeviceBytes(
+                        from: response,
+                        sourceOffset: responseOffset,
+                        count: count,
+                        to: descriptor.address
+                    )
                     responseOffset += count
                 }
                 usedLength = UInt32(response.count)
@@ -2414,6 +2510,62 @@ public final class VirtualVirtIODevice: MMIODevice {
         return completed
     }
 
+    private func completeDeferredGPUCommand(
+        queue: UInt32,
+        descriptorIndex: UInt16,
+        responseDescriptors: [VirtIODescriptor],
+        queueState: VirtIOQueueState,
+        response: [UInt8]
+    ) {
+        withDeviceLock {
+            guard let pendingCount = pendingGPUQueueCounts[queue],
+                  pendingCount > 0, let memory else {
+                return
+            }
+            if pendingCount == 1 {
+                pendingGPUQueueCounts.removeValue(forKey: queue)
+            } else {
+                pendingGPUQueueCounts[queue] = pendingCount - 1
+            }
+            do {
+                let responseCapacity = responseDescriptors.reduce(0) {
+                    $0 + Int($1.length)
+                }
+                guard response.count <= responseCapacity else {
+                    throw VMError.deviceError(
+                        "\(name) deferred GPU response descriptor is too small"
+                    )
+                }
+                var responseOffset = 0
+                for descriptor in responseDescriptors where responseOffset < response.count {
+                    let count = min(
+                        Int(descriptor.length),
+                        response.count - responseOffset
+                    )
+                    try memory.copyOwnedDeviceBytes(
+                        from: response,
+                        sourceOffset: responseOffset,
+                        count: count,
+                        to: descriptor.address
+                    )
+                    responseOffset += count
+                }
+                try publishUsedElement(
+                    descriptorIndex: descriptorIndex,
+                    usedLength: UInt32(response.count),
+                    queueState: queueState,
+                    memory: memory
+                )
+                interruptStatus |= Self.usedBufferInterrupt
+                _ = try processGPUQueue(queue)
+                updateInterruptLine()
+            } catch {
+                interruptStatus |= Self.usedBufferInterrupt
+                updateInterruptLine()
+            }
+        }
+    }
+
     private func processInputEventQueue() throws -> Int {
         guard pendingInputReadIndex < pendingInputEvents.count else {
             return 0
@@ -2425,7 +2577,7 @@ public final class VirtualVirtIODevice: MMIODevice {
         guard let memory else {
             return 0
         }
-        let availableIndex = try readMemory16(memory, at: state.driverAddress + 2)
+        let availableIndex = try readMemory16Acquire(memory, at: state.driverAddress + 2)
         if state.lastAvailableIndex == availableIndex {
             inputQueueStarvations += 1
         }
@@ -2443,9 +2595,22 @@ public final class VirtualVirtIODevice: MMIODevice {
             if let moveStart = pendingTouchMoveStart, pendingInputReadIndex > moveStart {
                 pendingTouchMoveStart = nil
             }
-            try writeMemory16(event.type, at: target.address, memory: memory)
-            try writeMemory16(event.code, at: target.address + 2, memory: memory)
-            try writeMemory32(UInt32(bitPattern: event.value), at: target.address + 4, memory: memory)
+            var eventBytes = [UInt8](repeating: 0, count: 8)
+            eventBytes[0] = UInt8(truncatingIfNeeded: event.type)
+            eventBytes[1] = UInt8(truncatingIfNeeded: event.type >> 8)
+            eventBytes[2] = UInt8(truncatingIfNeeded: event.code)
+            eventBytes[3] = UInt8(truncatingIfNeeded: event.code >> 8)
+            let eventValue = UInt32(bitPattern: event.value)
+            eventBytes[4] = UInt8(truncatingIfNeeded: eventValue)
+            eventBytes[5] = UInt8(truncatingIfNeeded: eventValue >> 8)
+            eventBytes[6] = UInt8(truncatingIfNeeded: eventValue >> 16)
+            eventBytes[7] = UInt8(truncatingIfNeeded: eventValue >> 24)
+            try memory.copyOwnedDeviceBytes(
+                from: eventBytes,
+                sourceOffset: 0,
+                count: eventBytes.count,
+                to: target.address
+            )
             try publishUsedElement(
                 descriptorIndex: descriptorIndex,
                 usedLength: 8,
@@ -2493,7 +2658,7 @@ public final class VirtualVirtIODevice: MMIODevice {
             return
         }
 
-        let availableIndex = try readMemory16(memory, at: state.driverAddress + 2)
+        let availableIndex = try readMemory16Acquire(memory, at: state.driverAddress + 2)
         while state.lastAvailableIndex != availableIndex {
             let ringOffset = UInt64(4 + (UInt32(state.lastAvailableIndex) % state.size) * 2)
             let descriptorIndex = try readMemory16(memory, at: state.driverAddress + ringOffset)
@@ -2534,7 +2699,7 @@ public final class VirtualVirtIODevice: MMIODevice {
             return
         }
 
-        var availableIndex = try readMemory16(memory, at: state.driverAddress + 2)
+        var availableIndex = try readMemory16Acquire(memory, at: state.driverAddress + 2)
         while state.lastAvailableIndex != availableIndex, !frames.isEmpty {
             let frame = frames.removeFirst()
             let ringOffset = UInt64(4 + (UInt32(state.lastAvailableIndex) % state.size) * 2)
@@ -2554,7 +2719,7 @@ public final class VirtualVirtIODevice: MMIODevice {
             state.lastAvailableIndex &+= 1
             completedNetworkReceives += 1
             interruptStatus |= Self.usedBufferInterrupt
-            availableIndex = try readMemory16(memory, at: state.driverAddress + 2)
+            availableIndex = try readMemory16Acquire(memory, at: state.driverAddress + 2)
         }
 
         pendingReceiveFrames.insert(contentsOf: frames, at: 0)
@@ -2579,7 +2744,7 @@ public final class VirtualVirtIODevice: MMIODevice {
                 continue
             }
             let count = Int(descriptor.length)
-            try memory.copyBytes(
+            try memory.copyOwnedDeviceBytes(
                 from: descriptor.address,
                 count: count,
                 to: &bytes,
@@ -2623,7 +2788,7 @@ public final class VirtualVirtIODevice: MMIODevice {
                 break
             }
             let count = min(Int(descriptor.length), remaining)
-            try memory.copyBytes(
+            try memory.copyOwnedDeviceBytes(
                 from: packet,
                 sourceOffset: copied,
                 count: count,
@@ -2650,7 +2815,7 @@ public final class VirtualVirtIODevice: MMIODevice {
             return
         }
 
-        let availableIndex = try readMemory16(memory, at: state.driverAddress + 2)
+        let availableIndex = try readMemory16Acquire(memory, at: state.driverAddress + 2)
         while state.lastAvailableIndex != availableIndex {
             let ringOffset = UInt64(4 + (UInt32(state.lastAvailableIndex) % state.size) * 2)
             let descriptorIndex = try readMemory16(memory, at: state.driverAddress + ringOffset)
@@ -2691,8 +2856,15 @@ public final class VirtualVirtIODevice: MMIODevice {
             return 1
         }
 
-        let requestType = try readMemory32(memory, at: descriptors[0].address)
-        let sector = try readMemory64(memory, at: descriptors[0].address + 8)
+        var requestHeader = [UInt8](repeating: 0, count: 16)
+        try memory.copyOwnedDeviceBytes(
+            from: descriptors[0].address,
+            count: requestHeader.count,
+            to: &requestHeader,
+            destinationOffset: 0
+        )
+        let requestType = UInt32(littleEndianBytes: requestHeader[0..<4])
+        let sector = UInt64(littleEndianBytes: requestHeader[8..<16])
         let dataDescriptors = descriptors.dropFirst().dropLast()
         let dataLength = dataDescriptors.reduce(0) { $0 + Int($1.length) }
 
@@ -2716,16 +2888,20 @@ public final class VirtualVirtIODevice: MMIODevice {
                     return 1
                 }
                 let count = Int(descriptor.length)
+                guard count > 0 else { continue }
                 guestBuffers.append(
-                    try memory.persistentMutableBytes(
+                    try memory.ownedDeviceBuffer(
                         at: descriptor.address,
                         count: count
                     )
                 )
             }
             try blockStorage.read(into: guestBuffers, at: diskOffset)
-            for descriptor in dataDescriptors {
-                memory.markDirty(at: descriptor.address, count: Int(descriptor.length))
+            for descriptor in dataDescriptors where descriptor.length > 0 {
+                try memory.publishOwnedDeviceWrite(
+                    at: descriptor.address,
+                    count: Int(descriptor.length)
+                )
             }
             try writeStatus(0, descriptors: descriptors, memory: memory)
             recordBlockRequest(type: requestType, sector: sector, payloadLength: dataLength, status: 0)
@@ -2749,9 +2925,10 @@ public final class VirtualVirtIODevice: MMIODevice {
                     return 1
                 }
                 let count = Int(descriptor.length)
+                guard count > 0 else { continue }
                 guestBuffers.append(
                     UnsafeRawBufferPointer(
-                        try memory.persistentMutableBytes(
+                        try memory.ownedDeviceBuffer(
                             at: descriptor.address,
                             count: count
                         )
@@ -2819,7 +2996,7 @@ public final class VirtualVirtIODevice: MMIODevice {
                 return []
             }
             let count = Int(descriptor.length)
-            try memory.copyBytes(
+            try memory.copyOwnedDeviceBytes(
                 from: descriptor.address,
                 count: count,
                 to: &payload,
@@ -2887,6 +3064,7 @@ public final class VirtualVirtIODevice: MMIODevice {
         detail: String? = nil
     ) {
         completedBlockRequestTypes[requestType, default: 0] += 1
+#if DEBUG
         var summary = "type=\(Self.blockRequestTypeName(requestType))(\(requestType)) sector=\(sector) payload=\(payloadLength) status=\(status)"
         if let detail, !detail.isEmpty {
             summary += " ranges=\(detail)"
@@ -2895,6 +3073,7 @@ public final class VirtualVirtIODevice: MMIODevice {
         if recentBlockRequestSummaries.count > 24 {
             recentBlockRequestSummaries.removeFirst(recentBlockRequestSummaries.count - 24)
         }
+#endif
     }
 
     private func descriptorChain(
@@ -2928,6 +3107,10 @@ public final class VirtualVirtIODevice: MMIODevice {
         guard descriptor.length >= 16 else {
             throw VMError.deviceError("\(name) invalid indirect descriptor table")
         }
+        try memory.registerDeviceSharedRange(
+            at: descriptor.address,
+            count: Int(descriptor.length)
+        )
         let tableCount = Int(descriptor.length / 16)
         var descriptors: [VirtIODescriptor] = []
         var current: UInt16 = 0
@@ -2962,7 +3145,13 @@ public final class VirtualVirtIODevice: MMIODevice {
         guard let statusDescriptor = descriptors.last, statusDescriptor.isDeviceWritable, statusDescriptor.length > 0 else {
             return
         }
-        try memory.write8(status, at: statusDescriptor.address)
+        let statusBytes = [status]
+        try memory.copyOwnedDeviceBytes(
+            from: statusBytes,
+            sourceOffset: 0,
+            count: statusBytes.count,
+            to: statusDescriptor.address
+        )
     }
 
     private func publishUsedElement(
@@ -2975,7 +3164,11 @@ public final class VirtualVirtIODevice: MMIODevice {
         let ringSlot = UInt64(4 + (UInt32(usedIndex) % queueState.size) * 8)
         try writeMemory32(UInt32(descriptorIndex), at: queueState.deviceAddress + ringSlot, memory: memory)
         try writeMemory32(usedLength, at: queueState.deviceAddress + ringSlot + 4, memory: memory)
-        try writeMemory16(usedIndex &+ 1, at: queueState.deviceAddress + 2, memory: memory)
+        try writeMemory16Release(
+            usedIndex &+ 1,
+            at: queueState.deviceAddress + 2,
+            memory: memory
+        )
     }
 
     private func updateInterruptLine() {
@@ -2997,6 +3190,45 @@ public final class VirtualVirtIODevice: MMIODevice {
         var state = queueState()
         update(&state)
         queues[selectedQueue] = state
+    }
+
+    private func registerSelectedQueueMemory() throws {
+        guard let memory else {
+            throw VMError.deviceError("\(name) has no guest memory")
+        }
+        let state = queueState()
+        guard state.size > 0,
+              state.descriptorAddress != 0,
+              state.driverAddress != 0,
+              state.deviceAddress != 0 else {
+            throw VMError.deviceError("\(name) queue \(selectedQueue) is incomplete")
+        }
+
+        let queueSize = UInt64(state.size)
+        let descriptorBytes = queueSize.multipliedReportingOverflow(by: 16)
+        let availableBytes = queueSize.multipliedReportingOverflow(by: 2)
+        let usedBytes = queueSize.multipliedReportingOverflow(by: 8)
+        guard !descriptorBytes.overflow,
+              !availableBytes.overflow,
+              !usedBytes.overflow,
+              availableBytes.partialValue <= UInt64(Int.max - 6),
+              usedBytes.partialValue <= UInt64(Int.max - 6),
+              descriptorBytes.partialValue <= UInt64(Int.max) else {
+            throw VMError.deviceError("\(name) queue \(selectedQueue) size overflows")
+        }
+
+        try memory.registerDeviceSharedRange(
+            at: state.descriptorAddress,
+            count: Int(descriptorBytes.partialValue)
+        )
+        try memory.registerDeviceSharedRange(
+            at: state.driverAddress,
+            count: Int(availableBytes.partialValue) + 6
+        )
+        try memory.registerDeviceSharedRange(
+            at: state.deviceAddress,
+            count: Int(usedBytes.partialValue) + 6
+        )
     }
 
     private func deviceFeatures(for selector: UInt32) -> UInt32 {
@@ -3211,6 +3443,10 @@ private func readMemory16(_ memory: PhysicalMemory, at address: GuestAddress) th
     try memory.read16(at: address)
 }
 
+private func readMemory16Acquire(_ memory: PhysicalMemory, at address: GuestAddress) throws -> UInt16 {
+    try memory.read16Acquire(at: address)
+}
+
 private func readMemory32(_ memory: PhysicalMemory, at address: GuestAddress) throws -> UInt32 {
     try memory.read32(at: address)
 }
@@ -3221,6 +3457,14 @@ private func readMemory64(_ memory: PhysicalMemory, at address: GuestAddress) th
 
 private func writeMemory16(_ value: UInt16, at address: GuestAddress, memory: PhysicalMemory) throws {
     try memory.write16(value, at: address)
+}
+
+private func writeMemory16Release(
+    _ value: UInt16,
+    at address: GuestAddress,
+    memory: PhysicalMemory
+) throws {
+    try memory.write16Release(value, at: address)
 }
 
 private func writeMemory32(_ value: UInt32, at address: GuestAddress, memory: PhysicalMemory) throws {

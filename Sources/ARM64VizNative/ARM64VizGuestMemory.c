@@ -1,18 +1,9 @@
-#include "ARM64VizNative.h"
+#include "ARM64VizGuestMemoryInternal.h"
 
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/mman.h>
-
-enum {
-    AVZ_FAST_TLB_SET_COUNT = 1024,
-    AVZ_FAST_TLB_WAY_COUNT = 4,
-    AVZ_FAST_TLB_ENTRY_COUNT =
-        AVZ_FAST_TLB_SET_COUNT * AVZ_FAST_TLB_WAY_COUNT,
-    AVZ_FAST_PAGE_SHIFT = 12,
-    AVZ_FAST_PAGE_SIZE = 1 << AVZ_FAST_PAGE_SHIFT
-};
 
 enum {
     AVZ_FAST_TRANSLATION_FAILED = 0,
@@ -33,71 +24,602 @@ enum {
     AVZ_FAULT_PERMISSION_LEVEL_0 = 0x0c
 };
 
-typedef struct {
-    uint64_t virtual_page;
-    uint64_t physical_page;
-    uint8_t *host_page;
-    uint64_t context_tag;
-    uint64_t generation;
-    uint8_t valid;
-} AVZNativeFastTLBEntry;
+static size_t avz_next_power_of_two(size_t value) {
+    if (value <= 1) {
+        return 1;
+    }
+    value--;
+    for (size_t shift = 1; shift < sizeof(value) * 8u; shift <<= 1u) {
+        value |= value >> shift;
+    }
+    return value == SIZE_MAX ? 0 : value + 1u;
+}
 
-struct AVZGuestMemory {
-    uint8_t *bytes;
-    size_t size;
-    _Atomic uint64_t *page_epochs;
-    _Atomic uint64_t *page_write_generations;
-    size_t page_count;
-    _Atomic uint64_t current_epoch;
-    _Atomic uint64_t current_write_generation;
-    _Atomic uint64_t translation_epoch;
-    atomic_flag write_lock;
+#define AVZ_MEMORY_STAT_INCREMENT(fast_path, field) \
+    do { \
+        if ((fast_path)->detailed_statistics_enabled) { \
+            (fast_path)->statistics.field++; \
+        } \
+    } while (0)
+
+static int avz_is_coherent_cache_maintenance(uint32_t instruction) {
+    unsigned crn = (instruction >> 12u) & 0xfu;
+    unsigned crm = (instruction >> 8u) & 0xfu;
+
+    if (crn != 7u) {
+        return 0;
+    }
+
+    /*
+     * IC and DC clean/invalidate operations are coherent no-ops for the
+     * interpreter. Guest stores update RAM immediately and advance code-page
+     * generations. CRM=4 includes DC ZVA, which still requires a real fill.
+     * CRM=8 contains address-translation operations and must remain slow.
+     */
+    return crm == 5u || crm == 6u ||
+        (crm >= 10u && crm <= 14u);
+}
+
+static void avz_lock_flag(atomic_flag *lock) {
+    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)) {
+    }
+}
+
+static void avz_guest_memory_lock_page_range(
+    AVZGuestMemory *memory,
+    size_t first_page,
+    size_t last_page
+) {
+    if (memory == NULL || memory->page_locks == NULL ||
+        first_page > last_page) {
+        return;
+    }
+    size_t span = last_page - first_page + 1u;
+    if (span >= AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT) {
+        for (size_t index = 0; index < AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT; index++) {
+            avz_lock_flag(&memory->page_locks[index]);
+        }
+        return;
+    }
+    size_t first = first_page & (AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT - 1u);
+    size_t last = last_page & (AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT - 1u);
+    if (first <= last) {
+        for (size_t index = first; index <= last; index++) {
+            avz_lock_flag(&memory->page_locks[index]);
+        }
+    } else {
+        for (size_t index = 0; index <= last; index++) {
+            avz_lock_flag(&memory->page_locks[index]);
+        }
+        for (size_t index = first; index < AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT; index++) {
+            avz_lock_flag(&memory->page_locks[index]);
+        }
+    }
+}
+
+static void avz_guest_memory_unlock_page_range(
+    AVZGuestMemory *memory,
+    size_t first_page,
+    size_t last_page
+) {
+    if (memory == NULL || memory->page_locks == NULL ||
+        first_page > last_page) {
+        return;
+    }
+    size_t span = last_page - first_page + 1u;
+    if (span >= AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT) {
+        for (size_t index = 0; index < AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT; index++) {
+            atomic_flag_clear_explicit(&memory->page_locks[index], memory_order_release);
+        }
+        return;
+    }
+    size_t first = first_page & (AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT - 1u);
+    size_t last = last_page & (AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT - 1u);
+    if (first <= last) {
+        for (size_t index = first; index <= last; index++) {
+            atomic_flag_clear_explicit(&memory->page_locks[index], memory_order_release);
+        }
+    } else {
+        for (size_t index = 0; index <= last; index++) {
+            atomic_flag_clear_explicit(&memory->page_locks[index], memory_order_release);
+        }
+        for (size_t index = first; index < AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT; index++) {
+            atomic_flag_clear_explicit(&memory->page_locks[index], memory_order_release);
+        }
+    }
+}
+
+static int avz_guest_memory_page_range(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count,
+    size_t *first_page,
+    size_t *last_page
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return 0;
+    }
+    *first_page = offset >> AVZ_FAST_PAGE_SHIFT;
+    *last_page = (offset + byte_count - 1u) >> AVZ_FAST_PAGE_SHIFT;
+    return 1;
+}
+
+static int avz_guest_memory_range_may_have_observation(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count,
+    uint8_t mask
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (memory == NULL || memory->page_observation_flags == NULL ||
+        !avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return 1;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        if ((atomic_load_explicit(
+                &memory->page_observation_flags[page],
+                memory_order_acquire) & mask) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+enum {
+    AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS =
+        AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT / 64
 };
 
-struct AVZNativeMemoryFastPath {
-    uint8_t *ram;
-    uint64_t ram_base;
-    uint64_t ram_size;
-    AVZNativeBlockCache *block_cache;
-    void *slow_context;
-    AVZNativeMemoryTranslateRAMCallback translate_ram;
-    AVZNativeMemoryTranslateRAMCallback translate_instruction_ram;
-    AVZNativeMemoryTranslationFaultCallback report_translation_fault;
-    AVZNativeMemoryReadCallback slow_read;
-    AVZNativeMemoryWriteCallback slow_write;
-    AVZNativePhysicalMemoryReadCallback read_physical;
-    AVZNativePhysicalMemoryWriteCallback write_physical;
-    AVZNativeMemoryCanAccessCallback slow_can_access;
-    AVZNativeMemoryFillCallback slow_fill;
-    AVZNativeSystemRegisterReadCallback slow_read_system_register;
-    AVZNativeSystemRegisterWriteCallback slow_write_system_register;
-    AVZNativeSystemInstructionCallback slow_execute_system_instruction;
-    AVZNativeExceptionReturnCallback slow_exception_return;
-    AVZNativeSynchronousExceptionCallback slow_synchronous_exception;
-    AVZNativeWaitCallback slow_wait;
-    AVZNativeFastTLBEntry read_tlb[AVZ_FAST_TLB_ENTRY_COUNT];
-    AVZNativeFastTLBEntry write_tlb[AVZ_FAST_TLB_ENTRY_COUNT];
-    AVZNativeFastTLBEntry instruction_tlb[AVZ_FAST_TLB_ENTRY_COUNT];
-    AVZNativeFastTLBEntry read_hot;
-    AVZNativeFastTLBEntry write_hot;
-    AVZNativeFastTLBEntry instruction_hot;
-    uint8_t read_replacement[AVZ_FAST_TLB_SET_COUNT];
-    uint8_t write_replacement[AVZ_FAST_TLB_SET_COUNT];
-    uint8_t instruction_replacement[AVZ_FAST_TLB_SET_COUNT];
-    AVZNativeThreadRegisterState thread_registers;
-    AVZNativeArchitecturalState architectural_state;
-    AVZNativeStage1TranslationState translation_state;
-    uint64_t low_translation_context_tag;
-    uint64_t high_translation_context_tag;
-    uint64_t low_translation_context_hash;
-    uint64_t high_translation_context_hash;
-    uint64_t translation_generation;
-    uint64_t observed_shared_translation_epoch;
-    uint8_t native_translation_enabled;
-    uint8_t translation_fault_pending;
-    AVZNativeMemoryFastPathStatistics statistics;
-    AVZGuestMemory *guest_memory;
-};
+static void avz_guest_memory_note_host_observation(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (memory == NULL || memory->host_page_observations == NULL ||
+        !avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        atomic_store_explicit(
+            &memory->host_page_observations[page],
+            1,
+            memory_order_release
+        );
+        atomic_fetch_or_explicit(
+            &memory->page_observation_flags[page],
+            AVZ_GUEST_PAGE_OBSERVATION_HOST,
+            memory_order_release
+        );
+    }
+}
+
+static int avz_guest_memory_range_has_host_observer(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (memory == NULL || memory->host_page_observations == NULL ||
+        !avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return 0;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        if (atomic_load_explicit(
+                &memory->host_page_observations[page],
+                memory_order_acquire) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void avz_guest_memory_note_bulk_read(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (memory == NULL || memory->bulk_read_page_observations == NULL ||
+        !avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        atomic_store_explicit(
+            &memory->bulk_read_page_observations[page],
+            1,
+            memory_order_release
+        );
+        atomic_fetch_or_explicit(
+            &memory->page_observation_flags[page],
+            AVZ_GUEST_PAGE_OBSERVATION_BULK_READER,
+            memory_order_release
+        );
+    }
+}
+
+static int avz_guest_memory_range_has_bulk_reader(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (memory == NULL || memory->bulk_read_page_observations == NULL ||
+        !avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return 0;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        if (atomic_load_explicit(
+                &memory->bulk_read_page_observations[page],
+                memory_order_acquire) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void avz_guest_memory_lock_range_internal(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        avz_guest_memory_lock_page_range(memory, first_page, last_page);
+    }
+}
+
+static void avz_guest_memory_unlock_range_internal(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        avz_guest_memory_unlock_page_range(memory, first_page, last_page);
+    }
+}
+
+void avz_guest_memory_lock_range(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    avz_guest_memory_note_host_observation(memory, offset, byte_count);
+    avz_guest_memory_lock_range_internal(memory, offset, byte_count);
+}
+
+void avz_guest_memory_unlock_range(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    avz_guest_memory_unlock_range_internal(memory, offset, byte_count);
+}
+
+int avz_guest_memory_register_host_range(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (!avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return 0;
+    }
+
+    /*
+     * Registration is an ownership boundary: callers must publish a shared
+     * range before a device can consume it. Holding the page stripes while
+     * publishing the observation synchronizes with all already-observed CPU
+     * accesses and guarantees that subsequent CPU accesses take the same
+     * stripes. Virtio queue setup satisfies the required ownership ordering.
+     */
+    avz_guest_memory_lock_page_range(memory, first_page, last_page);
+    avz_guest_memory_note_host_observation(memory, offset, byte_count);
+    atomic_thread_fence(memory_order_seq_cst);
+    avz_guest_memory_unlock_page_range(memory, first_page, last_page);
+    return 1;
+}
+
+int avz_guest_memory_host_range_is_registered(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (memory == NULL || memory->host_page_observations == NULL ||
+        !avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return 0;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        if (atomic_load_explicit(
+                &memory->host_page_observations[page],
+                memory_order_acquire) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int avz_guest_memory_collect_range_locks(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count,
+    uint64_t *lock_bitmap
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (!avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return 0;
+    }
+    size_t span = last_page - first_page + 1u;
+    if (span >= AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT) {
+        for (size_t word = 0;
+             word < AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS; word++) {
+            lock_bitmap[word] = UINT64_MAX;
+        }
+        return 1;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        size_t stripe = page & (AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT - 1u);
+        lock_bitmap[stripe >> 6] |= UINT64_C(1) << (stripe & 63u);
+    }
+    return 1;
+}
+
+static void avz_guest_memory_lock_bitmap(
+    AVZGuestMemory *memory,
+    const uint64_t *lock_bitmap
+) {
+    for (size_t word = 0;
+         word < AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS; word++) {
+        uint64_t pending = lock_bitmap[word];
+        while (pending != 0) {
+            unsigned bit = (unsigned)__builtin_ctzll(pending);
+            size_t stripe = word * 64u + bit;
+            avz_lock_flag(&memory->page_locks[stripe]);
+            pending &= pending - 1u;
+        }
+    }
+}
+
+static void avz_guest_memory_unlock_bitmap(
+    AVZGuestMemory *memory,
+    const uint64_t *lock_bitmap
+) {
+    for (size_t word = AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS;
+         word-- > 0;) {
+        uint64_t pending = lock_bitmap[word];
+        while (pending != 0) {
+            unsigned bit = 63u - (unsigned)__builtin_clzll(pending);
+            size_t stripe = word * 64u + bit;
+            atomic_flag_clear_explicit(
+                &memory->page_locks[stripe], memory_order_release);
+            pending &= ~(UINT64_C(1) << bit);
+        }
+    }
+}
+
+static int avz_guest_memory_collect_small_range_locks(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count,
+    uint16_t *stripes,
+    size_t stripe_capacity,
+    size_t *stripe_count
+) {
+    size_t first_page = 0;
+    size_t last_page = 0;
+    if (stripes == NULL || stripe_count == NULL ||
+        !avz_guest_memory_page_range(
+            memory, offset, byte_count, &first_page, &last_page)) {
+        return 0;
+    }
+    for (size_t page = first_page; page <= last_page; page++) {
+        uint16_t stripe = (uint16_t)(
+            page & (AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT - 1u));
+        size_t position = 0;
+        while (position < *stripe_count && stripes[position] < stripe) {
+            position++;
+        }
+        if (position < *stripe_count && stripes[position] == stripe) {
+            continue;
+        }
+        if (*stripe_count >= stripe_capacity) {
+            return 0;
+        }
+        memmove(
+            stripes + position + 1,
+            stripes + position,
+            (*stripe_count - position) * sizeof(*stripes)
+        );
+        stripes[position] = stripe;
+        (*stripe_count)++;
+    }
+    return 1;
+}
+
+static void avz_guest_memory_lock_small_set(
+    AVZGuestMemory *memory,
+    const uint16_t *stripes,
+    size_t stripe_count
+) {
+    for (size_t index = 0; index < stripe_count; index++) {
+        avz_lock_flag(&memory->page_locks[stripes[index]]);
+    }
+}
+
+static void avz_guest_memory_unlock_small_set(
+    AVZGuestMemory *memory,
+    const uint16_t *stripes,
+    size_t stripe_count
+) {
+    while (stripe_count != 0) {
+        atomic_flag_clear_explicit(
+            &memory->page_locks[stripes[--stripe_count]],
+            memory_order_release
+        );
+    }
+}
+
+static int avz_guest_memory_lock_small_pair(
+    AVZGuestMemory *memory,
+    size_t first_offset,
+    size_t first_byte_count,
+    size_t second_offset,
+    size_t second_byte_count,
+    uint16_t *stripes,
+    size_t stripe_capacity,
+    size_t *stripe_count
+) {
+    *stripe_count = 0;
+    if (!avz_guest_memory_collect_small_range_locks(
+            memory,
+            first_offset,
+            first_byte_count,
+            stripes,
+            stripe_capacity,
+            stripe_count) ||
+        !avz_guest_memory_collect_small_range_locks(
+            memory,
+            second_offset,
+            second_byte_count,
+            stripes,
+            stripe_capacity,
+            stripe_count)) {
+        return 0;
+    }
+    avz_guest_memory_lock_small_set(memory, stripes, *stripe_count);
+    return 1;
+}
+
+int avz_guest_memory_lock_spans(
+    AVZGuestMemory *memory,
+    const AVZGuestMemorySpan *spans,
+    size_t span_count
+) {
+    if (memory == NULL || spans == NULL || span_count == 0) {
+        return 0;
+    }
+    uint64_t lock_bitmap[AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS] = {0};
+    for (size_t index = 0; index < span_count; index++) {
+        avz_guest_memory_note_host_observation(
+            memory,
+            spans[index].offset,
+            spans[index].byte_count
+        );
+        if (!avz_guest_memory_collect_range_locks(
+                memory,
+                spans[index].offset,
+                spans[index].byte_count,
+                lock_bitmap)) {
+            return 0;
+        }
+    }
+    avz_guest_memory_lock_bitmap(memory, lock_bitmap);
+    return 1;
+}
+
+void avz_guest_memory_unlock_spans(
+    AVZGuestMemory *memory,
+    const AVZGuestMemorySpan *spans,
+    size_t span_count
+) {
+    if (memory == NULL || spans == NULL || span_count == 0) {
+        return;
+    }
+    uint64_t lock_bitmap[AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS] = {0};
+    for (size_t index = 0; index < span_count; index++) {
+        if (!avz_guest_memory_collect_range_locks(
+                memory,
+                spans[index].offset,
+                spans[index].byte_count,
+                lock_bitmap)) {
+            return;
+        }
+    }
+    avz_guest_memory_unlock_bitmap(memory, lock_bitmap);
+}
+
+static void avz_guest_memory_lock_internal(AVZGuestMemory *memory) {
+    if (memory == NULL || memory->page_locks == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT; index++) {
+        avz_lock_flag(&memory->page_locks[index]);
+    }
+}
+
+static void avz_guest_memory_unlock_internal(AVZGuestMemory *memory) {
+    if (memory != NULL && memory->page_locks != NULL) {
+        for (size_t index = 0; index < AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT; index++) {
+            atomic_flag_clear_explicit(&memory->page_locks[index], memory_order_release);
+        }
+    }
+}
+
+void avz_guest_memory_lock(AVZGuestMemory *memory) {
+    if (memory == NULL) {
+        return;
+    }
+    avz_guest_memory_note_host_observation(memory, 0, memory->size);
+    avz_guest_memory_lock_internal(memory);
+}
+
+void avz_guest_memory_unlock(AVZGuestMemory *memory) {
+    avz_guest_memory_unlock_internal(memory);
+}
+
+void avz_guest_memory_clear_host_observations(AVZGuestMemory *memory) {
+    if (memory == NULL) {
+        return;
+    }
+    for (size_t page = 0; page < memory->page_count; page++) {
+        if (memory->host_page_observations != NULL) {
+            atomic_store_explicit(
+                &memory->host_page_observations[page],
+                0,
+                memory_order_release
+            );
+        }
+        if (memory->bulk_read_page_observations != NULL) {
+            atomic_store_explicit(
+                &memory->bulk_read_page_observations[page],
+                0,
+                memory_order_release
+            );
+        }
+        if (memory->page_observation_flags != NULL) {
+            atomic_fetch_and_explicit(
+                &memory->page_observation_flags[page],
+                (uint8_t)~(
+                    AVZ_GUEST_PAGE_OBSERVATION_HOST |
+                    AVZ_GUEST_PAGE_OBSERVATION_BULK_READER),
+                memory_order_release
+            );
+        }
+    }
+}
 
 static uint16_t avz_system_register_key(uint32_t instruction) {
     uint16_t op0 = (uint16_t)((instruction >> 19) & 0x3u);
@@ -180,10 +702,155 @@ AVZGuestMemory *avz_guest_memory_create(size_t size) {
         free(memory);
         return 0;
     }
+    memory->page_exclusive_observation_epochs = calloc(
+        memory->page_count,
+        sizeof(*memory->page_exclusive_observation_epochs)
+    );
+    if (memory->page_exclusive_observation_epochs == NULL) {
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    memory->host_page_observations = calloc(
+        memory->page_count,
+        sizeof(*memory->host_page_observations)
+    );
+    if (memory->host_page_observations == NULL) {
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    memory->bulk_read_page_observations = calloc(
+        memory->page_count,
+        sizeof(*memory->bulk_read_page_observations)
+    );
+    if (memory->bulk_read_page_observations == NULL) {
+        free(memory->host_page_observations);
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    memory->page_observation_flags = calloc(
+        memory->page_count,
+        sizeof(*memory->page_observation_flags)
+    );
+    if (memory->page_observation_flags == NULL) {
+        free(memory->bulk_read_page_observations);
+        free(memory->host_page_observations);
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    if (memory->page_count > SIZE_MAX / AVZ_EXCLUSIVE_SLOT_SCALE) {
+        free(memory->page_observation_flags);
+        free(memory->bulk_read_page_observations);
+        free(memory->host_page_observations);
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    size_t requested_exclusive_slots =
+        memory->page_count * AVZ_EXCLUSIVE_SLOT_SCALE;
+    if (requested_exclusive_slots < AVZ_EXCLUSIVE_MINIMUM_SLOT_COUNT) {
+        requested_exclusive_slots = AVZ_EXCLUSIVE_MINIMUM_SLOT_COUNT;
+    }
+    memory->exclusive_slot_count = avz_next_power_of_two(
+        requested_exclusive_slots
+    );
+    if (memory->exclusive_slot_count == 0) {
+        free(memory->page_observation_flags);
+        free(memory->bulk_read_page_observations);
+        free(memory->host_page_observations);
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    memory->exclusive_slot_mask = memory->exclusive_slot_count - 1u;
+    memory->exclusive_write_generations = calloc(
+        memory->exclusive_slot_count,
+        sizeof(*memory->exclusive_write_generations)
+    );
+    memory->exclusive_observations = calloc(
+        memory->exclusive_slot_count,
+        sizeof(*memory->exclusive_observations)
+    );
+    if (memory->exclusive_write_generations == NULL ||
+        memory->exclusive_observations == NULL) {
+        free(memory->exclusive_observations);
+        free(memory->exclusive_write_generations);
+        free(memory->page_observation_flags);
+        free(memory->bulk_read_page_observations);
+        free(memory->host_page_observations);
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    memory->page_locks = calloc(
+        AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT,
+        sizeof(*memory->page_locks)
+    );
+    if (memory->page_locks == NULL) {
+        free(memory->exclusive_observations);
+        free(memory->exclusive_write_generations);
+        free(memory->page_observation_flags);
+        free(memory->bulk_read_page_observations);
+        free(memory->host_page_observations);
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
+    memory->code_page_bits = calloc(
+        (memory->page_count + 7u) / 8u,
+        sizeof(*memory->code_page_bits)
+    );
+    if (memory->code_page_bits == NULL) {
+        free(memory->page_locks);
+        free(memory->exclusive_observations);
+        free(memory->exclusive_write_generations);
+        free(memory->page_observation_flags);
+        free(memory->bulk_read_page_observations);
+        free(memory->host_page_observations);
+        free(memory->page_exclusive_observation_epochs);
+        free(memory->page_write_generations);
+        free(memory->page_epochs);
+        munmap(memory->bytes, memory->size);
+        free(memory);
+        return 0;
+    }
     atomic_init(&memory->current_epoch, 1);
     atomic_init(&memory->current_write_generation, 1);
+    atomic_init(&memory->code_mutation_epoch, 1);
     atomic_init(&memory->translation_epoch, 1);
-    atomic_flag_clear(&memory->write_lock);
+    atomic_init(&memory->exclusive_reads, 0);
+    atomic_init(&memory->exclusive_nonzero_reads, 0);
+    atomic_init(&memory->exclusive_write_successes, 0);
+    atomic_init(&memory->exclusive_write_conflicts, 0);
+    for (size_t index = 0; index < AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT; index++) {
+        atomic_flag_clear(&memory->page_locks[index]);
+    }
     return memory;
 }
 
@@ -196,19 +863,101 @@ void avz_guest_memory_destroy(AVZGuestMemory *memory) {
     }
     free(memory->page_epochs);
     free(memory->page_write_generations);
+    free(memory->page_exclusive_observation_epochs);
+    free(memory->host_page_observations);
+    free(memory->bulk_read_page_observations);
+    free(memory->page_observation_flags);
+    free(memory->exclusive_write_generations);
+    free(memory->exclusive_observations);
+    free(memory->page_locks);
+    free(memory->code_page_bits);
     free(memory);
 }
 
-void avz_guest_memory_note_write(
+void avz_guest_memory_mark_code_page(
     AVZGuestMemory *memory,
-    size_t offset,
-    size_t byte_count
+    uint64_t physical_page,
+    uint64_t ram_base
 ) {
-    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
-        byte_count > memory->size - offset) {
+    if (memory == NULL || physical_page < ram_base) {
         return;
     }
-    avz_guest_memory_mark_dirty(memory, offset, byte_count);
+    uint64_t offset = physical_page - ram_base;
+    if (offset >= memory->size) {
+        return;
+    }
+    size_t page = (size_t)offset >> AVZ_FAST_PAGE_SHIFT;
+    atomic_fetch_or_explicit(
+        &memory->code_page_bits[page >> 3],
+        (uint8_t)(1u << (page & 7u)),
+        memory_order_relaxed
+    );
+}
+
+int avz_guest_memory_range_may_contain_code(
+    const AVZGuestMemory *memory,
+    uint64_t physical_address,
+    size_t byte_count,
+    uint64_t ram_base
+) {
+    if (memory == NULL || byte_count == 0 || physical_address < ram_base) {
+        return 0;
+    }
+    uint64_t offset_u64 = physical_address - ram_base;
+    if (offset_u64 > SIZE_MAX || (size_t)offset_u64 >= memory->size ||
+        byte_count > memory->size - (size_t)offset_u64) {
+        return 0;
+    }
+    size_t first_page = (size_t)offset_u64 >> AVZ_FAST_PAGE_SHIFT;
+    size_t last_page = ((size_t)offset_u64 + byte_count - 1u) >>
+        AVZ_FAST_PAGE_SHIFT;
+    for (size_t page = first_page; page <= last_page; page++) {
+        uint8_t bits = atomic_load_explicit(
+            &memory->code_page_bits[page >> 3], memory_order_relaxed);
+        if ((bits & (uint8_t)(1u << (page & 7u))) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void avz_guest_memory_advance_code_mutation_epoch(
+    AVZGuestMemory *memory
+) {
+    uint64_t epoch = atomic_fetch_add_explicit(
+        &memory->code_mutation_epoch,
+        1,
+        memory_order_acq_rel
+    ) + 1;
+    if (epoch == 0) {
+        atomic_store_explicit(
+            &memory->code_mutation_epoch,
+            1,
+            memory_order_release
+        );
+    }
+}
+
+uint64_t avz_guest_memory_code_mutation_epoch(
+    const AVZGuestMemory *memory
+) {
+    return memory == NULL ? 0 : atomic_load_explicit(
+        &memory->code_mutation_epoch,
+        memory_order_acquire
+    );
+}
+
+const uint64_t *avz_guest_memory_code_mutation_epoch_token(
+    const AVZGuestMemory *memory
+) {
+    return memory == NULL
+        ? NULL
+        : (const uint64_t *)&memory->code_mutation_epoch;
+}
+
+static uint64_t avz_guest_memory_next_write_generation(
+    AVZGuestMemory *memory
+) {
     uint64_t generation = atomic_fetch_add_explicit(
         &memory->current_write_generation,
         1,
@@ -222,6 +971,19 @@ void avz_guest_memory_note_write(
             memory_order_release
         );
     }
+    return generation;
+}
+
+static void avz_guest_memory_note_page_write_generation(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return;
+    }
+    const uint64_t generation = avz_guest_memory_next_write_generation(memory);
     const size_t first_page = offset >> AVZ_FAST_PAGE_SHIFT;
     const size_t last_page =
         (offset + byte_count - 1u) >> AVZ_FAST_PAGE_SHIFT;
@@ -232,6 +994,271 @@ void avz_guest_memory_note_write(
             memory_order_release
         );
     }
+}
+
+static size_t avz_guest_memory_exclusive_slot(
+    const AVZGuestMemory *memory,
+    size_t granule
+) {
+    uint64_t value = (uint64_t)granule;
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    value ^= value >> 31;
+    return (size_t)value & memory->exclusive_slot_mask;
+}
+
+static void avz_guest_memory_note_exclusive_observation(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return;
+    }
+    const size_t first_page = offset >> AVZ_FAST_PAGE_SHIFT;
+    const size_t last_page =
+        (offset + byte_count - 1u) >> AVZ_FAST_PAGE_SHIFT;
+    for (size_t page = first_page; page <= last_page; page++) {
+        atomic_store_explicit(
+            &memory->page_exclusive_observation_epochs[page],
+            1,
+            memory_order_release
+        );
+        atomic_fetch_or_explicit(
+            &memory->page_observation_flags[page],
+            AVZ_GUEST_PAGE_OBSERVATION_EXCLUSIVE,
+            memory_order_release
+        );
+    }
+    const size_t first_granule = offset >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    const size_t last_granule =
+        (offset + byte_count - 1u) >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    for (size_t granule = first_granule;
+         granule <= last_granule; granule++) {
+        const size_t slot = avz_guest_memory_exclusive_slot(memory, granule);
+        atomic_store_explicit(
+            &memory->exclusive_observations[slot],
+            1,
+            memory_order_release
+        );
+    }
+}
+
+static void avz_guest_memory_note_exclusive_write_generation(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return;
+    }
+    const size_t first_granule = offset >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    const size_t last_granule =
+        (offset + byte_count - 1u) >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    const size_t granules_per_page =
+        (size_t)1u << (AVZ_FAST_PAGE_SHIFT - AVZ_EXCLUSIVE_GRANULE_SHIFT);
+    const size_t first_page = first_granule /
+        granules_per_page;
+    const size_t last_page = last_granule /
+        granules_per_page;
+    uint64_t generation = 0;
+    for (size_t page = first_page; page <= last_page; page++) {
+        if (atomic_load_explicit(
+                &memory->page_exclusive_observation_epochs[page],
+                memory_order_acquire) == 0) {
+            continue;
+        }
+        const size_t page_first_granule = page * granules_per_page;
+        const size_t observed_first = first_granule > page_first_granule
+            ? first_granule
+            : page_first_granule;
+        const size_t page_last_granule =
+            page_first_granule + granules_per_page - 1u;
+        const size_t observed_last = last_granule < page_last_granule
+            ? last_granule
+            : page_last_granule;
+        for (size_t granule = observed_first;
+             granule <= observed_last; granule++) {
+            const size_t slot =
+                avz_guest_memory_exclusive_slot(memory, granule);
+            if (atomic_load_explicit(
+                    &memory->exclusive_observations[slot],
+                    memory_order_acquire) == 0) {
+                continue;
+            }
+            if (generation == 0) {
+                generation = avz_guest_memory_next_write_generation(memory);
+            }
+            atomic_store_explicit(
+                &memory->exclusive_write_generations[slot],
+                generation,
+                memory_order_release
+            );
+        }
+    }
+}
+
+static int avz_guest_memory_range_has_exclusive_observer(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return 1;
+    }
+    const size_t first_granule = offset >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    const size_t last_granule =
+        (offset + byte_count - 1u) >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    const size_t granules_per_page =
+        (size_t)1u << (AVZ_FAST_PAGE_SHIFT - AVZ_EXCLUSIVE_GRANULE_SHIFT);
+    const size_t first_page = first_granule /
+        granules_per_page;
+    const size_t last_page = last_granule /
+        granules_per_page;
+    for (size_t page = first_page; page <= last_page; page++) {
+        if (atomic_load_explicit(
+                &memory->page_exclusive_observation_epochs[page],
+                memory_order_acquire) == 0) {
+            continue;
+        }
+        const size_t page_first_granule = page * granules_per_page;
+        const size_t observed_first = first_granule > page_first_granule
+            ? first_granule
+            : page_first_granule;
+        const size_t page_last_granule =
+            page_first_granule + granules_per_page - 1u;
+        const size_t observed_last = last_granule < page_last_granule
+            ? last_granule
+            : page_last_granule;
+        for (size_t granule = observed_first;
+             granule <= observed_last; granule++) {
+            const size_t slot =
+                avz_guest_memory_exclusive_slot(memory, granule);
+            if (atomic_load_explicit(
+                    &memory->exclusive_observations[slot],
+                    memory_order_acquire) != 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int avz_guest_memory_range_requires_serialization(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    return avz_guest_memory_range_has_host_observer(
+            memory, offset, byte_count) ||
+        avz_guest_memory_range_has_bulk_reader(
+            memory, offset, byte_count) ||
+        avz_guest_memory_range_has_exclusive_observer(
+            memory, offset, byte_count);
+}
+
+void avz_guest_memory_note_write(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return;
+    }
+    int touches_code = avz_guest_memory_range_may_contain_code(
+        memory,
+        (uint64_t)offset,
+        byte_count,
+        0
+    );
+    avz_guest_memory_mark_dirty(memory, offset, byte_count);
+    avz_guest_memory_note_exclusive_write_generation(
+        memory, offset, byte_count);
+    if (touches_code) {
+        avz_guest_memory_note_page_write_generation(
+            memory, offset, byte_count);
+        avz_guest_memory_advance_code_mutation_epoch(memory);
+    }
+}
+
+void avz_guest_memory_note_device_write(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return;
+    }
+    avz_guest_memory_note_host_observation(memory, offset, byte_count);
+    int touches_code = avz_guest_memory_range_may_contain_code(
+        memory,
+        (uint64_t)offset,
+        byte_count,
+        0
+    );
+    avz_guest_memory_note_exclusive_write_generation(
+        memory, offset, byte_count);
+    if (touches_code) {
+        avz_guest_memory_note_page_write_generation(
+            memory, offset, byte_count);
+        avz_guest_memory_advance_code_mutation_epoch(memory);
+    }
+}
+
+int avz_guest_memory_load_u16_acquire(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint16_t *value
+) {
+    if (memory == NULL || value == NULL || offset > memory->size ||
+        sizeof(uint16_t) > memory->size - offset ||
+        (offset & (sizeof(uint16_t) - 1u)) != 0) {
+        return 0;
+    }
+
+    avz_guest_memory_lock_range(memory, offset, sizeof(uint16_t));
+    uint16_t loaded = __atomic_load_n(
+        (const uint16_t *)(memory->bytes + offset),
+        __ATOMIC_ACQUIRE
+    );
+    avz_guest_memory_unlock_range(memory, offset, sizeof(uint16_t));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    loaded = __builtin_bswap16(loaded);
+#endif
+    *value = loaded;
+    return 1;
+}
+
+int avz_guest_memory_store_u16_release(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint16_t value
+) {
+    if (memory == NULL || offset > memory->size ||
+        sizeof(uint16_t) > memory->size - offset ||
+        (offset & (sizeof(uint16_t) - 1u)) != 0) {
+        return 0;
+    }
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    value = __builtin_bswap16(value);
+#endif
+    avz_guest_memory_lock_range(memory, offset, sizeof(uint16_t));
+    avz_guest_memory_note_write(memory, offset, sizeof(uint16_t));
+    __atomic_store_n(
+        (uint16_t *)(memory->bytes + offset),
+        value,
+        __ATOMIC_RELEASE
+    );
+    avz_guest_memory_unlock_range(memory, offset, sizeof(uint16_t));
+    return 1;
 }
 
 void avz_guest_memory_invalidate_translations(AVZGuestMemory *memory) {
@@ -379,22 +1406,76 @@ size_t avz_guest_memory_dirty_ranges(
     return range_count;
 }
 
-static void avz_fast_mark_dirty(
+static int avz_fast_mark_dirty(
     AVZNativeMemoryFastPath *fast_path,
     uint64_t physical_address,
     size_t byte_count
 ) {
     if (fast_path == NULL || fast_path->guest_memory == NULL ||
-        physical_address < fast_path->ram_base) {
-        return;
+        physical_address < fast_path->ram_base || byte_count == 0) {
+        return 0;
     }
     const uint64_t offset = physical_address - fast_path->ram_base;
     if (offset > SIZE_MAX) {
+        return 0;
+    }
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    size_t raw_offset = (size_t)offset;
+    if (raw_offset >= memory->size ||
+        byte_count > memory->size - raw_offset) {
+        return 0;
+    }
+    size_t first_page = raw_offset >> AVZ_FAST_PAGE_SHIFT;
+    size_t last_page = (raw_offset + byte_count - 1u) >> AVZ_FAST_PAGE_SHIFT;
+    uint64_t epoch = atomic_load_explicit(
+        &memory->current_epoch, memory_order_relaxed);
+    int mutated_code = 0;
+    for (size_t page = first_page; page <= last_page; page++) {
+        size_t slot = page & (AVZ_FAST_DIRTY_HOT_COUNT - 1u);
+        uint64_t page_physical = fast_path->ram_base +
+            ((uint64_t)page << AVZ_FAST_PAGE_SHIFT);
+        int page_contains_code = avz_guest_memory_range_may_contain_code(
+            memory, page_physical, 1, fast_path->ram_base);
+        mutated_code |= page_contains_code;
+        AVZNativeDirtyHotEntry *dirty_entry = &fast_path->dirty_hot[slot];
+        if (dirty_entry->valid && dirty_entry->page == page &&
+            dirty_entry->epoch == epoch) {
+            continue;
+        }
+        atomic_store_explicit(
+            &memory->page_epochs[page], epoch, memory_order_release);
+        *dirty_entry = (AVZNativeDirtyHotEntry){
+            .page = page,
+            .epoch = epoch,
+            .valid = 1
+        };
+    }
+    avz_guest_memory_note_exclusive_write_generation(
+        memory, raw_offset, byte_count);
+    if (mutated_code) {
+        avz_guest_memory_note_page_write_generation(
+            memory, raw_offset, byte_count);
+        avz_guest_memory_advance_code_mutation_epoch(memory);
+    }
+    return mutated_code;
+}
+
+static void avz_fast_invalidate_code_after_write(
+    AVZNativeMemoryFastPath *fast_path,
+    uint64_t physical_address,
+    size_t byte_count,
+    int range_contains_code
+) {
+    if (fast_path == NULL || fast_path->block_cache == NULL ||
+        byte_count == 0) {
         return;
     }
-    avz_guest_memory_note_write(
-        fast_path->guest_memory,
-        (size_t)offset,
+    if (fast_path->guest_memory != NULL && !range_contains_code) {
+        return;
+    }
+    avz_native_block_cache_invalidate_physical_range(
+        fast_path->block_cache,
+        physical_address,
         byte_count
     );
 }
@@ -421,9 +1502,13 @@ static void avz_fast_clear_tlbs(AVZNativeMemoryFastPath *fast_path) {
         );
         fast_path->translation_generation = 1;
     }
-    fast_path->read_hot.valid = 0;
-    fast_path->write_hot.valid = 0;
-    fast_path->instruction_hot.valid = 0;
+    memset(fast_path->read_hot, 0, sizeof(fast_path->read_hot));
+    memset(fast_path->write_hot, 0, sizeof(fast_path->write_hot));
+    memset(
+        fast_path->instruction_hot,
+        0,
+        sizeof(fast_path->instruction_hot)
+    );
 }
 
 static void avz_fast_synchronize_shared_translation_epoch(
@@ -432,7 +1517,17 @@ static void avz_fast_synchronize_shared_translation_epoch(
     if (fast_path == NULL || fast_path->guest_memory == NULL) {
         return;
     }
-    const uint64_t epoch = atomic_load_explicit(
+    uint64_t epoch = atomic_load_explicit(
+        &fast_path->guest_memory->translation_epoch,
+        memory_order_relaxed
+    );
+    if (epoch == fast_path->observed_shared_translation_epoch) {
+        return;
+    }
+    /* The overwhelmingly common unchanged case needs only coherence. Once a
+     * new epoch is observed, acquire the publication of the preceding page
+     * table writes before dropping cached translations. */
+    epoch = atomic_load_explicit(
         &fast_path->guest_memory->translation_epoch,
         memory_order_acquire
     );
@@ -529,7 +1624,7 @@ static int avz_stage1_fault(
     uint8_t status_code
 ) {
     fast_path->translation_fault_pending = 1;
-    fast_path->statistics.native_page_table_faults++;
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, native_page_table_faults);
     if (fast_path->report_translation_fault != NULL) {
         fast_path->report_translation_fault(
             fast_path->slow_context,
@@ -562,7 +1657,12 @@ static int avz_stage1_read_descriptor(
             __ATOMIC_ACQUIRE
         );
     } else {
-        memcpy(descriptor, host_address, sizeof(*descriptor));
+        uint64_t value = 0;
+        for (uint8_t index = 0; index < sizeof(*descriptor); index++) {
+            value |= (uint64_t)__atomic_load_n(
+                host_address + index, __ATOMIC_ACQUIRE) << (index * 8u);
+        }
+        *descriptor = value;
     }
     return 1;
 }
@@ -624,7 +1724,7 @@ static int avz_stage1_translate(
         return AVZ_NATIVE_TRANSLATION_SUCCESS;
     }
 
-    fast_path->statistics.native_page_table_walks++;
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, native_page_table_walks);
     uint8_t uses_ttbr1 = (uint8_t)(virtual_address >> 63);
     unsigned size_offset = uses_ttbr1 ? 16u : 0u;
     unsigned tsz = (unsigned)(
@@ -769,7 +1869,7 @@ static int avz_resolve_translation(
     if (result != AVZ_NATIVE_TRANSLATION_UNAVAILABLE) {
         return result == AVZ_NATIVE_TRANSLATION_SUCCESS;
     }
-    fast_path->statistics.translation_callback_walks++;
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, translation_callback_walks);
     return fallback != NULL && fallback(
         fast_path->slow_context,
         virtual_address,
@@ -779,7 +1879,7 @@ static int avz_resolve_translation(
     );
 }
 
-static int avz_fast_translate(
+static int avz_fast_translate_cold(
     AVZNativeMemoryFastPath *fast_path,
     uint64_t virtual_address,
     uint8_t width,
@@ -791,7 +1891,6 @@ static int avz_fast_translate(
         !avz_fast_width_supported(width)) {
         return 0;
     }
-    avz_fast_synchronize_shared_translation_epoch(fast_path);
     uint64_t page_offset = virtual_address & (AVZ_FAST_PAGE_SIZE - 1u);
     if (page_offset + width > AVZ_FAST_PAGE_SIZE) {
         return 0;
@@ -802,19 +1901,25 @@ static int avz_fast_translate(
         fast_path,
         virtual_address
     );
-    AVZNativeFastTLBEntry *hot =
-        is_write ? &fast_path->write_hot : &fast_path->read_hot;
+    size_t hot_index = (size_t)(
+        (virtual_page ^ (context_tag >> AVZ_FAST_PAGE_SHIFT)) &
+        (AVZ_FAST_DATA_HOT_COUNT - 1u)
+    );
+    AVZNativeFastTLBEntry *hot = is_write
+        ? &fast_path->write_hot[hot_index]
+        : &fast_path->read_hot[hot_index];
     uint64_t physical_page;
     uint8_t *host_page;
     if (hot->valid && hot->generation == fast_path->translation_generation &&
+        hot->contiguous_span >= page_offset + width &&
         hot->virtual_page == virtual_page &&
         hot->context_tag == context_tag) {
         physical_page = hot->physical_page;
         host_page = hot->host_page;
         if (is_write) {
-            fast_path->statistics.write_tlb_hits++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, write_tlb_hits);
         } else {
-            fast_path->statistics.read_tlb_hits++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, read_tlb_hits);
         }
         goto translated;
     }
@@ -832,6 +1937,7 @@ static int avz_fast_translate(
         AVZNativeFastTLBEntry *candidate = &entries[base + way];
         if (candidate->valid &&
             candidate->generation == fast_path->translation_generation &&
+            candidate->contiguous_span >= page_offset + width &&
             candidate->virtual_page == virtual_page &&
             candidate->context_tag == context_tag) {
             entry = candidate;
@@ -845,15 +1951,15 @@ static int avz_fast_translate(
         physical_page = entry->physical_page;
         host_page = entry->host_page;
         if (is_write) {
-            fast_path->statistics.write_tlb_hits++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, write_tlb_hits);
         } else {
-            fast_path->statistics.read_tlb_hits++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, read_tlb_hits);
         }
     } else {
         if (is_write) {
-            fast_path->statistics.write_tlb_misses++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, write_tlb_misses);
         } else {
-            fast_path->statistics.read_tlb_misses++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, read_tlb_misses);
         }
         uint64_t translated = 0;
         if (!avz_resolve_translation(
@@ -893,6 +1999,15 @@ static int avz_fast_translate(
         entry->virtual_page = virtual_page;
         entry->physical_page = physical_page;
         entry->host_page = host_page;
+        uint64_t contiguous_span = AVZ_FAST_PAGE_SIZE;
+        if (host_page != NULL) {
+            const uint64_t ram_offset = physical_page - fast_path->ram_base;
+            const uint64_t ram_remaining = fast_path->ram_size - ram_offset;
+            if (contiguous_span > ram_remaining) {
+                contiguous_span = ram_remaining;
+            }
+        }
+        entry->contiguous_span = (uint16_t)contiguous_span;
         entry->context_tag = context_tag;
         entry->generation = fast_path->translation_generation;
         entry->valid = 1;
@@ -923,19 +2038,96 @@ translated:
     return AVZ_FAST_TRANSLATION_RAM;
 }
 
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((always_inline))
+#endif
+static inline int avz_fast_translate(
+    AVZNativeMemoryFastPath *fast_path,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint8_t is_write,
+    uint64_t *physical_address,
+    uint8_t **host_address
+) {
+    if (fast_path == NULL || fast_path->ram == NULL ||
+        physical_address == NULL || !avz_fast_width_supported(width)) {
+        return AVZ_FAST_TRANSLATION_FAILED;
+    }
+
+    avz_fast_synchronize_shared_translation_epoch(fast_path);
+    const uint64_t page_offset =
+        virtual_address & (AVZ_FAST_PAGE_SIZE - 1u);
+    if (page_offset + width > AVZ_FAST_PAGE_SIZE) {
+        return AVZ_FAST_TRANSLATION_FAILED;
+    }
+
+    const uint64_t virtual_page = virtual_address >> AVZ_FAST_PAGE_SHIFT;
+    const uint64_t context_tag = avz_fast_translation_context_tag(
+        fast_path,
+        virtual_address
+    );
+    const size_t hot_index = (size_t)(
+        (virtual_page ^ (context_tag >> AVZ_FAST_PAGE_SHIFT)) &
+        (AVZ_FAST_DATA_HOT_COUNT - 1u)
+    );
+    const AVZNativeFastTLBEntry *hot = is_write
+        ? &fast_path->write_hot[hot_index]
+        : &fast_path->read_hot[hot_index];
+    if (hot->valid && hot->generation == fast_path->translation_generation &&
+        hot->contiguous_span >= page_offset + width &&
+        hot->virtual_page == virtual_page &&
+        hot->context_tag == context_tag) {
+        if (is_write) {
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, write_tlb_hits);
+        } else {
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, read_tlb_hits);
+        }
+        if (hot->host_page != NULL) {
+            *physical_address = hot->physical_page + page_offset;
+            if (host_address != NULL) {
+                *host_address = hot->host_page + page_offset;
+            }
+            return AVZ_FAST_TRANSLATION_RAM;
+        }
+        if (hot->physical_page > UINT64_MAX - page_offset) {
+            return AVZ_FAST_TRANSLATION_FAILED;
+        }
+        *physical_address = hot->physical_page + page_offset;
+        if (host_address != NULL) {
+            *host_address = NULL;
+        }
+        return AVZ_FAST_TRANSLATION_PHYSICAL;
+    }
+
+    return avz_fast_translate_cold(
+        fast_path,
+        virtual_address,
+        width,
+        is_write,
+        physical_address,
+        host_address
+    );
+}
+
 static uint64_t avz_fast_load(
     const uint8_t *host_address,
     uint8_t width
 ) {
+    /*
+     * Plain AArch64 loads are atomic at their supported natural alignment but
+     * are not acquire operations. LDAR/LDAXR handlers apply the architectural
+     * acquire fence after this access, and page locks protect host-observed or
+     * unaligned ranges.
+     */
     const uintptr_t address = (uintptr_t)host_address;
     switch (width) {
     case 1:
-        return __atomic_load_n(host_address, __ATOMIC_ACQUIRE);
+        return __atomic_load_n(host_address, __ATOMIC_RELAXED);
     case 2:
         if ((address & 1u) == 0) {
             return __atomic_load_n(
                 (const uint16_t *)host_address,
-                __ATOMIC_ACQUIRE
+                __ATOMIC_RELAXED
             );
         }
         break;
@@ -943,7 +2135,7 @@ static uint64_t avz_fast_load(
         if ((address & 3u) == 0) {
             return __atomic_load_n(
                 (const uint32_t *)host_address,
-                __ATOMIC_ACQUIRE
+                __ATOMIC_RELAXED
             );
         }
         break;
@@ -951,7 +2143,7 @@ static uint64_t avz_fast_load(
         if ((address & 7u) == 0) {
             return __atomic_load_n(
                 (const uint64_t *)host_address,
-                __ATOMIC_ACQUIRE
+                __ATOMIC_RELAXED
             );
         }
         break;
@@ -959,7 +2151,10 @@ static uint64_t avz_fast_load(
         break;
     }
     uint64_t value = 0;
-    memcpy(&value, host_address, width);
+    for (uint8_t offset = 0; offset < width; offset++) {
+        value |= (uint64_t)__atomic_load_n(
+            host_address + offset, __ATOMIC_RELAXED) << (offset * 8u);
+    }
     return value;
 }
 
@@ -991,20 +2186,30 @@ static int avz_fast_translate_instruction(
     uint8_t *host_page = NULL;
     AVZNativeFastTLBEntry *entry = NULL;
 
-    if (fast_path->instruction_hot.valid &&
-        fast_path->instruction_hot.generation ==
-            fast_path->translation_generation &&
-        fast_path->instruction_hot.virtual_page == virtual_page &&
-        fast_path->instruction_hot.context_tag == context_tag) {
-        entry = &fast_path->instruction_hot;
-        fast_path->statistics.instruction_tlb_hits++;
-    } else {
+    for (size_t index = 0; index < AVZ_FAST_INSTRUCTION_HOT_COUNT; index++) {
+        AVZNativeFastTLBEntry *candidate =
+            &fast_path->instruction_hot[index];
+        if (candidate->valid &&
+            candidate->generation == fast_path->translation_generation &&
+            candidate->contiguous_span >= page_offset + sizeof(uint32_t) &&
+            candidate->virtual_page == virtual_page &&
+            candidate->context_tag == context_tag) {
+            entry = candidate;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_hits);
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_hot_hits);
+            break;
+        }
+    }
+    if (entry == NULL) {
         uint64_t page_hash = virtual_page ^ (virtual_page >> 11) ^
             (virtual_page >> 23) ^
             avz_fast_translation_context_hash(fast_path, virtual_address);
-        size_t set = (size_t)(page_hash & (AVZ_FAST_TLB_SET_COUNT - 1u));
+        size_t set = (size_t)(
+            page_hash & (AVZ_FAST_INSTRUCTION_TLB_SET_COUNT - 1u)
+        );
         size_t base = set * AVZ_FAST_TLB_WAY_COUNT;
         AVZNativeFastTLBEntry *first_invalid = NULL;
+        int invalidated_mapping = 0;
         for (size_t way = 0; way < AVZ_FAST_TLB_WAY_COUNT; way++) {
             AVZNativeFastTLBEntry *candidate =
                 &fast_path->instruction_tlb[base + way];
@@ -1015,15 +2220,33 @@ static int avz_fast_translate_instruction(
                 entry = candidate;
                 break;
             }
-            if (!candidate->valid && first_invalid == NULL) {
+            if ((!candidate->valid ||
+                 candidate->generation != fast_path->translation_generation) &&
+                first_invalid == NULL) {
                 first_invalid = candidate;
+            }
+            if (candidate->valid &&
+                candidate->generation != fast_path->translation_generation &&
+                candidate->virtual_page == virtual_page &&
+                candidate->context_tag == context_tag) {
+                invalidated_mapping = 1;
             }
         }
 
         if (entry != NULL) {
-            fast_path->statistics.instruction_tlb_hits++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_hits);
         } else {
-            fast_path->statistics.instruction_tlb_misses++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_misses);
+            if (invalidated_mapping) {
+                AVZ_MEMORY_STAT_INCREMENT(
+                    fast_path, instruction_tlb_invalidation_misses);
+            } else if (first_invalid != NULL) {
+                AVZ_MEMORY_STAT_INCREMENT(
+                    fast_path, instruction_tlb_cold_misses);
+            } else {
+                AVZ_MEMORY_STAT_INCREMENT(
+                    fast_path, instruction_tlb_conflict_misses);
+            }
             uint64_t translated = 0;
             if (!avz_resolve_translation(
                     fast_path,
@@ -1055,12 +2278,19 @@ static int avz_fast_translate_instruction(
                 .virtual_page = virtual_page,
                 .physical_page = physical_page,
                 .host_page = host_page,
+                .contiguous_span = AVZ_FAST_PAGE_SIZE,
                 .context_tag = context_tag,
                 .generation = fast_path->translation_generation,
                 .valid = 1
             };
         }
-        fast_path->instruction_hot = *entry;
+        size_t hot_slot =
+            fast_path->instruction_hot_replacement &
+            (AVZ_FAST_INSTRUCTION_HOT_COUNT - 1u);
+        fast_path->instruction_hot_replacement = (uint8_t)(
+            (hot_slot + 1u) & (AVZ_FAST_INSTRUCTION_HOT_COUNT - 1u)
+        );
+        fast_path->instruction_hot[hot_slot] = *entry;
     }
 
     physical_page = entry->physical_page;
@@ -1095,9 +2325,188 @@ int avz_native_fast_fetch_instruction(
         )) {
         return 0;
     }
-    memcpy(instruction, host_address, sizeof(*instruction));
-    fast_path->statistics.instruction_fetch_hits++;
+    *instruction = __atomic_load_n(
+        (const uint32_t *)host_address,
+        __ATOMIC_ACQUIRE
+    );
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_fetch_hits);
     return 1;
+}
+
+static void avz_fast_store_value(
+    uint8_t *host_address,
+    uint8_t width,
+    uint64_t value
+) {
+    /* STLR/STLXR handlers issue their release fence before reaching here. */
+    const uintptr_t address = (uintptr_t)host_address;
+    if (width == 1) {
+        __atomic_store_n(host_address, (uint8_t)value, __ATOMIC_RELAXED);
+    } else if (width == 2 && (address & 1u) == 0) {
+        __atomic_store_n((uint16_t *)host_address, (uint16_t)value, __ATOMIC_RELAXED);
+    } else if (width == 4 && (address & 3u) == 0) {
+        __atomic_store_n((uint32_t *)host_address, (uint32_t)value, __ATOMIC_RELAXED);
+    } else if (width == 8 && (address & 7u) == 0) {
+        __atomic_store_n((uint64_t *)host_address, value, __ATOMIC_RELAXED);
+    } else {
+        for (uint8_t offset = 0; offset < width; offset++) {
+            __atomic_store_n(
+                host_address + offset,
+                (uint8_t)(value >> (offset * 8u)),
+                __ATOMIC_RELAXED
+            );
+        }
+    }
+}
+
+static uint8_t avz_fast_atomic_chunk_width(
+    const uint8_t *host_address,
+    size_t remaining
+) {
+    const uintptr_t address = (uintptr_t)host_address;
+    if (remaining >= 8u && (address & 7u) == 0) {
+        return 8;
+    }
+    if (remaining >= 4u && (address & 3u) == 0) {
+        return 4;
+    }
+    if (remaining >= 2u && (address & 1u) == 0) {
+        return 2;
+    }
+    return 1;
+}
+
+static void avz_fast_atomic_read_bytes(
+    const uint8_t *host_address,
+    uint8_t *destination,
+    size_t byte_count
+) {
+    size_t offset = 0;
+    while (offset < byte_count) {
+        uint8_t width = avz_fast_atomic_chunk_width(
+            host_address + offset, byte_count - offset);
+        uint64_t value = avz_fast_load(host_address + offset, width);
+        memcpy(destination + offset, &value, width);
+        offset += width;
+    }
+}
+
+static void avz_fast_atomic_write_bytes(
+    uint8_t *host_address,
+    const uint8_t *source,
+    size_t byte_count
+) {
+    size_t offset = 0;
+    while (offset < byte_count) {
+        uint8_t width = avz_fast_atomic_chunk_width(
+            host_address + offset, byte_count - offset);
+        uint64_t value = 0;
+        memcpy(&value, source + offset, width);
+        avz_fast_store_value(host_address + offset, width, value);
+        offset += width;
+    }
+}
+
+static void avz_fast_atomic_fill_bytes(
+    uint8_t *host_address,
+    size_t byte_count,
+    const uint8_t *pattern,
+    uint8_t pattern_width,
+    uint64_t pattern_phase
+) {
+    size_t offset = 0;
+    while (offset < byte_count) {
+        uint8_t width = avz_fast_atomic_chunk_width(
+            host_address + offset, byte_count - offset);
+        uint8_t bytes[8] = {0};
+        for (uint8_t index = 0; index < width; index++) {
+            bytes[index] = pattern[
+                (pattern_phase + offset + index) % pattern_width];
+        }
+        uint64_t value = 0;
+        memcpy(&value, bytes, width);
+        avz_fast_store_value(host_address + offset, width, value);
+        offset += width;
+    }
+}
+
+int avz_guest_memory_dma_read_owned(
+    AVZGuestMemory *memory,
+    size_t offset,
+    void *destination,
+    size_t byte_count
+) {
+    if (memory == NULL || destination == NULL || byte_count == 0 ||
+        offset >= memory->size || byte_count > memory->size - offset) {
+        return 0;
+    }
+
+    /* The virtqueue acquire publishes all guest writes before device DMA. */
+    atomic_thread_fence(memory_order_acquire);
+    memcpy(destination, memory->bytes + offset, byte_count);
+    return 1;
+}
+
+uint8_t *avz_guest_memory_dma_owned_pointer(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return NULL;
+    }
+
+    atomic_thread_fence(memory_order_acquire);
+    return memory->bytes + offset;
+}
+
+void avz_guest_memory_dma_write_owned_complete(
+    AVZGuestMemory *memory,
+    size_t offset,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || offset >= memory->size ||
+        byte_count > memory->size - offset) {
+        return;
+    }
+
+    atomic_thread_fence(memory_order_release);
+    avz_guest_memory_note_exclusive_write_generation(
+        memory, offset, byte_count);
+    if (avz_guest_memory_range_may_contain_code(
+            memory, (uint64_t)offset, byte_count, 0)) {
+        avz_guest_memory_note_page_write_generation(
+            memory, offset, byte_count);
+        avz_guest_memory_advance_code_mutation_epoch(memory);
+    }
+}
+
+int avz_guest_memory_dma_write_owned(
+    AVZGuestMemory *memory,
+    size_t offset,
+    const void *source,
+    size_t byte_count
+) {
+    if (memory == NULL || source == NULL || byte_count == 0 ||
+        offset >= memory->size || byte_count > memory->size - offset) {
+        return 0;
+    }
+
+    memcpy(memory->bytes + offset, source, byte_count);
+    avz_guest_memory_dma_write_owned_complete(memory, offset, byte_count);
+    return 1;
+}
+
+static int avz_fast_access_is_naturally_atomic(
+    const uint8_t *host_address,
+    uint8_t width
+) {
+    const uintptr_t address = (uintptr_t)host_address;
+    return width == 1 ||
+        (width == 2 && (address & 1u) == 0) ||
+        (width == 4 && (address & 3u) == 0) ||
+        (width == 8 && (address & 7u) == 0);
 }
 
 static void avz_fast_store(
@@ -1108,39 +2517,33 @@ static void avz_fast_store(
     uint64_t value
 ) {
     AVZGuestMemory *memory = fast_path->guest_memory;
-    if (memory != NULL) {
-        while (atomic_flag_test_and_set_explicit(
-            &memory->write_lock,
-            memory_order_acquire
-        )) {
-        }
+    size_t memory_offset = physical_address >= fast_path->ram_base
+        ? (size_t)(physical_address - fast_path->ram_base)
+        : 0;
+    const int requires_lock = memory != NULL &&
+        (!avz_fast_access_is_naturally_atomic(host_address, width) ||
+         (avz_guest_memory_range_may_have_observation(
+              memory, memory_offset, width, UINT8_MAX) &&
+          (avz_guest_memory_range_has_host_observer(
+               memory, memory_offset, width) ||
+           avz_guest_memory_range_has_bulk_reader(
+               memory, memory_offset, width) ||
+           avz_guest_memory_range_has_exclusive_observer(
+               memory, memory_offset, width))));
+    if (requires_lock) {
+        avz_guest_memory_lock_range_internal(memory, memory_offset, width);
     }
-    const uintptr_t address = (uintptr_t)host_address;
-    if (width == 1) {
-        __atomic_store_n(host_address, (uint8_t)value, __ATOMIC_RELEASE);
-    } else if (width == 2 && (address & 1u) == 0) {
-        __atomic_store_n((uint16_t *)host_address, (uint16_t)value, __ATOMIC_RELEASE);
-    } else if (width == 4 && (address & 3u) == 0) {
-        __atomic_store_n((uint32_t *)host_address, (uint32_t)value, __ATOMIC_RELEASE);
-    } else if (width == 8 && (address & 7u) == 0) {
-        __atomic_store_n((uint64_t *)host_address, value, __ATOMIC_RELEASE);
-    } else {
-        memcpy(host_address, &value, width);
-    }
-    avz_fast_mark_dirty(fast_path, physical_address, width);
-    if (fast_path->block_cache != 0) {
-        avz_native_block_cache_invalidate_physical_range(
-            fast_path->block_cache,
-            physical_address,
-            width
-        );
-    }
-    if (memory != NULL) {
-        atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    avz_fast_store_value(host_address, width, value);
+    int contains_code = avz_fast_mark_dirty(
+        fast_path, physical_address, width);
+    avz_fast_invalidate_code_after_write(
+        fast_path, physical_address, width, contains_code);
+    if (requires_lock) {
+        avz_guest_memory_unlock_range_internal(memory, memory_offset, width);
     }
 }
 
-static uint64_t avz_guest_memory_write_generation(
+static uint64_t avz_guest_memory_page_generation(
     const AVZGuestMemory *memory,
     uint64_t physical_address,
     uint64_t ram_base,
@@ -1171,17 +2574,211 @@ static uint64_t avz_guest_memory_write_generation(
     return generation;
 }
 
+static uint64_t avz_guest_memory_exclusive_write_generation(
+    const AVZGuestMemory *memory,
+    uint64_t physical_address,
+    uint64_t ram_base,
+    size_t byte_count
+) {
+    if (memory == NULL || byte_count == 0 || physical_address < ram_base) {
+        return 0;
+    }
+    const uint64_t raw_offset = physical_address - ram_base;
+    if (raw_offset > SIZE_MAX || (size_t)raw_offset >= memory->size ||
+        byte_count > memory->size - (size_t)raw_offset) {
+        return 0;
+    }
+    const size_t offset = (size_t)raw_offset;
+    const size_t first_granule = offset >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    const size_t last_granule =
+        (offset + byte_count - 1u) >> AVZ_EXCLUSIVE_GRANULE_SHIFT;
+    uint64_t generation = 0;
+    for (size_t granule = first_granule;
+         granule <= last_granule; granule++) {
+        const size_t slot = avz_guest_memory_exclusive_slot(memory, granule);
+        const uint64_t candidate = atomic_load_explicit(
+            &memory->exclusive_write_generations[slot],
+            memory_order_acquire
+        );
+        if (candidate > generation) {
+            generation = candidate;
+        }
+    }
+    return generation;
+}
+
 uint64_t avz_guest_memory_page_write_generation(
     const AVZGuestMemory *memory,
     uint64_t physical_page,
     uint64_t ram_base
 ) {
-    return avz_guest_memory_write_generation(
+    return avz_guest_memory_page_generation(
         memory,
         physical_page,
         ram_base,
         AVZ_FAST_PAGE_SIZE
     );
+}
+
+const uint64_t *avz_guest_memory_page_write_generation_token(
+    const AVZGuestMemory *memory,
+    uint64_t physical_page,
+    uint64_t ram_base
+) {
+    if (memory == NULL || physical_page < ram_base) {
+        return NULL;
+    }
+    const uint64_t raw_offset = physical_page - ram_base;
+    if (raw_offset > SIZE_MAX || (size_t)raw_offset >= memory->size) {
+        return NULL;
+    }
+    const size_t page = (size_t)raw_offset >> AVZ_FAST_PAGE_SHIFT;
+    if (page >= memory->page_count) {
+        return NULL;
+    }
+    return (const uint64_t *)&memory->page_write_generations[page];
+}
+
+AVZGuestExclusiveStatistics avz_guest_memory_exclusive_statistics(
+    const AVZGuestMemory *memory
+) {
+    if (memory == NULL) {
+        return (AVZGuestExclusiveStatistics){0};
+    }
+    return (AVZGuestExclusiveStatistics){
+        .reads = atomic_load_explicit(
+            &memory->exclusive_reads, memory_order_relaxed),
+        .nonzero_reads = atomic_load_explicit(
+            &memory->exclusive_nonzero_reads, memory_order_relaxed),
+        .write_successes = atomic_load_explicit(
+            &memory->exclusive_write_successes, memory_order_relaxed),
+        .write_conflicts = atomic_load_explicit(
+            &memory->exclusive_write_conflicts, memory_order_relaxed)
+    };
+}
+
+static int avz_guest_memory_valid_exclusive_range(
+    const AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    size_t element_count
+) {
+    if (memory == NULL ||
+        (width != 1 && width != 2 && width != 4 && width != 8) ||
+        element_count == 0 || width > SIZE_MAX / element_count) {
+        return 0;
+    }
+    const size_t byte_count = (size_t)width * element_count;
+    return offset <= memory->size && byte_count <= memory->size - offset;
+}
+
+int avz_guest_memory_exclusive_read(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t *value,
+    uint64_t *generation
+) {
+    if (value == NULL || generation == NULL ||
+        !avz_guest_memory_valid_exclusive_range(memory, offset, width, 1)) {
+        return 0;
+    }
+    avz_guest_memory_lock_range_internal(memory, offset, width);
+    avz_guest_memory_note_exclusive_observation(memory, offset, width);
+    *value = avz_fast_load(memory->bytes + offset, width);
+    *generation = avz_guest_memory_exclusive_write_generation(
+        memory, (uint64_t)offset, 0, width);
+    atomic_fetch_add_explicit(
+        &memory->exclusive_reads, 1, memory_order_relaxed);
+    if (*value != 0) {
+        atomic_fetch_add_explicit(
+            &memory->exclusive_nonzero_reads, 1, memory_order_relaxed);
+    }
+    avz_guest_memory_unlock_range_internal(memory, offset, width);
+    return 1;
+}
+
+int avz_guest_memory_exclusive_read_pair(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t *first_value,
+    uint64_t *second_value,
+    uint64_t *generation
+) {
+    if (first_value == NULL || second_value == NULL || generation == NULL ||
+        !avz_guest_memory_valid_exclusive_range(memory, offset, width, 2)) {
+        return 0;
+    }
+    const size_t byte_count = (size_t)width * 2;
+    avz_guest_memory_lock_range_internal(memory, offset, byte_count);
+    avz_guest_memory_note_exclusive_observation(memory, offset, byte_count);
+    *first_value = avz_fast_load(memory->bytes + offset, width);
+    *second_value = avz_fast_load(memory->bytes + offset + width, width);
+    *generation = avz_guest_memory_exclusive_write_generation(
+        memory, (uint64_t)offset, 0, byte_count);
+    atomic_fetch_add_explicit(
+        &memory->exclusive_reads, 1, memory_order_relaxed);
+    avz_guest_memory_unlock_range_internal(memory, offset, byte_count);
+    return 1;
+}
+
+int avz_guest_memory_exclusive_write(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t value,
+    uint64_t expected_generation
+) {
+    if (!avz_guest_memory_valid_exclusive_range(memory, offset, width, 1)) {
+        return -1;
+    }
+    avz_guest_memory_lock_range_internal(memory, offset, width);
+    const uint64_t generation = avz_guest_memory_exclusive_write_generation(
+        memory, (uint64_t)offset, 0, width);
+    if (generation != expected_generation) {
+        atomic_fetch_add_explicit(
+            &memory->exclusive_write_conflicts, 1, memory_order_relaxed);
+        avz_guest_memory_unlock_range_internal(memory, offset, width);
+        return 0;
+    }
+    avz_fast_store_value(memory->bytes + offset, width, value);
+    avz_guest_memory_note_write(memory, offset, width);
+    atomic_fetch_add_explicit(
+        &memory->exclusive_write_successes, 1, memory_order_relaxed);
+    avz_guest_memory_unlock_range_internal(memory, offset, width);
+    return 1;
+}
+
+int avz_guest_memory_exclusive_write_pair(
+    AVZGuestMemory *memory,
+    size_t offset,
+    uint8_t width,
+    uint64_t first_value,
+    uint64_t second_value,
+    uint64_t expected_generation
+) {
+    if (!avz_guest_memory_valid_exclusive_range(memory, offset, width, 2)) {
+        return -1;
+    }
+    const size_t byte_count = (size_t)width * 2;
+    avz_guest_memory_lock_range_internal(memory, offset, byte_count);
+    const uint64_t generation = avz_guest_memory_exclusive_write_generation(
+        memory, (uint64_t)offset, 0, byte_count);
+    if (generation != expected_generation) {
+        atomic_fetch_add_explicit(
+            &memory->exclusive_write_conflicts, 1, memory_order_relaxed);
+        avz_guest_memory_unlock_range_internal(memory, offset, byte_count);
+        return 0;
+    }
+    avz_fast_store_value(memory->bytes + offset, width, first_value);
+    avz_fast_store_value(
+        memory->bytes + offset + width, width, second_value);
+    avz_guest_memory_note_write(memory, offset, byte_count);
+    atomic_fetch_add_explicit(
+        &memory->exclusive_write_successes, 1, memory_order_relaxed);
+    avz_guest_memory_unlock_range_internal(memory, offset, byte_count);
+    return 1;
 }
 
 int avz_native_fast_memory_reservation_generation(
@@ -1205,12 +2802,18 @@ int avz_native_fast_memory_reservation_generation(
         ) != AVZ_FAST_TRANSLATION_RAM) {
         return 0;
     }
-    *generation = avz_guest_memory_write_generation(
-        fast_path->guest_memory,
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    size_t memory_offset = (size_t)(physical_address - fast_path->ram_base);
+    avz_guest_memory_lock_range_internal(memory, memory_offset, width);
+    avz_guest_memory_note_exclusive_observation(
+        memory, memory_offset, width);
+    *generation = avz_guest_memory_exclusive_write_generation(
+        memory,
         physical_address,
         fast_path->ram_base,
         width
     );
+    avz_guest_memory_unlock_range_internal(memory, memory_offset, width);
     return 1;
 }
 
@@ -1238,19 +2841,30 @@ int avz_native_fast_memory_exclusive_read(
     }
 
     AVZGuestMemory *memory = fast_path->guest_memory;
-    while (atomic_flag_test_and_set_explicit(
-        &memory->write_lock,
-        memory_order_acquire
-    )) {
-    }
+    size_t memory_offset = (size_t)(physical_address - fast_path->ram_base);
+    avz_guest_memory_lock_range_internal(memory, memory_offset, width);
+    avz_guest_memory_note_exclusive_observation(
+        memory, memory_offset, width);
     *value = avz_fast_load(host_address, width);
-    *generation = avz_guest_memory_write_generation(
+    fast_path->exclusive_expected_address = physical_address;
+    fast_path->exclusive_expected_first = *value;
+    fast_path->exclusive_expected_second = 0;
+    fast_path->exclusive_expected_width = width;
+    fast_path->exclusive_expected_count = 1;
+    fast_path->exclusive_expected_valid = 1;
+    atomic_fetch_add_explicit(
+        &memory->exclusive_reads, 1, memory_order_relaxed);
+    if (*value != 0) {
+        atomic_fetch_add_explicit(
+            &memory->exclusive_nonzero_reads, 1, memory_order_relaxed);
+    }
+    *generation = avz_guest_memory_exclusive_write_generation(
         memory,
         physical_address,
         fast_path->ram_base,
         width
     );
-    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    avz_guest_memory_unlock_range_internal(memory, memory_offset, width);
     return 1;
 }
 
@@ -1289,20 +2903,40 @@ int avz_native_fast_memory_exclusive_read_pair(
     }
 
     AVZGuestMemory *memory = fast_path->guest_memory;
-    while (atomic_flag_test_and_set_explicit(
-        &memory->write_lock,
-        memory_order_acquire
-    )) {
+    size_t first_offset = (size_t)(first_physical - fast_path->ram_base);
+    size_t second_offset = (size_t)(second_physical - fast_path->ram_base);
+    uint16_t lock_stripes[4];
+    size_t lock_stripe_count = 0;
+    if (!avz_guest_memory_lock_small_pair(
+            memory,
+            first_offset,
+            width,
+            second_offset,
+            width,
+            lock_stripes,
+            sizeof(lock_stripes) / sizeof(lock_stripes[0]),
+            &lock_stripe_count)) {
+        return 0;
     }
+    avz_guest_memory_note_exclusive_observation(
+        memory, first_offset, width);
+    avz_guest_memory_note_exclusive_observation(
+        memory, second_offset, width);
     *first_value = avz_fast_load(first_host, width);
     *second_value = avz_fast_load(second_host, width);
-    const uint64_t first_generation = avz_guest_memory_write_generation(
+    fast_path->exclusive_expected_address = first_physical;
+    fast_path->exclusive_expected_first = *first_value;
+    fast_path->exclusive_expected_second = *second_value;
+    fast_path->exclusive_expected_width = width;
+    fast_path->exclusive_expected_count = 2;
+    fast_path->exclusive_expected_valid = 1;
+    const uint64_t first_generation = avz_guest_memory_exclusive_write_generation(
         memory,
         first_physical,
         fast_path->ram_base,
         width
     );
-    const uint64_t second_generation = avz_guest_memory_write_generation(
+    const uint64_t second_generation = avz_guest_memory_exclusive_write_generation(
         memory,
         second_physical,
         fast_path->ram_base,
@@ -1311,7 +2945,8 @@ int avz_native_fast_memory_exclusive_read_pair(
     *generation = first_generation > second_generation
         ? first_generation
         : second_generation;
-    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    avz_guest_memory_unlock_small_set(
+        memory, lock_stripes, lock_stripe_count);
     return 1;
 }
 
@@ -1338,43 +2973,37 @@ int avz_native_fast_memory_exclusive_write(
     }
 
     AVZGuestMemory *memory = fast_path->guest_memory;
-    while (atomic_flag_test_and_set_explicit(
-        &memory->write_lock,
-        memory_order_acquire
-    )) {
-    }
-    const uint64_t current_generation = avz_guest_memory_write_generation(
+    size_t memory_offset = (size_t)(physical_address - fast_path->ram_base);
+    avz_guest_memory_lock_range_internal(memory, memory_offset, width);
+    fast_path->exclusive_expected_valid = 0;
+    const uint64_t current_generation = avz_guest_memory_exclusive_write_generation(
         memory,
         physical_address,
         fast_path->ram_base,
         width
     );
     if (current_generation != expected_generation) {
-        atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+        atomic_fetch_add_explicit(
+            &memory->exclusive_write_conflicts, 1, memory_order_relaxed);
+        avz_guest_memory_unlock_range_internal(memory, memory_offset, width);
         return 0;
     }
 
-    const uintptr_t address = (uintptr_t)host_address;
-    if (width == 1) {
-        __atomic_store_n(host_address, (uint8_t)value, __ATOMIC_RELEASE);
-    } else if (width == 2 && (address & 1u) == 0) {
-        __atomic_store_n((uint16_t *)host_address, (uint16_t)value, __ATOMIC_RELEASE);
-    } else if (width == 4 && (address & 3u) == 0) {
-        __atomic_store_n((uint32_t *)host_address, (uint32_t)value, __ATOMIC_RELEASE);
-    } else if (width == 8 && (address & 7u) == 0) {
-        __atomic_store_n((uint64_t *)host_address, value, __ATOMIC_RELEASE);
-    } else {
-        memcpy(host_address, &value, width);
-    }
-    avz_fast_mark_dirty(fast_path, physical_address, width);
-    if (fast_path->block_cache != NULL) {
-        avz_native_block_cache_invalidate_physical_range(
-            fast_path->block_cache,
-            physical_address,
-            width
-        );
-    }
-    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    /*
+     * The page-stripe lock and per-granule write generation form the guest
+     * global exclusive monitor.  Expected-value scratch belongs to a single
+     * PE and must never decide another PE's STXR result when a fast-memory
+     * context is reused.  Once the generation matches under the stripe lock,
+     * this store is the only architecturally valid winner.
+     */
+    avz_fast_store_value(host_address, width, value);
+    int contains_code = avz_fast_mark_dirty(
+        fast_path, physical_address, width);
+    avz_fast_invalidate_code_after_write(
+        fast_path, physical_address, width, contains_code);
+    atomic_fetch_add_explicit(
+        &memory->exclusive_write_successes, 1, memory_order_relaxed);
+    avz_guest_memory_unlock_range_internal(memory, memory_offset, width);
     return 1;
 }
 
@@ -1412,18 +3041,29 @@ int avz_native_fast_memory_exclusive_write_pair(
     }
 
     AVZGuestMemory *memory = fast_path->guest_memory;
-    while (atomic_flag_test_and_set_explicit(
-        &memory->write_lock,
-        memory_order_acquire
-    )) {
+    size_t first_offset = (size_t)(first_physical - fast_path->ram_base);
+    size_t second_offset = (size_t)(second_physical - fast_path->ram_base);
+    uint16_t lock_stripes[4];
+    size_t lock_stripe_count = 0;
+    if (!avz_guest_memory_lock_small_pair(
+            memory,
+            first_offset,
+            width,
+            second_offset,
+            width,
+            lock_stripes,
+            sizeof(lock_stripes) / sizeof(lock_stripes[0]),
+            &lock_stripe_count)) {
+        return -1;
     }
-    const uint64_t first_generation = avz_guest_memory_write_generation(
+    fast_path->exclusive_expected_valid = 0;
+    const uint64_t first_generation = avz_guest_memory_exclusive_write_generation(
         memory,
         first_physical,
         fast_path->ram_base,
         width
     );
-    const uint64_t second_generation = avz_guest_memory_write_generation(
+    const uint64_t second_generation = avz_guest_memory_exclusive_write_generation(
         memory,
         second_physical,
         fast_path->ram_base,
@@ -1433,27 +3073,27 @@ int avz_native_fast_memory_exclusive_write_pair(
         ? first_generation
         : second_generation;
     if (current_generation != expected_generation) {
-        atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+        atomic_fetch_add_explicit(
+            &memory->exclusive_write_conflicts, 1, memory_order_relaxed);
+        avz_guest_memory_unlock_small_set(
+            memory, lock_stripes, lock_stripe_count);
         return 0;
     }
 
-    memcpy(first_host, &first_value, width);
-    memcpy(second_host, &second_value, width);
-    avz_fast_mark_dirty(fast_path, first_physical, width);
-    avz_fast_mark_dirty(fast_path, second_physical, width);
-    if (fast_path->block_cache != NULL) {
-        avz_native_block_cache_invalidate_physical_range(
-            fast_path->block_cache,
-            first_physical,
-            width
-        );
-        avz_native_block_cache_invalidate_physical_range(
-            fast_path->block_cache,
-            second_physical,
-            width
-        );
-    }
-    atomic_flag_clear_explicit(&memory->write_lock, memory_order_release);
+    avz_fast_store_value(first_host, width, first_value);
+    avz_fast_store_value(second_host, width, second_value);
+    int first_contains_code = avz_fast_mark_dirty(
+        fast_path, first_physical, width);
+    int second_contains_code = avz_fast_mark_dirty(
+        fast_path, second_physical, width);
+    avz_fast_invalidate_code_after_write(
+        fast_path, first_physical, width, first_contains_code);
+    avz_fast_invalidate_code_after_write(
+        fast_path, second_physical, width, second_contains_code);
+    atomic_fetch_add_explicit(
+        &memory->exclusive_write_successes, 1, memory_order_relaxed);
+    avz_guest_memory_unlock_small_set(
+        memory, lock_stripes, lock_stripe_count);
     return 1;
 }
 
@@ -1499,6 +3139,8 @@ AVZNativeMemoryFastPath *avz_native_memory_fast_path_create(
     fast_path->slow_synchronous_exception = slow_synchronous_exception;
     fast_path->slow_wait = slow_wait;
     fast_path->translation_generation = 1;
+    fast_path->detailed_statistics_enabled = 1;
+    fast_path->direct_bulk_mapping_enabled = 1;
     if (block_cache != 0 &&
         !avz_native_block_cache_bind_physical_memory(
             block_cache,
@@ -1540,6 +3182,24 @@ void avz_native_memory_fast_path_set_ram(
     }
 }
 
+void avz_native_memory_fast_path_set_detailed_statistics_enabled(
+    AVZNativeMemoryFastPath *fast_path,
+    int enabled
+) {
+    if (fast_path != NULL) {
+        fast_path->detailed_statistics_enabled = enabled != 0;
+    }
+}
+
+void avz_native_memory_fast_path_set_direct_bulk_mapping_enabled(
+    AVZNativeMemoryFastPath *fast_path,
+    int enabled
+) {
+    if (fast_path != NULL) {
+        fast_path->direct_bulk_mapping_enabled = enabled != 0;
+    }
+}
+
 int avz_native_memory_fast_path_set_guest_memory(
     AVZNativeMemoryFastPath *fast_path,
     AVZGuestMemory *memory
@@ -1572,7 +3232,11 @@ void avz_native_memory_fast_path_set_instruction_translator(
         0,
         sizeof(fast_path->instruction_tlb)
     );
-    fast_path->instruction_hot.valid = 0;
+    memset(
+        fast_path->instruction_hot,
+        0,
+        sizeof(fast_path->instruction_hot)
+    );
     memset(
         fast_path->instruction_replacement,
         0,
@@ -1761,7 +3425,11 @@ static void avz_native_fast_set_current_el(
         return;
     fast_path->translation_state.current_el = current_el;
     avz_fast_refresh_translation_context_tags(fast_path);
-    fast_path->instruction_hot.valid = 0;
+    memset(
+        fast_path->instruction_hot,
+        0,
+        sizeof(fast_path->instruction_hot)
+    );
 }
 
 int avz_native_fast_memory_read(
@@ -1785,8 +3453,32 @@ int avz_native_fast_memory_read(
         &host_address
     );
     if (translation == AVZ_FAST_TRANSLATION_RAM) {
+        AVZGuestMemory *memory = fast_path->guest_memory;
+        const size_t memory_offset = physical_address >= fast_path->ram_base
+            ? (size_t)(physical_address - fast_path->ram_base)
+            : 0;
+        const uintptr_t address = (uintptr_t)host_address;
+        const int naturally_atomic = width == 1 ||
+            (width == 2 && (address & 1u) == 0) ||
+            (width == 4 && (address & 3u) == 0) ||
+            (width == 8 && (address & 7u) == 0);
+        const int requires_lock = memory != NULL &&
+            (!naturally_atomic ||
+             avz_guest_memory_range_may_have_observation(
+                 memory,
+                 memory_offset,
+                 width,
+                 AVZ_GUEST_PAGE_OBSERVATION_HOST));
+        if (requires_lock) {
+            avz_guest_memory_lock_range_internal(
+                memory, memory_offset, width);
+        }
         *value = avz_fast_load(host_address, width);
-        fast_path->statistics.read_hits++;
+        if (requires_lock) {
+            avz_guest_memory_unlock_range_internal(
+                memory, memory_offset, width);
+        }
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, read_hits);
         return 1;
     }
     if (translation == AVZ_FAST_TRANSLATION_PHYSICAL &&
@@ -1797,7 +3489,7 @@ int avz_native_fast_memory_read(
             width,
             value
         )) {
-        fast_path->statistics.physical_device_reads++;
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, physical_device_reads);
         return 1;
     }
     if (fast_path != NULL && fast_path->translation_fault_pending) {
@@ -1838,7 +3530,7 @@ int avz_native_fast_memory_write(
             width,
             value
         );
-        fast_path->statistics.write_hits++;
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, write_hits);
         return 1;
     }
     if (translation == AVZ_FAST_TRANSLATION_PHYSICAL &&
@@ -1849,7 +3541,7 @@ int avz_native_fast_memory_write(
             width,
             value
         )) {
-        fast_path->statistics.physical_device_writes++;
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, physical_device_writes);
         return 1;
     }
     if (fast_path != NULL && fast_path->translation_fault_pending) {
@@ -1865,6 +3557,221 @@ int avz_native_fast_memory_write(
         : 0;
 }
 
+static int avz_native_fast_memory_translate_pair(
+    AVZNativeMemoryFastPath *fast_path,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint8_t is_write,
+    uint64_t *first_physical,
+    uint64_t *second_physical,
+    uint8_t **first_host,
+    uint8_t **second_host
+) {
+    if (fast_path == NULL || first_physical == NULL ||
+        second_physical == NULL || first_host == NULL ||
+        second_host == NULL ||
+        (width != 1 && width != 2 && width != 4 && width != 8) ||
+        virtual_address > UINT64_MAX - width) {
+        return 0;
+    }
+
+    const size_t pair_byte_count = (size_t)width * 2u;
+    const size_t page_offset =
+        (size_t)(virtual_address & (AVZ_FAST_PAGE_SIZE - 1u));
+    if (pair_byte_count <= AVZ_FAST_PAGE_SIZE - page_offset &&
+        avz_fast_translate(
+            fast_path,
+            virtual_address,
+            (uint8_t)pair_byte_count,
+            is_write != 0,
+            first_physical,
+            first_host
+        ) == AVZ_FAST_TRANSLATION_RAM) {
+        *second_physical = *first_physical + width;
+        *second_host = *first_host + width;
+        return 1;
+    }
+
+    return avz_fast_translate(
+            fast_path,
+            virtual_address,
+            width,
+            is_write != 0,
+            first_physical,
+            first_host
+        ) == AVZ_FAST_TRANSLATION_RAM &&
+        avz_fast_translate(
+            fast_path,
+            virtual_address + width,
+            width,
+            is_write != 0,
+            second_physical,
+            second_host
+        ) == AVZ_FAST_TRANSLATION_RAM;
+}
+
+int avz_native_fast_memory_read_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t *first_value,
+    uint64_t *second_value
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t first_physical = 0;
+    uint64_t second_physical = 0;
+    uint8_t *first_host = NULL;
+    uint8_t *second_host = NULL;
+    if (first_value == NULL || second_value == NULL ||
+        !avz_native_fast_memory_translate_pair(
+            fast_path,
+            virtual_address,
+            width,
+            0,
+            &first_physical,
+            &second_physical,
+            &first_host,
+            &second_host
+        )) {
+        return 0;
+    }
+
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    const size_t first_offset =
+        (size_t)(first_physical - fast_path->ram_base);
+    const size_t second_offset =
+        (size_t)(second_physical - fast_path->ram_base);
+    const int requires_lock = memory != NULL &&
+        (!avz_fast_access_is_naturally_atomic(first_host, width) ||
+         !avz_fast_access_is_naturally_atomic(second_host, width) ||
+         avz_guest_memory_range_may_have_observation(
+             memory,
+             first_offset,
+             width,
+             AVZ_GUEST_PAGE_OBSERVATION_HOST) ||
+         avz_guest_memory_range_may_have_observation(
+             memory,
+             second_offset,
+             width,
+             AVZ_GUEST_PAGE_OBSERVATION_HOST));
+    uint16_t lock_stripes[4];
+    size_t lock_stripe_count = 0;
+    if (requires_lock) {
+        if (!avz_guest_memory_lock_small_pair(
+                memory,
+                first_offset,
+                width,
+                second_offset,
+                width,
+                lock_stripes,
+                sizeof(lock_stripes) / sizeof(lock_stripes[0]),
+                &lock_stripe_count)) {
+            return 0;
+        }
+    }
+    *first_value = avz_fast_load(first_host, width);
+    *second_value = avz_fast_load(second_host, width);
+    if (requires_lock) {
+        avz_guest_memory_unlock_small_set(
+            memory, lock_stripes, lock_stripe_count);
+    }
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, read_hits);
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, read_hits);
+    return 1;
+}
+
+int avz_native_fast_memory_write_pair(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint64_t first_value,
+    uint64_t second_value
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t first_physical = 0;
+    uint64_t second_physical = 0;
+    uint8_t *first_host = NULL;
+    uint8_t *second_host = NULL;
+    if (!avz_native_fast_memory_translate_pair(
+            fast_path,
+            virtual_address,
+            width,
+            1,
+            &first_physical,
+            &second_physical,
+            &first_host,
+            &second_host
+        )) {
+        return 0;
+    }
+
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    const size_t first_offset =
+        (size_t)(first_physical - fast_path->ram_base);
+    const size_t second_offset =
+        (size_t)(second_physical - fast_path->ram_base);
+    const int requires_lock = memory != NULL &&
+        (!avz_fast_access_is_naturally_atomic(first_host, width) ||
+         !avz_fast_access_is_naturally_atomic(second_host, width) ||
+         ((avz_guest_memory_range_may_have_observation(
+                memory, first_offset, width, UINT8_MAX) ||
+           avz_guest_memory_range_may_have_observation(
+                memory, second_offset, width, UINT8_MAX)) &&
+          (avz_guest_memory_range_has_host_observer(
+               memory, first_offset, width) ||
+           avz_guest_memory_range_has_host_observer(
+               memory, second_offset, width) ||
+           avz_guest_memory_range_has_bulk_reader(
+               memory, first_offset, width) ||
+           avz_guest_memory_range_has_bulk_reader(
+               memory, second_offset, width) ||
+           avz_guest_memory_range_has_exclusive_observer(
+               memory, first_offset, width) ||
+           avz_guest_memory_range_has_exclusive_observer(
+               memory, second_offset, width))));
+    uint16_t lock_stripes[4];
+    size_t lock_stripe_count = 0;
+    if (requires_lock) {
+        if (!avz_guest_memory_lock_small_pair(
+                memory,
+                first_offset,
+                width,
+                second_offset,
+                width,
+                lock_stripes,
+                sizeof(lock_stripes) / sizeof(lock_stripes[0]),
+                &lock_stripe_count)) {
+            return 0;
+        }
+    }
+
+    avz_fast_store_value(first_host, width, first_value);
+    avz_fast_store_value(second_host, width, second_value);
+    if (second_physical == first_physical + width) {
+        const size_t byte_count = (size_t)width * 2u;
+        int contains_code = avz_fast_mark_dirty(
+            fast_path, first_physical, byte_count);
+        avz_fast_invalidate_code_after_write(
+            fast_path, first_physical, byte_count, contains_code);
+    } else {
+        int contains_code = avz_fast_mark_dirty(
+            fast_path, first_physical, width);
+        avz_fast_invalidate_code_after_write(
+            fast_path, first_physical, width, contains_code);
+        contains_code = avz_fast_mark_dirty(
+            fast_path, second_physical, width);
+        avz_fast_invalidate_code_after_write(
+            fast_path, second_physical, width, contains_code);
+    }
+    if (requires_lock) {
+        avz_guest_memory_unlock_small_set(
+            memory, lock_stripes, lock_stripe_count);
+    }
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, write_hits);
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, write_hits);
+    return 1;
+}
+
 int avz_native_fast_memory_read_bytes(
     void *context,
     uint64_t virtual_address,
@@ -1874,34 +3781,86 @@ int avz_native_fast_memory_read_bytes(
     AVZNativeMemoryFastPath *fast_path = context;
     uint8_t *output = destination;
     if (fast_path == NULL || output == NULL || byte_count == 0 ||
-        byte_count > 64 || virtual_address > UINT64_MAX - (byte_count - 1u)) {
+        byte_count > AVZ_FAST_PAGE_SIZE ||
+        virtual_address > UINT64_MAX - (byte_count - 1u)) {
         return 0;
     }
 
-    size_t copied = 0;
-    while (copied < byte_count) {
-        uint64_t address = virtual_address + copied;
+    typedef struct {
+        uint8_t *host_address;
+        uint64_t physical_address;
+        size_t destination_offset;
+        size_t byte_count;
+    } AVZNativeReadSpan;
+    AVZNativeReadSpan spans[2];
+    size_t span_count = 0;
+    size_t checked = 0;
+    while (checked < byte_count) {
+        uint64_t address = virtual_address + checked;
         size_t page_remaining = AVZ_FAST_PAGE_SIZE -
             (size_t)(address & (AVZ_FAST_PAGE_SIZE - 1u));
-        size_t chunk = byte_count - copied < page_remaining
-            ? byte_count - copied
+        size_t chunk = byte_count - checked < page_remaining
+            ? byte_count - checked
             : page_remaining;
-        uint64_t physical_address = 0;
-        uint8_t *host_address = NULL;
+        if (span_count >= sizeof(spans) / sizeof(spans[0])) {
+            return 0;
+        }
+        AVZNativeReadSpan *span = &spans[span_count];
         if (avz_fast_translate(
                 fast_path,
                 address,
                 1,
                 0,
-                &physical_address,
-                &host_address
+                &span->physical_address,
+                &span->host_address
             ) != AVZ_FAST_TRANSLATION_RAM) {
             return 0;
         }
-        memcpy(output + copied, host_address, chunk);
-        copied += chunk;
+        span->destination_offset = checked;
+        span->byte_count = chunk;
+        span_count++;
+        checked += chunk;
     }
-    fast_path->statistics.read_hits++;
+
+    uint16_t lock_stripes[2];
+    size_t lock_stripe_count = 0;
+    if (fast_path->guest_memory != NULL) {
+        /* This is synchronous vCPU work, not a retained host mapping. Only
+         * pages already shared with a device require stripe serialization. */
+        for (size_t index = 0; index < span_count; index++) {
+            AVZNativeReadSpan *span = &spans[index];
+            const size_t memory_offset = (size_t)(
+                span->physical_address - fast_path->ram_base);
+            if (avz_guest_memory_range_may_have_observation(
+                    fast_path->guest_memory,
+                    memory_offset,
+                    span->byte_count,
+                    AVZ_GUEST_PAGE_OBSERVATION_HOST) &&
+                !avz_guest_memory_collect_small_range_locks(
+                    fast_path->guest_memory,
+                    memory_offset,
+                    span->byte_count,
+                    lock_stripes,
+                    sizeof(lock_stripes) / sizeof(lock_stripes[0]),
+                    &lock_stripe_count)) {
+                return 0;
+            }
+        }
+        avz_guest_memory_lock_small_set(
+            fast_path->guest_memory, lock_stripes, lock_stripe_count);
+    }
+    for (size_t index = 0; index < span_count; index++) {
+        AVZNativeReadSpan *span = &spans[index];
+        avz_fast_atomic_read_bytes(
+            span->host_address,
+            output + span->destination_offset,
+            span->byte_count);
+    }
+    if (fast_path->guest_memory != NULL) {
+        avz_guest_memory_unlock_small_set(
+            fast_path->guest_memory, lock_stripes, lock_stripe_count);
+    }
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, read_hits);
     return 1;
 }
 
@@ -1956,25 +3915,53 @@ int avz_native_fast_memory_write_bytes(
 
     for (size_t index = 0; index < span_count; index++) {
         AVZNativeWriteSpan *span = &spans[index];
-        memcpy(
+        size_t memory_offset = (size_t)(
+            span->physical_address - fast_path->ram_base);
+        /* Do not permanently turn libc/SIMD destinations into shared pages.
+         * Existing host and exclusive observers still use the same locks. */
+        int requires_lock = fast_path->guest_memory != NULL &&
+            avz_guest_memory_range_may_have_observation(
+                fast_path->guest_memory,
+                memory_offset,
+                span->byte_count,
+                UINT8_MAX) &&
+            (avz_guest_memory_range_has_host_observer(
+                 fast_path->guest_memory,
+                 memory_offset,
+                 span->byte_count) ||
+             avz_guest_memory_range_has_bulk_reader(
+                 fast_path->guest_memory,
+                 memory_offset,
+                 span->byte_count) ||
+             avz_guest_memory_range_has_exclusive_observer(
+                 fast_path->guest_memory,
+                 memory_offset,
+                 span->byte_count));
+        if (requires_lock) {
+            avz_guest_memory_lock_range_internal(
+                fast_path->guest_memory, memory_offset, span->byte_count);
+        }
+        avz_fast_atomic_write_bytes(
             span->host_address,
             input + span->source_offset,
-            span->byte_count
-        );
-        avz_fast_mark_dirty(
+            span->byte_count);
+        int contains_code = avz_fast_mark_dirty(
             fast_path,
             span->physical_address,
             span->byte_count
         );
-        if (fast_path->block_cache != NULL) {
-            avz_native_block_cache_invalidate_physical_range(
-                fast_path->block_cache,
-                span->physical_address,
-                span->byte_count
-            );
+        avz_fast_invalidate_code_after_write(
+            fast_path,
+            span->physical_address,
+            span->byte_count,
+            contains_code
+        );
+        if (requires_lock) {
+            avz_guest_memory_unlock_range_internal(
+                fast_path->guest_memory, memory_offset, span->byte_count);
         }
     }
-    fast_path->statistics.write_hits++;
+    AVZ_MEMORY_STAT_INCREMENT(fast_path, write_hits);
     return 1;
 }
 
@@ -1987,7 +3974,8 @@ int avz_native_fast_memory_map_span(
     uint64_t *physical_address
 ) {
     AVZNativeMemoryFastPath *fast_path = context;
-    if (fast_path == NULL || host_address == NULL ||
+    if (fast_path == NULL || !fast_path->direct_bulk_mapping_enabled ||
+        host_address == NULL ||
         physical_address == NULL || byte_count == 0 || byte_count > 64 ||
         virtual_address > UINT64_MAX - (byte_count - 1u)) {
         return 0;
@@ -2016,11 +4004,137 @@ int avz_native_fast_memory_map_span(
         return 0;
     }
     if (is_write != 0) {
-        fast_path->statistics.write_hits++;
+        avz_guest_memory_note_host_observation(
+            fast_path->guest_memory,
+            (size_t)ram_offset,
+            byte_count
+        );
     } else {
-        fast_path->statistics.read_hits++;
+        avz_guest_memory_note_bulk_read(
+            fast_path->guest_memory,
+            (size_t)ram_offset,
+            byte_count
+        );
+    }
+    if (is_write != 0) {
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, write_hits);
+    } else {
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, read_hits);
     }
     return 1;
+}
+
+void avz_native_fast_memory_lock(void *context) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path != NULL) {
+        avz_guest_memory_lock_internal(fast_path->guest_memory);
+    }
+}
+
+void avz_native_fast_memory_unlock(void *context) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path != NULL) {
+        avz_guest_memory_unlock_internal(fast_path->guest_memory);
+    }
+}
+
+void avz_native_fast_memory_lock_physical_span(
+    void *context,
+    uint64_t physical_address,
+    size_t byte_count
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        physical_address < fast_path->ram_base) {
+        return;
+    }
+    uint64_t offset = physical_address - fast_path->ram_base;
+    if (offset > SIZE_MAX) {
+        return;
+    }
+    avz_guest_memory_lock_range_internal(
+        fast_path->guest_memory, (size_t)offset, byte_count);
+}
+
+void avz_native_fast_memory_unlock_physical_span(
+    void *context,
+    uint64_t physical_address,
+    size_t byte_count
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        physical_address < fast_path->ram_base) {
+        return;
+    }
+    uint64_t offset = physical_address - fast_path->ram_base;
+    if (offset > SIZE_MAX) {
+        return;
+    }
+    avz_guest_memory_unlock_range_internal(
+        fast_path->guest_memory, (size_t)offset, byte_count);
+}
+
+static int avz_native_fast_memory_collect_physical_spans(
+    AVZNativeMemoryFastPath *fast_path,
+    const AVZNativePhysicalSpan *spans,
+    size_t span_count,
+    uint64_t *lock_bitmap
+) {
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        spans == NULL || span_count == 0) {
+        return 0;
+    }
+    memset(lock_bitmap, 0,
+        AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS * sizeof(*lock_bitmap));
+    for (size_t index = 0; index < span_count; index++) {
+        if (spans[index].physical_address < fast_path->ram_base) {
+            return 0;
+        }
+        uint64_t offset = spans[index].physical_address - fast_path->ram_base;
+        if (offset > SIZE_MAX || !avz_guest_memory_collect_range_locks(
+                fast_path->guest_memory,
+                (size_t)offset,
+                spans[index].byte_count,
+                lock_bitmap)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int avz_native_fast_memory_lock_physical_spans(
+    void *context,
+    const AVZNativePhysicalSpan *spans,
+    size_t span_count
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path != NULL && fast_path->guest_memory == NULL) {
+        return 1;
+    }
+    uint64_t lock_bitmap[AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS];
+    if (!avz_native_fast_memory_collect_physical_spans(
+            fast_path, spans, span_count, lock_bitmap)) {
+        return 0;
+    }
+    avz_guest_memory_lock_bitmap(fast_path->guest_memory, lock_bitmap);
+    return 1;
+}
+
+void avz_native_fast_memory_unlock_physical_spans(
+    void *context,
+    const AVZNativePhysicalSpan *spans,
+    size_t span_count
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path != NULL && fast_path->guest_memory == NULL) {
+        return;
+    }
+    uint64_t lock_bitmap[AVZ_GUEST_MEMORY_LOCK_BITMAP_WORDS];
+    if (!avz_native_fast_memory_collect_physical_spans(
+            fast_path, spans, span_count, lock_bitmap)) {
+        return;
+    }
+    avz_guest_memory_unlock_bitmap(fast_path->guest_memory, lock_bitmap);
 }
 
 void avz_native_fast_memory_commit_write_span(
@@ -2032,14 +4146,10 @@ void avz_native_fast_memory_commit_write_span(
     if (fast_path == NULL || byte_count == 0) {
         return;
     }
-    avz_fast_mark_dirty(fast_path, physical_address, byte_count);
-    if (fast_path->block_cache != NULL) {
-        avz_native_block_cache_invalidate_physical_range(
-            fast_path->block_cache,
-            physical_address,
-            byte_count
-        );
-    }
+    int contains_code = avz_fast_mark_dirty(
+        fast_path, physical_address, byte_count);
+    avz_fast_invalidate_code_after_write(
+        fast_path, physical_address, byte_count, contains_code);
 }
 
 int avz_native_fast_memory_can_access(
@@ -2132,49 +4242,64 @@ int avz_native_fast_memory_fill(
                         &physical_address,
                         &host_address
                     ) != AVZ_FAST_TRANSLATION_RAM) {
-                    fast_path->statistics.fill_misses++;
+                    AVZ_MEMORY_STAT_INCREMENT(fast_path, fill_misses);
                     return 0;
                 }
-                uint64_t phase = written % pattern_width;
-                uint8_t repeated[8];
-                for (size_t index = 0; index < sizeof(repeated); index++) {
-                    repeated[index] =
-                        pattern_bytes[(phase + index) % pattern_width];
+                size_t memory_offset = (size_t)(
+                    physical_address - fast_path->ram_base);
+                int requires_lock = fast_path->guest_memory != NULL &&
+                    avz_guest_memory_range_may_have_observation(
+                        fast_path->guest_memory,
+                        memory_offset,
+                        (size_t)chunk,
+                        UINT8_MAX) &&
+                    (avz_guest_memory_range_has_host_observer(
+                         fast_path->guest_memory,
+                         memory_offset,
+                         (size_t)chunk) ||
+                     avz_guest_memory_range_has_bulk_reader(
+                         fast_path->guest_memory,
+                         memory_offset,
+                         (size_t)chunk) ||
+                     avz_guest_memory_range_has_exclusive_observer(
+                         fast_path->guest_memory,
+                         memory_offset,
+                         (size_t)chunk));
+                if (requires_lock) {
+                    avz_guest_memory_lock_range_internal(
+                        fast_path->guest_memory,
+                        memory_offset,
+                        (size_t)chunk);
                 }
-                uint64_t index = 0;
-                while (chunk - index >= sizeof(repeated)) {
-                    memcpy(
-                        host_address + index,
-                        repeated,
-                        sizeof(repeated)
-                    );
-                    index += sizeof(repeated);
-                }
-                if (index < chunk) {
-                    memcpy(
-                        host_address + index,
-                        repeated,
-                        (size_t)(chunk - index)
-                    );
-                }
-                if (fast_path->block_cache != NULL) {
-                    avz_native_block_cache_invalidate_physical_range(
-                        fast_path->block_cache,
-                        physical_address,
-                        chunk
-                    );
-                }
-                avz_fast_mark_dirty(
+                avz_fast_atomic_fill_bytes(
+                    host_address,
+                    (size_t)chunk,
+                    pattern_bytes,
+                    pattern_width,
+                    written % pattern_width);
+                int contains_code = avz_fast_mark_dirty(
                     fast_path,
                     physical_address,
                     (size_t)chunk
                 );
+                avz_fast_invalidate_code_after_write(
+                    fast_path,
+                    physical_address,
+                    (size_t)chunk,
+                    contains_code
+                );
+                if (requires_lock) {
+                    avz_guest_memory_unlock_range_internal(
+                        fast_path->guest_memory,
+                        memory_offset,
+                        (size_t)chunk);
+                }
                 written += chunk;
             }
-            fast_path->statistics.fill_hits++;
+            AVZ_MEMORY_STAT_INCREMENT(fast_path, fill_hits);
             return 1;
         }
-        fast_path->statistics.fill_misses++;
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, fill_misses);
     }
     if (fast_path != NULL && fast_path->translation_fault_pending) {
         return 0;
@@ -2265,7 +4390,7 @@ int avz_native_fast_read_system_register(
         default:
             goto slow_path;
         }
-        fast_path->statistics.local_system_register_reads++;
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, local_system_register_reads);
         return 1;
     }
 
@@ -2371,7 +4496,7 @@ int avz_native_fast_write_system_register(
         default:
             goto slow_path;
         }
-        fast_path->statistics.local_system_register_writes++;
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, local_system_register_writes);
         return 1;
     }
 
@@ -2394,6 +4519,10 @@ int avz_native_fast_execute_system_instruction(
     uint64_t operand
 ) {
     AVZNativeMemoryFastPath *fast_path = context;
+    if (fast_path != NULL &&
+        avz_is_coherent_cache_maintenance(instruction)) {
+        return 1;
+    }
     return fast_path != 0 && fast_path->slow_execute_system_instruction != 0
         ? fast_path->slow_execute_system_instruction(
             fast_path->slow_context,

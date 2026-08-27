@@ -1,0 +1,85 @@
+--- a/src/layout-transaction.c
++++ b/src/layout-transaction.c
+@@ -19,7 +19,8 @@
+  * them have committed new matching buffers.
+  */
+ 
+-#define TIMEOUT_LAYER_MS 3000
++#define DEFAULT_TIMEOUT_LAYER_MS 3000
++#define MIN_TIMEOUT_LAYER_MS 16
+ 
+ enum {
+   PROP_0,
+@@ -34,6 +35,8 @@ struct _PhocLayoutTransaction {
+   gint64                starttime;
+   guint                 pending_layer_configures;
+   guint                 layer_timer_id;
++  guint                 layer_timeout_ms;
++  guint                 stale_layer_configures;
+ };
+ G_DEFINE_TYPE (PhocLayoutTransaction, phoc_layout_transaction, G_TYPE_OBJECT)
+ 
+@@ -50,6 +53,7 @@ abort_transaction (PhocLayoutTransaction *self)
+ {
+   g_return_if_fail (self->pending_layer_configures);
+ 
++  self->stale_layer_configures += self->pending_layer_configures;
+   apply_transaction (self);
+ 
+   self->pending_layer_configures = 0;
+@@ -64,7 +68,7 @@ on_timeout_expired (gpointer user_data)
+ 
+   self->layer_timer_id = 0;
+-  g_warning ("Timeout (%dms) expired with %u configures pending",
+-             TIMEOUT_LAYER_MS, self->pending_layer_configures);
++  g_warning ("Timeout (%ums) expired with %u configures pending",
++             self->layer_timeout_ms, self->pending_layer_configures);
+   abort_transaction (self);
+ }
+ 
+@@ -129,6 +133,18 @@ phoc_layout_transaction_class_init (PhocLayoutTransactionClass *klass)
+ static void
+ phoc_layout_transaction_init (PhocLayoutTransaction *self)
+ {
++  const char *value = g_getenv ("PHOC_LAYOUT_TRANSACTION_TIMEOUT_MS");
++  guint64 timeout = DEFAULT_TIMEOUT_LAYER_MS;
++
++  if (value && *value) {
++    char *end = NULL;
++    guint64 parsed = g_ascii_strtoull (value, &end, 10);
++
++    if (end != value && *end == '\0')
++      timeout = CLAMP (parsed, MIN_TIMEOUT_LAYER_MS,
++                       DEFAULT_TIMEOUT_LAYER_MS);
++  }
++  self->layer_timeout_ms = timeout;
+ }
+ 
+ /**
+@@ -184,7 +200,8 @@ phoc_layout_transaction_add_layer_dirty (PhocLayoutTransaction *self)
+   /* Outstanding configures. Transaction started */
+   g_debug ("Starting new layout transaction");
+   self->starttime = g_get_monotonic_time ();
+-  self->layer_timer_id = g_timeout_add_once (TIMEOUT_LAYER_MS, on_timeout_expired, self);
++  self->layer_timer_id = g_timeout_add_once (
++    self->layer_timeout_ms, on_timeout_expired, self);
+   g_source_set_name_by_id (self->layer_timer_id, "[phoc] layout transaction timer");
+   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_ACTIVE]);
+ }
+@@ -204,7 +221,15 @@ phoc_layout_transaction_notify_layer_configured (PhocLayoutTransaction *self)
+ 
+   g_assert (PHOC_IS_LAYOUT_TRANSACTION (self));
+ 
+-  g_return_if_fail (self->pending_layer_configures > 0);
++  /* A configure may complete after a timed-out transaction was published.
++   * Consume that completion without corrupting a newer transaction or
++   * emitting a critical assertion. */
++  if (self->stale_layer_configures > 0) {
++    self->stale_layer_configures--;
++    return;
++  }
++  if (self->pending_layer_configures == 0)
++    return;
+ 
+   self->pending_layer_configures--;
+   if (self->pending_layer_configures) {

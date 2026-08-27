@@ -2,6 +2,56 @@ import XCTest
 @testable import ARM64VizCore
 
 final class ParavirtualGraphicsTests: XCTestCase {
+    func testDeferredParavirtualCompletionPublishesOnlyAfterAcceleratorFence() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
+        let backing: GuestAddress = 0x4001_0000
+        let gpu = VirtIOGPUDevice(width: 2, height: 2)
+        let accelerator = DeferredRecordingGraphicsAccelerator()
+        gpu.setGraphicsAccelerator(accelerator)
+        try createResource(
+            id: 1,
+            backing: backing,
+            pixels: [UInt8](repeating: 0, count: 16),
+            width: 2,
+            height: 2,
+            gpu: gpu,
+            memory: memory
+        )
+        let command = paravirtualRequest(
+            operation: 3,
+            sourceResourceID: 0,
+            destinationResourceID: 1,
+            sourceX: 0,
+            sourceY: 0,
+            destinationX: 0,
+            destinationY: 0,
+            width: 2,
+            height: 2,
+            color: 0xff00_0000
+        )
+        let response = DeferredResponseBox()
+
+        XCTAssertTrue(gpu.processDeferred(
+            request: command,
+            memory: memory,
+            completion: { response.store($0) }
+        ))
+        XCTAssertNil(response.value)
+        XCTAssertEqual(
+            try memory.readBytes(at: backing, count: 16),
+            [UInt8](repeating: 0, count: 16)
+        )
+
+        accelerator.complete(success: true)
+
+        XCTAssertEqual(response.value.map(responseType), 0x1100)
+        XCTAssertEqual(
+            try memory.readBytes(at: backing, count: 16),
+            [UInt8](repeating: 0x7a, count: 16)
+        )
+        XCTAssertTrue(gpu.diagnosticsSummary().contains("pv2d=1/1:4"))
+    }
+
     func testParavirtualFillUsesSharedGuestBacking() throws {
         let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
         let backing: GuestAddress = 0x4001_0000
@@ -40,6 +90,70 @@ final class ParavirtualGraphicsTests: XCTestCase {
         )
         XCTAssertTrue(gpu.diagnosticsSummary().contains("pv2d=1/1:4"))
         XCTAssertTrue(gpu.diagnosticsSummary().contains("/b0/m1"))
+    }
+
+    func testAcceleratedGuestWriteTransfersExactDamageWithoutPageReadback() throws {
+        let width = 64
+        let height = 32
+        let byteCount = width * height * 4
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
+        let backing: GuestAddress = 0x4001_0000
+        let gpu = VirtIOGPUDevice(width: width, height: height)
+        let accelerator = RectangleGraphicsAccelerator()
+        gpu.setGraphicsAccelerator(accelerator)
+        try createResource(
+            id: 1,
+            backing: backing,
+            pixels: [UInt8](repeating: 0, count: byteCount),
+            width: UInt32(width),
+            height: UInt32(height),
+            gpu: gpu,
+            memory: memory
+        )
+
+        let fullRectangle = [UInt32(0), 0, UInt32(width), UInt32(height)]
+        XCTAssertEqual(responseType(gpu.process(
+            request: gpuRequest(type: 0x0103, words: fullRectangle + [0, 1]),
+            memory: memory
+        )), 0x1100)
+        let transfer = gpuRequest(
+            type: 0x0105,
+            words: fullRectangle + [0, 0, 1, 0]
+        )
+        let flush = gpuRequest(type: 0x0104, words: fullRectangle + [1, 0])
+        XCTAssertEqual(responseType(gpu.process(request: transfer, memory: memory)), 0x1100)
+        XCTAssertEqual(responseType(gpu.process(request: flush, memory: memory)), 0x1100)
+        let firstFrame = try XCTUnwrap(gpu.snapshot(afterGeneration: nil))
+
+        let x: UInt32 = 7
+        let y: UInt32 = 20
+        XCTAssertEqual(responseType(gpu.process(
+            request: paravirtualRequest(
+                operation: 3,
+                sourceResourceID: 0,
+                destinationResourceID: 1,
+                sourceX: 0,
+                sourceY: 0,
+                destinationX: Int32(x),
+                destinationY: Int32(y),
+                width: 1,
+                height: 1,
+                color: 0xff30_2010
+            ),
+            memory: memory
+        )), 0x1100)
+        XCTAssertEqual(responseType(gpu.process(request: transfer, memory: memory)), 0x1100)
+        XCTAssertEqual(responseType(gpu.process(request: flush, memory: memory)), 0x1100)
+
+        let frame = try XCTUnwrap(gpu.snapshot(afterGeneration: firstFrame.generation))
+        let offset = (Int(y) * width + Int(x)) * 4
+        XCTAssertEqual(Array(frame.pixels[offset..<(offset + 4)]), [0x10, 0x20, 0x30, 0xff])
+        XCTAssertEqual(frame.damage, [
+            VirtualFramebufferDamage(x: Int(x), y: Int(y), width: 1, height: 1)
+        ])
+        let diagnostics = gpu.diagnosticsSummary()
+        XCTAssertTrue(diagnostics.contains("pages=1/0:\(byteCount + 4)"), diagnostics)
+        XCTAssertTrue(diagnostics.contains("exact=1/4"), diagnostics)
     }
 
     func testParavirtualCompletionPreservesVirtIOFence() throws {
@@ -402,6 +516,152 @@ final class ParavirtualGraphicsTests: XCTestCase {
         )
     }
 
+    func testExactCompositeCopiesAndFillsPackedA8Surfaces() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
+        let sourceBacking: GuestAddress = 0x4001_0000
+        let destinationBacking: GuestAddress = 0x4001_1000
+        let gpu = VirtIOGPUDevice(width: 2, height: 2)
+        try createResource(
+            id: 1,
+            backing: sourceBacking,
+            pixels: [64, 128, 9, 9, 9, 9, 9, 9, 192, 255, 9, 9, 9, 9, 9, 9],
+            width: 2,
+            height: 2,
+            gpu: gpu,
+            memory: memory
+        )
+        try createResource(
+            id: 2,
+            backing: destinationBacking,
+            pixels: [UInt8](repeating: 7, count: 16),
+            width: 2,
+            height: 2,
+            gpu: gpu,
+            memory: memory
+        )
+
+        let copy = paravirtualRequest(
+            version: PineconeGraphicsProtocol.exactCompositeVersion,
+            operation: PineconeGraphicsBlendOperator.source.rawValue,
+            flags: PineconeGraphicsProtocol.sourceContainsAlphaFlag |
+                PineconeGraphicsProtocol.packedA8SourceFlag |
+                PineconeGraphicsProtocol.packedA8DestinationFlag,
+            sourceResourceID: 1,
+            destinationResourceID: 2,
+            sourceX: 0,
+            sourceY: 0,
+            destinationX: 0,
+            destinationY: 0,
+            width: 2,
+            height: 2,
+            color: 0
+        )
+        XCTAssertEqual(responseType(gpu.process(request: copy, memory: memory)), 0x1100)
+        XCTAssertEqual(
+            try memory.readBytes(at: destinationBacking, count: 16),
+            [64, 128, 7, 7, 7, 7, 7, 7, 192, 255, 7, 7, 7, 7, 7, 7]
+        )
+
+        let fill = paravirtualRequest(
+            version: PineconeGraphicsProtocol.exactCompositeVersion,
+            operation: PineconeGraphicsBlendOperator.source.rawValue,
+            flags: PineconeGraphicsProtocol.solidSourceFlag |
+                PineconeGraphicsProtocol.packedA8DestinationFlag,
+            sourceResourceID: 0,
+            destinationResourceID: 2,
+            sourceX: 0,
+            sourceY: 0,
+            destinationX: 1,
+            destinationY: 0,
+            width: 1,
+            height: 2,
+            color: 0x8000_0000
+        )
+        XCTAssertEqual(responseType(gpu.process(request: fill, memory: memory)), 0x1100)
+        XCTAssertEqual(
+            try memory.readBytes(at: destinationBacking, count: 16),
+            [64, 128, 7, 7, 7, 7, 7, 7, 192, 128, 7, 7, 7, 7, 7, 7]
+        )
+    }
+
+    func testPackedA8ExactCompositeIsValidInsideBatchEnvelope() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x40_000)
+        let gpu = VirtIOGPUDevice(width: 64, height: 64)
+        try createResource(
+            id: 11, backing: 0x4001_0000,
+            pixels: [UInt8](repeating: 0, count: 64 * 64 * 4),
+            width: 64, height: 64, gpu: gpu, memory: memory
+        )
+        try createResource(
+            id: 12, backing: 0x4002_0000,
+            pixels: [UInt8](repeating: 128, count: 64 * 64 * 4),
+            width: 64, height: 64, gpu: gpu, memory: memory
+        )
+        let command = paravirtualRequest(
+            version: PineconeGraphicsProtocol.exactCompositeVersion,
+            operation: PineconeGraphicsBlendOperator.source.rawValue,
+            flags: PineconeGraphicsProtocol.sourceContainsAlphaFlag |
+                PineconeGraphicsProtocol.packedA8SourceFlag |
+                PineconeGraphicsProtocol.packedA8DestinationFlag,
+            sourceResourceID: 12,
+            destinationResourceID: 11,
+            sourceX: 0,
+            sourceY: 0,
+            sourceWidth: 23,
+            sourceHeight: 30,
+            destinationX: 0,
+            destinationY: 0,
+            width: 23,
+            height: 30,
+            color: 0
+        )
+        let batch = paravirtualBatchRequest([command])
+        XCTAssertEqual(responseType(gpu.process(request: batch, memory: memory)), 0x1100)
+        XCTAssertEqual(
+            try memory.readBytes(at: 0x4001_0000, count: 23),
+            [UInt8](repeating: 128, count: 23)
+        )
+    }
+
+    func testPackedA8SourceRequiresAlphaSemanticsAndNearestFiltering() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
+        let gpu = VirtIOGPUDevice(width: 1, height: 1)
+        try createResource(
+            id: 1, backing: 0x4001_0000,
+            pixels: [128, 0, 0, 0], gpu: gpu, memory: memory
+        )
+        try createResource(
+            id: 2, backing: 0x4001_1000,
+            pixels: [0, 0, 0, 0], gpu: gpu, memory: memory
+        )
+
+        for invalidFlags in [
+            PineconeGraphicsProtocol.packedA8SourceFlag,
+            PineconeGraphicsProtocol.packedA8SourceFlag |
+                PineconeGraphicsProtocol.sourceContainsAlphaFlag |
+                PineconeGraphicsProtocol.bilinearFilterFlag
+        ] {
+            let command = paravirtualRequest(
+                version: PineconeGraphicsProtocol.exactCompositeVersion,
+                operation: PineconeGraphicsBlendOperator.source.rawValue,
+                flags: invalidFlags,
+                sourceResourceID: 1,
+                destinationResourceID: 2,
+                sourceX: 0,
+                sourceY: 0,
+                destinationX: 0,
+                destinationY: 0,
+                width: 1,
+                height: 1,
+                color: 0
+            )
+            XCTAssertEqual(
+                responseType(gpu.process(request: command, memory: memory)),
+                0x1205
+            )
+        }
+    }
+
     func testExactCompositeAppliesComponentAlphaSourceOver() throws {
         let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
         let gpu = VirtIOGPUDevice(width: 1, height: 1)
@@ -459,6 +719,65 @@ final class ParavirtualGraphicsTests: XCTestCase {
             try memory.readBytes(at: 0x4001_1000, count: 4),
             [255, 60, 255, 255]
         )
+    }
+
+    func testExactCompositeSaturateUsesPixmanUNORMQuantization() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
+        let gpu = VirtIOGPUDevice(width: 1, height: 1)
+        try createResource(
+            id: 1, backing: 0x4001_0000,
+            pixels: [0x1f, 0x3f, 0x7f, 0xfe], gpu: gpu, memory: memory
+        )
+        try createResource(
+            id: 2, backing: 0x4001_1000,
+            pixels: [0x1f, 0x3f, 0x7f, 0xfe], gpu: gpu, memory: memory
+        )
+        let command = paravirtualRequest(
+            version: PineconeGraphicsProtocol.exactCompositeVersion,
+            operation: PineconeGraphicsBlendOperator.saturate.rawValue,
+            flags: PineconeGraphicsProtocol.sourceContainsAlphaFlag,
+            sourceResourceID: 1, destinationResourceID: 2,
+            sourceX: 0, sourceY: 0, destinationX: 0, destinationY: 0,
+            width: 1, height: 1, color: 0
+        )
+        XCTAssertEqual(responseType(gpu.process(request: command, memory: memory)), 0x1100)
+        XCTAssertEqual(
+            try memory.readBytes(at: 0x4001_1000, count: 4),
+            [0x1f, 0x3f, 0x80, 0xff]
+        )
+    }
+
+    func testExactCompositeSupportsDestinationOverAndSourceIn() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
+        let gpu = VirtIOGPUDevice(width: 1, height: 1)
+        try createResource(
+            id: 1, backing: 0x4001_0000,
+            pixels: [40, 20, 10, 128], gpu: gpu, memory: memory
+        )
+        try createResource(
+            id: 2, backing: 0x4001_1000,
+            pixels: [100, 80, 60, 64], gpu: gpu, memory: memory
+        )
+
+        func composite(_ operation: PineconeGraphicsBlendOperator) throws -> [UInt8] {
+            let command = paravirtualRequest(
+                version: PineconeGraphicsProtocol.exactCompositeVersion,
+                operation: operation.rawValue,
+                flags: PineconeGraphicsProtocol.sourceContainsAlphaFlag,
+                sourceResourceID: 1, destinationResourceID: 2,
+                sourceX: 0, sourceY: 0, destinationX: 0, destinationY: 0,
+                width: 1, height: 1, color: 0
+            )
+            XCTAssertEqual(
+                responseType(gpu.process(request: command, memory: memory)),
+                0x1100
+            )
+            return try memory.readBytes(at: 0x4001_1000, count: 4)
+        }
+
+        XCTAssertEqual(try composite(.destinationOver), [130, 95, 67, 160])
+        try memory.writeBytes([100, 80, 60, 64], at: 0x4001_1000)
+        XCTAssertEqual(try composite(.sourceIn), [10, 5, 3, 32])
     }
 
     func testNativeFallbackCopiesAndFillsSharedBacking() throws {
@@ -642,12 +961,13 @@ final class ParavirtualGraphicsTests: XCTestCase {
         backing: GuestAddress,
         pixels: [UInt8],
         width: UInt32 = 1,
+        height: UInt32 = 1,
         gpu: VirtIOGPUDevice,
         memory: PhysicalMemory
     ) throws {
         try memory.writeBytes(pixels, at: backing)
         XCTAssertEqual(responseType(gpu.process(
-            request: gpuRequest(type: 0x0101, words: [id, 1, width, 1]),
+            request: gpuRequest(type: 0x0101, words: [id, 1, width, height]),
             memory: memory
         )), 0x1100)
         var attach = gpuRequest(type: 0x0106, words: [id, 1])
@@ -810,5 +1130,101 @@ private final class RecordingGraphicsAccelerator: PineconeGraphicsAccelerator {
             ) else { return false }
         }
         return true
+    }
+}
+
+private final class RectangleGraphicsAccelerator: PineconeGraphicsAccelerator {
+    func execute(
+        _ command: PineconeGraphicsCommand,
+        source: PineconeGraphicsSurface?,
+        mask: PineconeGraphicsSurface?,
+        destination: PineconeGraphicsSurface
+    ) -> Bool {
+        let rectangle = command.destinationRectangle
+        guard rectangle.width > 0, rectangle.height > 0 else { return false }
+        for row in 0..<rectangle.height {
+            let offset = (rectangle.y + row) * destination.stride + rectangle.x * 4
+            let pixels = destination.bytes.baseAddress!.advanced(by: offset)
+                .assumingMemoryBound(to: UInt8.self)
+            for column in 0..<rectangle.width {
+                pixels[column * 4] = UInt8(truncatingIfNeeded: command.color)
+                pixels[column * 4 + 1] = UInt8(truncatingIfNeeded: command.color >> 8)
+                pixels[column * 4 + 2] = UInt8(truncatingIfNeeded: command.color >> 16)
+                pixels[column * 4 + 3] = UInt8(truncatingIfNeeded: command.color >> 24)
+            }
+        }
+        return true
+    }
+
+    func executeBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool {
+        workItems.allSatisfy {
+            execute(
+                $0.command,
+                source: $0.source,
+                mask: $0.mask,
+                destination: $0.destination
+            )
+        }
+    }
+}
+
+private final class DeferredRecordingGraphicsAccelerator: PineconeGraphicsAccelerator,
+    @unchecked Sendable {
+    private var workItems: [PineconeGraphicsWorkItem] = []
+    private var completion: (@Sendable (Bool) -> Void)?
+
+    func execute(
+        _ command: PineconeGraphicsCommand,
+        source: PineconeGraphicsSurface?,
+        mask: PineconeGraphicsSurface?,
+        destination: PineconeGraphicsSurface
+    ) -> Bool {
+        false
+    }
+
+    func executeBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool {
+        false
+    }
+
+    func executeBatchAsync(
+        _ workItems: [PineconeGraphicsWorkItem],
+        completion: @escaping @Sendable (Bool) -> Void
+    ) -> Bool {
+        self.workItems = workItems
+        self.completion = completion
+        return true
+    }
+
+    func complete(success: Bool) {
+        if success {
+            for item in workItems {
+                item.destination.bytes.initializeMemory(
+                    as: UInt8.self,
+                    repeating: 0x7a
+                )
+            }
+        }
+        let callback = completion
+        workItems.removeAll(keepingCapacity: false)
+        completion = nil
+        callback?(success)
+    }
+}
+
+private final class DeferredResponseBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [UInt8]?
+
+    var value: [UInt8]? {
+        lock.lock()
+        let result = storage
+        lock.unlock()
+        return result
+    }
+
+    func store(_ value: [UInt8]) {
+        lock.lock()
+        storage = value
+        lock.unlock()
     }
 }

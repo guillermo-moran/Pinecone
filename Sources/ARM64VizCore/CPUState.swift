@@ -8,6 +8,7 @@ public struct CPUState: Codable, Equatable {
     public var halted: Bool
     public var exclusiveReservationAddress: UInt64?
     public var exclusiveReservationSize: Int?
+    public var exclusiveReservationGeneration: UInt64?
 
     public init(
         x: [UInt64] = Array(repeating: 0, count: 31),
@@ -18,7 +19,8 @@ public struct CPUState: Codable, Equatable {
         pstate: UInt64 = 0,
         halted: Bool = false,
         exclusiveReservationAddress: UInt64? = nil,
-        exclusiveReservationSize: Int? = nil
+        exclusiveReservationSize: Int? = nil,
+        exclusiveReservationGeneration: UInt64? = nil
     ) {
         precondition(x.count == 31, "ARM64 CPU state stores X0...X30")
         precondition(v.count == 32, "ARM64 CPU state stores V0...V31")
@@ -31,6 +33,7 @@ public struct CPUState: Codable, Equatable {
         self.halted = halted
         self.exclusiveReservationAddress = exclusiveReservationAddress
         self.exclusiveReservationSize = exclusiveReservationSize
+        self.exclusiveReservationGeneration = exclusiveReservationGeneration
     }
 
     public subscript(register index: Int) -> UInt64 {

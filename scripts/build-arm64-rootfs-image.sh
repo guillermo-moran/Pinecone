@@ -8,6 +8,8 @@ SIZE_MIB="${ROOTFS_SIZE_MIB:-auto}"
 MINIMUM_SIZE_MIB="${ROOTFS_MIN_SIZE_MIB:-384}"
 MINIMUM_FREE_MIB="${ROOTFS_MIN_FREE_MIB:-256}"
 MKE2FS="${MKE2FS:-}"
+E2FSCK="${E2FSCK:-}"
+DUMPE2FS="${DUMPE2FS:-}"
 BUSYBOX_APPLETS=(
   awk basename cat chgrp chmod chown chroot clear cmp cp cut date dd df dirname
   dmesg du echo env false find free grep head hexdump hostname id ifconfig init ip kill
@@ -19,10 +21,34 @@ BUSYBOX_APPLETS=(
 if [[ -z "${MKE2FS}" ]]; then
   if command -v mke2fs >/dev/null 2>&1; then
     MKE2FS="$(command -v mke2fs)"
+  elif [[ -x "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs" ]]; then
+    MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
   elif [[ -x "${HOME}/Library/Android/sdk/platform-tools/mke2fs" ]]; then
     MKE2FS="${HOME}/Library/Android/sdk/platform-tools/mke2fs"
   else
     echo "mke2fs is required to build ${IMAGE}" >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "${E2FSCK}" ]]; then
+  if command -v e2fsck >/dev/null 2>&1; then
+    E2FSCK="$(command -v e2fsck)"
+  elif [[ -x "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck" ]]; then
+    E2FSCK="/opt/homebrew/opt/e2fsprogs/sbin/e2fsck"
+  else
+    echo "e2fsck is required to validate ${IMAGE}" >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "${DUMPE2FS}" ]]; then
+  if command -v dumpe2fs >/dev/null 2>&1; then
+    DUMPE2FS="$(command -v dumpe2fs)"
+  elif [[ -x "/opt/homebrew/opt/e2fsprogs/sbin/dumpe2fs" ]]; then
+    DUMPE2FS="/opt/homebrew/opt/e2fsprogs/sbin/dumpe2fs"
+  else
+    echo "dumpe2fs is required to validate ${IMAGE}" >&2
     exit 1
   fi
 fi
@@ -32,8 +58,16 @@ if [[ ! -f "${OUT_DIR}/initramfs-virt-ttyinit.cpio" ]]; then
   exit 1
 fi
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/arm64viz-rootfs.XXXXXX")"
+mkdir -p "${ROOT_DIR}/.build"
+WORK_DIR="$(mktemp -d "${ROOT_DIR}/.build/arm64viz-rootfs.XXXXXX")"
 ROOTFS_DIR="${WORK_DIR}/root"
+IMAGE_STAGING="${IMAGE}.staging.$$"
+CHECKSUM_STAGING="${IMAGE}.sha256.staging.$$"
+cleanup() {
+  rm -rf "${WORK_DIR}"
+  rm -f "${IMAGE_STAGING}" "${CHECKSUM_STAGING}"
+}
+trap cleanup EXIT INT TERM
 mkdir -p "${ROOTFS_DIR}"
 
 bsdtar -C "${ROOTFS_DIR}" --exclude dev -xf "${OUT_DIR}/initramfs-virt-ttyinit.cpio"
@@ -69,8 +103,13 @@ if [[ "${ARM64VIZ_GRAPHICAL_ROOTFS:-1}" == "1" ]]; then
   install -d "${ROOTFS_DIR}/usr/include/pinecone"
   install -m 0644 "${ROOT_DIR}/scripts/rootfs/pinecone-pixman.h" \
     "${ROOTFS_DIR}/usr/include/pinecone/pinecone-pixman.h"
-  "${ROOT_DIR}/scripts/build-pinecone-pixman-library.sh" \
-    "${OUT_DIR}/libpixman-1.so.0.46.4"
+  if [[ "${PINECONE_REUSE_PIXMAN_LIBRARY:-0}" != "1" ]]; then
+    "${ROOT_DIR}/scripts/build-pinecone-pixman-library.sh" \
+      "${OUT_DIR}/libpixman-1.so.0.46.4"
+  elif [[ ! -x "${OUT_DIR}/libpixman-1.so.0.46.4" ]]; then
+    echo "missing reusable ${OUT_DIR}/libpixman-1.so.0.46.4" >&2
+    exit 1
+  fi
   install -m 0755 "${OUT_DIR}/libpixman-1.so.0.46.4" \
     "${ROOTFS_DIR}/usr/lib/libpixman-1.so.0.46.4"
   OPTIONAL_DBUS_SERVICES="${ROOTFS_DIR}/usr/share/pinecone/dbus-system-services"
@@ -81,6 +120,58 @@ if [[ "${ARM64VIZ_GRAPHICAL_ROOTFS:-1}" == "1" ]]; then
       mv "${active_service}" "${OPTIONAL_DBUS_SERVICES}/${service}"
     fi
   done
+
+  # feedbackd takes the session bus activation path during Phosh startup, but
+  # this compact guest does not provide the hardware feedback service it needs
+  # to become useful. Leaving its activator installed makes Phosh wait for the
+  # D-Bus 120-second service-start timeout. Keep the descriptor available for
+  # a future supervised feedback stack while making the default failure
+  # immediate and deterministic.
+  OPTIONAL_SESSION_SERVICES="${ROOTFS_DIR}/usr/share/pinecone/dbus-session-services"
+  mkdir -p "${OPTIONAL_SESSION_SERVICES}"
+  FEEDBACK_SERVICE="${ROOTFS_DIR}/usr/share/dbus-1/services/org.sigxcpu.Feedback.service"
+  if [[ -f "${FEEDBACK_SERVICE}" ]]; then
+    mv "${FEEDBACK_SERVICE}" "${OPTIONAL_SESSION_SERVICES}/"
+  fi
+
+  # Alpine marks these applications as D-Bus activatable. Under interpreted
+  # execution a failed activation holds Phosh on an empty launch surface until
+  # dbus-daemon's 120-second timeout. Direct desktop launches still use each
+  # application's normal GApplication single-instance protocol, but report
+  # startup failures immediately and keep stderr in the Phosh session log.
+  for desktop_name in \
+    dev.tchx84.Portfolio.desktop \
+    org.gnome.Calculator.desktop \
+    org.gnome.Calendar.desktop \
+    org.gnome.Settings.desktop \
+    org.gnome.TextEditor.desktop \
+    org.gnome.clocks.desktop; do
+    desktop_file="${ROOTFS_DIR}/usr/share/applications/${desktop_name}"
+    if [[ -f "${desktop_file}" ]]; then
+      sed -i.bak 's/^DBusActivatable=true$/DBusActivatable=false/' \
+        "${desktop_file}"
+      rm -f "${desktop_file}.bak"
+    fi
+  done
+  SETTINGS_DESKTOP="${ROOTFS_DIR}/usr/share/applications/org.gnome.Settings.desktop"
+  if [[ -f "${SETTINGS_DESKTOP}" ]]; then
+    sed -i.bak \
+      's|^Exec=.*$|Exec=/usr/local/bin/pinecone-launch-settings|' \
+      "${SETTINGS_DESKTOP}"
+    rm -f "${SETTINGS_DESKTOP}.bak"
+  fi
+  mkdir -p "${ROOTFS_DIR}/usr/share/pinecone"
+  cat > "${ROOTFS_DIR}/usr/share/pinecone/phosh-apps.list" <<'EOF'
+# Prevalidated first-boot launcher set. Patched Phosh uses normal dynamic
+# discovery after any desktop-file change, including applications added by apk.
+foot.desktop
+dev.tchx84.Portfolio.desktop
+org.gnome.Calculator.desktop
+org.gnome.Calendar.desktop
+org.gnome.clocks.desktop
+org.gnome.TextEditor.desktop
+org.gnome.Settings.desktop
+EOF
   SCHEMA_DIR="${ROOTFS_DIR}/usr/share/glib-2.0/schemas"
   if [[ -d "${SCHEMA_DIR}" ]]; then
     cat > "${SCHEMA_DIR}/99-pinecone.gschema.override" <<'EOF'
@@ -113,12 +204,6 @@ require-unlock=false
 [sm.puri.phosh]
 favorites=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.TextEditor.desktop']
 force-adaptive=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.Calendar.desktop', 'org.gnome.clocks.desktop', 'org.gnome.TextEditor.desktop']
-
-[org.gnome.desktop.background]
-picture-uri=''
-picture-uri-dark=''
-color-shading-type='solid'
-primary-color='#000000'
 EOF
     if ! command -v glib-compile-schemas >/dev/null 2>&1; then
       echo "glib-compile-schemas is required for graphical rootfs profiles" >&2
@@ -133,15 +218,6 @@ EOF
       exit 1
     fi
     update-mime-database "${MIME_DIR}"
-  fi
-
-  # Fontconfig caches are architecture-compatible between the ARM64 build host
-  # and guest. Build them into the image so Phosh does not scan every font on
-  # its first frame. The sysroot keeps cached paths guest-relative.
-  if command -v fc-cache >/dev/null 2>&1 && \
-     [[ -f "${ROOTFS_DIR}/etc/fonts/fonts.conf" ]]; then
-    FONTCONFIG_FILE="${ROOTFS_DIR}/etc/fonts/fonts.conf" \
-      fc-cache --really-force --system-only --sysroot="${ROOTFS_DIR}"
   fi
 
   # GTK icon caches are platform-independent. Use a host utility when present;
@@ -229,6 +305,19 @@ SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pinecone Touchscreen", ENV{I
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pinecone Keyboard", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEYBOARD}="1", ENV{ID_SEAT}="seat0"
 EOF
 
+  # The guest owns eth0 directly through its lightweight static setup. Keep
+  # NetworkManager from replacing that configuration while still exposing the
+  # system D-Bus API expected by Phosh and GNOME Settings.
+  mkdir -p "${ROOTFS_DIR}/etc/NetworkManager/conf.d"
+  cat > "${ROOTFS_DIR}/etc/NetworkManager/conf.d/10-pinecone.conf" <<'EOF'
+[main]
+plugins=keyfile
+no-auto-default=*
+
+[keyfile]
+unmanaged-devices=interface-name:eth0
+EOF
+
   # This compact session does not run gnome-settings-daemon, so changing
   # org.gnome.desktop.interface alone never reaches GtkSettings. Phosh and
   # libhandy would otherwise execute their lock-screen transitions one
@@ -260,18 +349,33 @@ cat > "${ROOTFS_DIR}/etc/passwd" <<EOF
 root:x:0:0:root:/root:/bin/sh
 messagebus:x:101:101:D-Bus system message bus:/run/dbus:/sbin/nologin
 polkitd:x:102:102:PolicyKit daemon:/var/empty:/sbin/nologin
+malcontent-webd:x:106:106:Malcontent web service:/var/empty:/sbin/nologin
+malcontent-timerd:x:107:107:Malcontent timer service:/var/empty:/sbin/nologin
+malcontent-timer-ext-agent:x:108:108:Malcontent timer agent:/var/empty:/sbin/nologin
 colord:x:103:103:Color management daemon:/var/lib/colord:/sbin/nologin
 geoclue:x:104:104:Geolocation service:/var/lib/geoclue:/sbin/nologin
 nobody:x:65534:65534:nobody:/var/empty:/bin/false
 EOF
 cat > "${ROOTFS_DIR}/etc/group" <<EOF
 root:x:0:
+tty:x:5:
+disk:x:6:
+lp:x:7:
+kmem:x:9:
 wheel:x:10:root
+audio:x:18:
+cdrom:x:19:
+dialout:x:20:
+tape:x:26:
 users:x:100:
 video:x:27:root
 input:x:28:root
+kvm:x:34:
 messagebus:x:101:
 polkitd:x:102:
+malcontent-webd:x:106:
+malcontent-timerd:x:107:
+malcontent-timer-ext-agent:x:108:
 colord:x:103:
 geoclue:x:104:
 nobody:x:65534:
@@ -280,6 +384,9 @@ cat > "${ROOTFS_DIR}/etc/shadow" <<EOF
 root::0:0:99999:7:::
 messagebus:!:0:0:99999:7:::
 polkitd:!:0:0:99999:7:::
+malcontent-webd:!:0:0:99999:7:::
+malcontent-timerd:!:0:0:99999:7:::
+malcontent-timer-ext-agent:!:0:0:99999:7:::
 colord:!:0:0:99999:7:::
 geoclue:!:0:0:99999:7:::
 nobody:*:0:0:99999:7:::
@@ -353,6 +460,10 @@ mkdir -p /run/dbus /run/user/0
 chmod 0700 /run/user/0
 if [ ! -S /run/dbus/system_bus_socket ] && command -v dbus-daemon >/dev/null 2>&1; then
   dbus-daemon --system --fork --nopidfile
+fi
+if [ -x /sbin/udevd ] && [ -x /sbin/udevadm ]; then
+  /sbin/udevd --daemon 2>/dev/null || true
+  /sbin/udevadm trigger --subsystem-match=input --action=add >/dev/null 2>&1 &
 fi
 /bin/ifconfig lo 127.0.0.1 up 2>/dev/null || true
 for _ in 1 2 3 4 5; do
@@ -620,6 +731,7 @@ export _GNOME_IS_SOFTWARE_RENDERING=1
 export _GNOME_SESSION_RENDERER=pixman
 export GSK_RENDERER=cairo
 export LD_PRELOAD=/usr/lib/libpinecone-pixman.so
+export PINECONE_PIXMAN_DIAGNOSTICS=${PINECONE_PIXMAN_DIAGNOSTICS:-0}
 # virtio-gpu exposes a virtual connector. Phosh must treat that connector as
 # the device's built-in panel so it can select a primary mobile monitor.
 export PHOSH_DEBUG=fake-builtin
@@ -660,6 +772,8 @@ ln -sf pinecone-session-launcher \
   "${ROOTFS_DIR}/usr/local/bin/start-pinecone-phosh"
 ln -sf pinecone-session-launcher \
   "${ROOTFS_DIR}/usr/local/bin/pinecone-phosh-client"
+ln -sf pinecone-session-launcher \
+  "${ROOTFS_DIR}/usr/local/bin/pinecone-launch-settings"
 cat > "${ROOTFS_DIR}/etc/shells" <<'EOF'
 /bin/sh
 /bin/ash
@@ -719,22 +833,60 @@ elif (( SIZE_MIB < REQUIRED_MIB )); then
   echo "Use ROOTFS_SIZE_MIB=${REQUIRED_MIB} or larger." >&2
   exit 1
 fi
-rm -f "${IMAGE}"
-truncate -s "${SIZE_MIB}M" "${IMAGE}"
+mkdir -p "$(dirname "${IMAGE}")"
+rm -f "${IMAGE_STAGING}" "${CHECKSUM_STAGING}"
+truncate -s "${SIZE_MIB}M" "${IMAGE_STAGING}"
 # The VM does not expose a battery-backed wall clock yet. Normalize staged
 # mtimes so fontconfig and other cache validators do not reject every cache as
 # being newer than the guest clock on each boot.
 find "${ROOTFS_DIR}" -exec touch -h -t 197001010000.00 {} +
-"${MKE2FS}" -q -t ext4 -L arm64viz-root -d "${ROOTFS_DIR}" "${IMAGE}"
+if [[ "${ARM64VIZ_GRAPHICAL_ROOTFS:-1}" == "1" ]]; then
+  # Rebuild timestamp-sensitive caches only after source directories have
+  # their final mtimes. The cache payloads are generated by the staged ARM64
+  # binaries, avoiding host-endian or host-module-path artifacts.
+  GTK_ICON_CACHE_TOOL="${GTK_UPDATE_ICON_CACHE:-$(command -v gtk-update-icon-cache || true)}"
+  if [[ -n "${GTK_ICON_CACHE_TOOL}" ]]; then
+    for theme_dir in "${ROOTFS_DIR}"/usr/share/icons/*; do
+      [[ -f "${theme_dir}/index.theme" ]] || continue
+      "${GTK_ICON_CACHE_TOOL}" --force --ignore-theme-index "${theme_dir}"
+    done
+  fi
+  "${ROOT_DIR}/scripts/generate-aarch64-rootfs-caches.sh" "${ROOTFS_DIR}"
+fi
+# Keep the journal, but materialize allocation metadata before publication.
+# Deferred block/inode initialization exercises SMP paths before userspace is
+# available and previously exposed partially initialized groups to the guest.
+"${MKE2FS}" -q -t ext4 \
+  -O ^metadata_csum,^uninit_bg \
+  -E lazy_itable_init=0,lazy_journal_init=0 \
+  -L arm64viz-root \
+  -d "${ROOTFS_DIR}" \
+  "${IMAGE_STAGING}"
+
+# Never publish an image unless the ext4 metadata is internally consistent.
+# -n keeps validation read-only; -f checks every group even for a clean image.
+if ! "${E2FSCK}" -fn "${IMAGE_STAGING}" > "${WORK_DIR}/e2fsck.log" 2>&1; then
+  cat "${WORK_DIR}/e2fsck.log" >&2
+  echo "error: staged root filesystem failed validation" >&2
+  exit 1
+fi
+
+if "${DUMPE2FS}" "${IMAGE_STAGING}" 2>/dev/null | \
+   grep -Eq 'INODE_UNINIT|BLOCK_UNINIT'; then
+  echo "error: staged root filesystem contains deferred block-group metadata" >&2
+  exit 1
+fi
 
 if command -v shasum >/dev/null 2>&1; then
-  shasum -a 256 "${IMAGE}" | awk '{ print $1 }' > "${IMAGE}.sha256"
+  shasum -a 256 "${IMAGE_STAGING}" | awk '{ print $1 }' > "${CHECKSUM_STAGING}"
 elif command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "${IMAGE}" | awk '{ print $1 }' > "${IMAGE}.sha256"
+  sha256sum "${IMAGE_STAGING}" | awk '{ print $1 }' > "${CHECKSUM_STAGING}"
 else
   echo "error: shasum or sha256sum is required to fingerprint the rootfs" >&2
   exit 1
 fi
+mv "${IMAGE_STAGING}" "${IMAGE}"
+mv "${CHECKSUM_STAGING}" "${IMAGE}.sha256"
 
 echo "Built root filesystem image:"
 echo "  ${IMAGE}"

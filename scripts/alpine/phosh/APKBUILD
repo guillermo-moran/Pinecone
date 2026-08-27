@@ -1,0 +1,128 @@
+# Pinecone's reproducible Phosh build. It follows Alpine edge's 0.57.0-r1
+# package and adds only the opt-in Pinecone startup profile.
+maintainer="team/phosh <newbyte@postmarketos.org>"
+pkgname=phosh
+pkgver=0.57.0
+pkgrel=3
+pkgdesc="Wayland shell for GNOME on mobile devices"
+arch="all !armhf"
+url="https://gitlab.gnome.org/World/Phosh/phosh"
+license="GPL-3.0-only"
+triggers="$pkgname.trigger=/usr/lib/phosh/plugins/prefs"
+depends="
+	$pkgname-schemas
+	adwaita-fonts
+	adwaita-icon-theme
+	bash
+	dbus-x11
+	dbus:org.freedesktop.Secrets
+	desktop-file-utils
+	gnome-control-center
+	gnome-session
+	gnome-settings-daemon
+	gnome-shell-schemas
+	gsettings-desktop-schemas
+	phoc
+	phosh-keyboard
+	polkit-elogind
+	xwayland
+	"
+makedepends="
+	callaudiod-dev
+	elogind-dev
+	evince-dev
+	evolution-data-server-dev
+	feedbackd-dev
+	gcr-dev
+	gettext-dev
+	glib-dev
+	gmobile-dev
+	gnome-bluetooth-dev
+	gnome-desktop-dev
+	gtk+3.0-dev
+	libadwaita-dev
+	libgudev-dev
+	libhandy1-dev
+	libsecret-dev
+	linux-pam-dev
+	meson
+	modemmanager-dev
+	networkmanager-dev
+	polkit-elogind-dev
+	pulseaudio-dev
+	py3-docutils
+	qrcodegen-dev
+	upower-dev
+	wayland-dev
+	wayland-protocols
+	"
+checkdepends="xvfb-run xmlstarlet"
+subpackages="
+	libphosh:libs
+	libphosh-dev:libphosh_dev
+	$pkgname-dbg
+	$pkgname-dev
+	$pkgname-doc
+	$pkgname-lang
+	$pkgname-portalsconf::noarch
+	$pkgname-schemas::noarch
+	$pkgname-systemd
+	"
+source="
+	https://sources.phosh.mobi/releases/phosh/phosh-$pkgver.tar.xz
+	splash-timeout-flatpak-dbus.patch::https://gitlab.alpinelinux.org/alpine/aports/-/raw/0897c8a6251bf9893648cf406aaeda889810cdd7/community/phosh/splash-timeout-flatpak-dbus.patch
+	phosh-pinecone-startup.patch
+	phosh-pinecone-app-manifest.patch
+	phosh-pinecone-service-profile.patch
+	"
+builddir="$srcdir/$pkgname-$pkgver"
+somask="libphoshsearch.so"
+
+prepare() {
+	default_prepare
+	sed -i 's/\.rc/_rc/' meson.build
+}
+
+build() {
+	abuild-meson \
+		-Db_lto=true \
+		-Dphoc_tests=disabled \
+		-Dman=true \
+		-Dbindings-lib=true \
+		. output
+	meson compile -C output
+}
+
+check() {
+	xvfb-run -a meson test --print-errorlogs -C output
+}
+
+package() {
+	DESTDIR="$pkgdir/" meson install --no-rebuild --skip-subprojects -C output
+}
+
+portalsconf() {
+	install_if="$pkgname=$pkgver-r$pkgrel xdg-desktop-portal>=1.17.1"
+	amove usr/share/xdg-desktop-portal/phosh-portals.conf
+}
+
+libphosh_dev() {
+	amove usr/include/libphosh-*
+	amove usr/lib/libphosh-*.so
+	amove usr/lib/pkgconfig/libphosh-*.pc
+}
+
+schemas() {
+	pkgdesc="$pkgdesc (schemas)"
+	depends=
+
+	amove usr/share/glib-2.0/schemas
+}
+
+sha512sums="
+51219a3295b061047765368a0f65a02b131c4b229ec03713f547595b73a98c51b99086769bf0584dd7d44b8426b21d50162e76e955fb7a37a5136cefa253fea8  phosh-0.57.0.tar.xz
+cb4bad612e5d2dff156c6b97b460c16ab7fd48067935b616fe0b65d11c3d255f1ecd06b800c654ac9ea93bc53e823eb47134836dfdf61bb338588dab78d3b9e9  splash-timeout-flatpak-dbus.patch
+5d0d8ec0c0896d2d7859b2fdf1507a17950cabdc764f22950aba7b30ba6d10eaf55d5e5bb8de54b14c9fac9e18b71f5ecc3bd1cc10ed8d0264620eb38e419581  phosh-pinecone-startup.patch
+e25c3f729f04be6831fe43f3a9fbd71ece0243d5e2e43c30a580608aa825f2c0f390bf3d815669fbeb2c4c63a089048618a1b88c3d0a317dc5577ff845711853  phosh-pinecone-app-manifest.patch
+bb941dbcc332698dac3af264dd370b9381d87a2bb7630fd9a6173396962724c03cf6c811923b05d87d8a46baeea32d17cf68e24aa68046f310ba2893447b9354  phosh-pinecone-service-profile.patch
+"

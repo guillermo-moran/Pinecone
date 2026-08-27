@@ -13,6 +13,12 @@ pixman_image_t *pinecone_pixman_create_bits(
     int clear
 );
 
+void pinecone_pixman_begin_cpu_access(void);
+void pinecone_pixman_end_cpu_access(void);
+void pinecone_pixman_output_commit(void);
+void pinecone_pixman_begin_render_pass(void);
+void pinecone_pixman_end_render_pass(void);
+
 /* The caller owns the returned close-on-exec dma-buf descriptor. */
 int pinecone_pixman_export_dmabuf(
     pixman_image_t *image,

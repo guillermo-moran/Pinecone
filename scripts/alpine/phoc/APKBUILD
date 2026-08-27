@@ -1,0 +1,94 @@
+# Pinecone's reproducible Phoc build. Keep this close to Alpine edge's package
+# and carry only the embedded-wlroots and layout transaction patches.
+maintainer="team/phosh <newbie13xd@gmail.com>"
+pkgname=phoc
+pkgver=0.57.0
+pkgrel=1
+pkgdesc="wlroots based Phone compositor for the Phosh shell"
+arch="all"
+url="https://gitlab.gnome.org/World/Phosh/phoc"
+license="GPL-3.0-only"
+depends="
+	$pkgname-schemas
+	dbus
+	gsettings-desktop-schemas
+	mutter-schemas
+	"
+_wlrootsmakedepends="
+	eudev-dev
+	glslang
+	hwdata-dev
+	libcap-dev
+	libdisplay-info-dev
+	libseat-dev
+	libxcb-dev
+	xcb-util-image-dev
+	xcb-util-renderutil-dev
+	xcb-util-wm-dev
+	xkeyboard-config-dev
+	xwayland-dev
+	"
+makedepends="
+	glib-dev
+	gmobile-dev
+	gnome-desktop-dev
+	json-glib-dev
+	libdrm-dev
+	libinput-dev
+	libxkbcommon-dev
+	mesa-dev
+	meson
+	pixman-dev
+	py3-docutils
+	wayland-dev
+	wayland-protocols
+	$_wlrootsmakedepends
+	"
+subpackages="$pkgname-dbg $pkgname-doc $pkgname-lang $pkgname-schemas::noarch"
+options="!check"
+source="
+	https://sources.phosh.mobi/releases/phoc/phoc-$pkgver.tar.xz
+	phoc-pinecone-layout.patch
+	wlroots-pinecone-0.20.2.patch.embed
+	"
+replaces="wlroots-phosh"
+builddir="$srcdir/$pkgname-$pkgver"
+
+prepare() {
+	default_prepare
+	patch -Np1 < subprojects/packagefiles/wlroots/0001-Revert-layer-shell-error-on-0-dimension-without-anch.patch \
+		-d subprojects/wlroots-0.20.x
+	patch -Np1 < "$srcdir"/wlroots-pinecone-0.20.2.patch.embed \
+		-d subprojects/wlroots-0.20.x
+}
+
+build() {
+	abuild-meson \
+		-Db_lto=true \
+		-Dembed-wlroots=enabled \
+		-Dman=true \
+		-Dtests=false \
+		--default-library=static \
+		. output
+	meson compile -C output
+}
+
+package() {
+	DESTDIR="$pkgdir/" meson install --no-rebuild -C output
+	install -Dm755 tools/scale-to-fit -t "$pkgdir"/usr/bin
+	rm -r "$pkgdir"/usr/include
+	rm -r "$pkgdir"/usr/lib/libwlroots-*.a
+	rm -r "$pkgdir"/usr/lib/pkgconfig
+}
+
+schemas() {
+	pkgdesc="$pkgdesc (schemas)"
+	depends=
+	amove usr/share/glib-2.0/schemas
+}
+
+sha512sums="
+c3dfb5e951422ccedcc1740b788a4c9dbc517ec7c0901967298a77dc5a35b4ca4556fe97b02085868779adddb1b86539224f2c3c6277ff5264315ada54b322a3  phoc-0.57.0.tar.xz
+b493ff6b1be35a659400abeaa90e0870ae1d91d1191fbbfdff21adb47b580406f602bc17a550f30ea15c2ba7d0936d1778d55a3afe41d3e630279f937a98cc5c  phoc-pinecone-layout.patch
+2d1cd36e63a596e18b25554d032e792459b8314c6743486e0e68d998ac1674467b7b4ee448c6a8b70f8bb2994c60cdaee4c94d61e25ba43eb26d2664abceca99  wlroots-pinecone-0.20.2.patch.embed
+"

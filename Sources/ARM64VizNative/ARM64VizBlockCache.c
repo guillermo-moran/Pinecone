@@ -6,13 +6,13 @@
 #include <string.h>
 
 enum {
-    AVZ_BLOCK_CACHE_SET_COUNT = 2048,
+    AVZ_BLOCK_CACHE_SET_COUNT = 8192,
     AVZ_BLOCK_CACHE_WAY_COUNT = 4,
     AVZ_BLOCK_CACHE_ENTRY_COUNT =
         AVZ_BLOCK_CACHE_SET_COUNT * AVZ_BLOCK_CACHE_WAY_COUNT,
 
-    AVZ_BLOCK_FRONT_CACHE_ENTRY_COUNT = 1024,
-    AVZ_BLOCK_PAGE_BUCKET_COUNT = 8192
+    AVZ_BLOCK_FRONT_CACHE_ENTRY_COUNT = 8192,
+    AVZ_BLOCK_PAGE_BUCKET_COUNT = 16384
 };
 
 #define AVZ_BLOCK_TTBR_BASE_MASK UINT64_C(0x0000fffffffff000)
@@ -24,25 +24,118 @@ typedef struct {
     uint8_t linked;
 } AVZBlockPageLink;
 
+typedef struct {
+    const AVZNativeDecodedBlock *target;
+    const uint64_t *target_serial_token;
+    uint64_t target_serial;
+    uint64_t last_used;
+} AVZBlockSuccessor;
+
 struct AVZNativeDecodedBlock {
     AVZNativeBlockKey key;
     AVZNativeInstruction instructions[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
     uint64_t physical_addresses[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
+    uint8_t semantic_candidates[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
+    uint8_t trace_semantic_candidates[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
     uint8_t instruction_count;
     uint8_t uses_vector_state;
+    uint8_t chain_barrier;
+    uint8_t requires_host_checkpoint;
     uint8_t code_page_count;
     uint64_t physical_code_pages[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
     const uint8_t *host_code_pages[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
     const uint64_t
         *code_page_generation_tokens[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
+    const uint64_t
+        *shared_code_page_generation_tokens[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
     uint64_t code_page_generations[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
     uint64_t shared_code_page_generations[AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
+    AVZBlockSuccessor successors[2];
+    uint64_t successor_clock;
 };
+
+static int avz_is_coherent_cache_maintenance(uint32_t instruction) {
+    unsigned crn = (instruction >> 12u) & 0xfu;
+    unsigned crm = (instruction >> 8u) & 0xfu;
+
+    if (crn != 7u) {
+        return 0;
+    }
+    return crm == 5u || crm == 6u ||
+        (crm >= 10u && crm <= 14u);
+}
+
+static void avz_record_block_exit_metadata(
+    AVZNativeDecodedBlock *block,
+    const AVZNativeInstruction *instruction
+) {
+    switch (instruction->kind) {
+    case AVZ_NATIVE_OP_SYSTEM_REGISTER_READ:
+    case AVZ_NATIVE_OP_EXCEPTION_RETURN:
+        block->chain_barrier = 1;
+        break;
+    case AVZ_NATIVE_OP_SYNCHRONOUS_EXCEPTION:
+        block->chain_barrier = 1;
+        if ((instruction->raw & UINT32_C(0xffe0001f)) !=
+            UINT32_C(0xd4000001)) {
+            block->requires_host_checkpoint = 1;
+        }
+        break;
+    case AVZ_NATIVE_OP_SYSTEM_INSTRUCTION:
+        if (avz_is_coherent_cache_maintenance(instruction->raw)) {
+            break;
+        }
+        block->chain_barrier = 1;
+        block->requires_host_checkpoint = 1;
+        break;
+    case AVZ_NATIVE_OP_SYSTEM_REGISTER_WRITE:
+    case AVZ_NATIVE_OP_PSTATE_IMMEDIATE:
+    case AVZ_NATIVE_OP_WAIT:
+    case AVZ_NATIVE_OP_HALT:
+        block->chain_barrier = 1;
+        block->requires_host_checkpoint = 1;
+        break;
+    case AVZ_NATIVE_OP_BARRIER:
+        if ((instruction->raw & UINT32_C(0xfffff0ff)) ==
+            UINT32_C(0xd50330df)) {
+            block->chain_barrier = 1;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void avz_classify_block_semantics(AVZNativeDecodedBlock *block) {
+    if (block == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < block->instruction_count; index++) {
+        block->semantic_candidates[index] =
+            avz_native_classify_semantic_candidate(
+                block->instructions,
+                block->instruction_count,
+                index,
+                index == 0,
+                0
+            );
+        block->trace_semantic_candidates[index] =
+            avz_native_classify_semantic_candidate(
+                block->instructions,
+                block->instruction_count,
+                index,
+                index == 0,
+                1
+            );
+    }
+}
 
 typedef struct {
     AVZNativeDecodedBlock block;
     uint64_t serial;
     uint64_t validated_code_mutation_epoch;
+    uint64_t validated_shared_code_mutation_epoch;
+    uint64_t last_used;
     uint8_t valid;
     uint8_t prefetched;
 } AVZBlockCacheEntry;
@@ -57,7 +150,7 @@ struct AVZNativeBlockCache {
     AVZBlockCacheEntry *entries;
     AVZBlockPageLink *page_links;
     int32_t *page_bucket_heads;
-    uint8_t *replacement_cursors;
+    uint64_t access_clock;
     AVZBlockFrontCacheEntry front_entries[AVZ_BLOCK_FRONT_CACHE_ENTRY_COUNT];
     AVZNativeBlockKey last_context_key;
     uint64_t last_context_hash;
@@ -222,6 +315,7 @@ static size_t avz_page_bucket(uint64_t page) {
 }
 
 static void avz_track_code_page(AVZNativeBlockCache *cache, uint64_t page) {
+    avz_guest_memory_mark_code_page(cache->guest_memory, page, cache->ram_base);
     if (cache->code_page_refcounts == NULL || page < cache->tracked_first_page) {
         return;
     }
@@ -317,11 +411,11 @@ static int avz_block_shared_code_pages_are_current(
         return 1;
     }
     for (size_t slot = 0; slot < block->code_page_count; slot++) {
-        if (avz_guest_memory_page_write_generation(
-                cache->guest_memory,
-                block->physical_code_pages[slot],
-                cache->ram_base
-            ) != block->shared_code_page_generations[slot]) {
+        const uint64_t *token =
+            block->shared_code_page_generation_tokens[slot];
+        if (token != NULL &&
+            __atomic_load_n(token, __ATOMIC_ACQUIRE) !=
+                block->shared_code_page_generations[slot]) {
             return 0;
         }
     }
@@ -332,14 +426,18 @@ static int avz_entry_code_is_current(
     AVZNativeBlockCache *cache,
     AVZBlockCacheEntry *entry
 ) {
-    if (!avz_block_shared_code_pages_are_current(cache, &entry->block)) {
-        return 0;
+    uint64_t shared_epoch =
+        avz_native_block_cache_shared_code_mutation_epoch(cache);
+    if (entry->validated_shared_code_mutation_epoch != shared_epoch) {
+        if (!avz_block_shared_code_pages_are_current(cache, &entry->block)) {
+            return 0;
+        }
+        entry->validated_shared_code_mutation_epoch = shared_epoch;
     }
     if (entry->validated_code_mutation_epoch == cache->code_mutation_epoch) {
         return 1;
     }
-    if (!avz_block_code_pages_are_current(&entry->block) ||
-        !avz_block_shared_code_pages_are_current(cache, &entry->block)) {
+    if (!avz_block_code_pages_are_current(&entry->block)) {
         return 0;
     }
     entry->validated_code_mutation_epoch = cache->code_mutation_epoch;
@@ -522,13 +620,16 @@ static void avz_record_prefetch_outcome(
 
     uint8_t next_limit;
     if ((uint64_t)cache->batch_prefetch_window_hits * 100u >=
-        (uint64_t)outcomes * 60u) {
+        (uint64_t)outcomes * 80u) {
         next_limit = 3;
     } else if ((uint64_t)cache->batch_prefetch_window_hits * 100u >=
-               (uint64_t)outcomes * 50u) {
+               (uint64_t)outcomes * 65u) {
         next_limit = 2;
-    } else {
+    } else if ((uint64_t)cache->batch_prefetch_window_hits * 100u >=
+               (uint64_t)outcomes * 55u) {
         next_limit = 1;
+    } else {
+        next_limit = 0;
     }
     if (next_limit != cache->batch_prefetch_limit) {
         cache->batch_prefetch_limit = next_limit;
@@ -559,6 +660,14 @@ static void avz_record_prefetch_hit(
         entry->prefetched = 0;
         avz_record_prefetch_outcome(cache, 1);
     }
+}
+
+static void avz_touch_entry(
+    AVZNativeBlockCache *cache,
+    AVZBlockCacheEntry *entry
+) {
+    avz_advance_nonzero_counter(&cache->access_clock);
+    entry->last_used = cache->access_clock;
 }
 
 static void avz_link_entry_page(
@@ -612,12 +721,19 @@ static void avz_index_entry(AVZNativeBlockCache *cache, size_t entry_index) {
             block->code_page_generation_tokens[slot] == NULL
                 ? 0
                 : *block->code_page_generation_tokens[slot];
-        block->shared_code_page_generations[slot] =
-            avz_guest_memory_page_write_generation(
+        block->shared_code_page_generation_tokens[slot] =
+            avz_guest_memory_page_write_generation_token(
                 cache->guest_memory,
                 pages[slot],
                 cache->ram_base
             );
+        block->shared_code_page_generations[slot] =
+            block->shared_code_page_generation_tokens[slot] == NULL
+                ? 0
+                : __atomic_load_n(
+                    block->shared_code_page_generation_tokens[slot],
+                    __ATOMIC_ACQUIRE
+                );
     }
     block->code_page_count = (uint8_t)page_count;
 }
@@ -673,12 +789,8 @@ AVZNativeBlockCache *avz_native_block_cache_create(void) {
     cache->page_bucket_heads = malloc(
         AVZ_BLOCK_PAGE_BUCKET_COUNT * sizeof(*cache->page_bucket_heads)
     );
-    cache->replacement_cursors = calloc(
-        AVZ_BLOCK_CACHE_SET_COUNT,
-        sizeof(*cache->replacement_cursors)
-    );
     if (cache->entries == NULL || cache->page_links == NULL ||
-        cache->page_bucket_heads == NULL || cache->replacement_cursors == NULL) {
+        cache->page_bucket_heads == NULL) {
         avz_native_block_cache_destroy(cache);
         return NULL;
     }
@@ -702,7 +814,6 @@ void avz_native_block_cache_destroy(AVZNativeBlockCache *cache) {
     free(cache->entries);
     free(cache->page_links);
     free(cache->page_bucket_heads);
-    free(cache->replacement_cursors);
     free(cache->code_page_refcounts);
     free(cache->code_page_generations);
     free(cache->trace_code_page_bits);
@@ -718,7 +829,7 @@ void avz_native_block_cache_clear(AVZNativeBlockCache *cache) {
     avz_advance_nonzero_counter(&cache->code_mutation_epoch);
     avz_advance_nonzero_counter(&cache->reset_epoch);
     memset(cache->entries, 0, AVZ_BLOCK_CACHE_ENTRY_COUNT * sizeof(*cache->entries));
-    memset(cache->replacement_cursors, 0, AVZ_BLOCK_CACHE_SET_COUNT);
+    cache->access_clock = 0;
     memset(cache->front_entries, 0, sizeof(cache->front_entries));
     cache->last_context_valid = 0;
     cache->decode_window_valid = 0;
@@ -923,9 +1034,11 @@ static int avz_decode_block(
             &physical_address,
             &raw
         )) {
-            return block->instruction_count == 0
-                ? AVZ_NATIVE_BLOCK_DECODE_FETCH_FAULT
-                : AVZ_NATIVE_BLOCK_DECODE_OK;
+            if (block->instruction_count == 0) {
+                return AVZ_NATIVE_BLOCK_DECODE_FETCH_FAULT;
+            }
+            avz_classify_block_semantics(block);
+            return AVZ_NATIVE_BLOCK_DECODE_OK;
         }
 
         direct_virtual_page = pc >> 12;
@@ -962,6 +1075,7 @@ static int avz_decode_block(
         block->physical_addresses[index] = physical_address;
         block->instruction_count++;
         block->uses_vector_state |= (uint8_t)avz_native_kind_uses_vector_state(decoded.kind);
+        avz_record_block_exit_metadata(block, &decoded);
         if (avz_native_kind_terminates_block(decoded.kind) ||
             (decoded.kind == AVZ_NATIVE_OP_BARRIER &&
              (raw & UINT32_C(0xfffff0ff)) == UINT32_C(0xd50330df))) {
@@ -969,6 +1083,7 @@ static int avz_decode_block(
         }
         pc += 4;
     }
+    avz_classify_block_semantics(block);
     return AVZ_NATIVE_BLOCK_DECODE_OK;
 }
 
@@ -1008,6 +1123,7 @@ const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
             cache->statistics.hits++;
             cache->statistics.front_hits++;
             avz_record_prefetch_hit(cache, entry);
+            avz_touch_entry(cache, entry);
             if (decode_status != NULL) {
                 *decode_status = AVZ_NATIVE_BLOCK_DECODE_OK;
             }
@@ -1027,6 +1143,7 @@ const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
         } else if (entry->valid && avz_block_keys_equal(&entry->block.key, key)) {
             cache->statistics.hits++;
             avz_record_prefetch_hit(cache, entry);
+            avz_touch_entry(cache, entry);
             if (decode_status != NULL) {
                 *decode_status = AVZ_NATIVE_BLOCK_DECODE_OK;
             }
@@ -1057,10 +1174,17 @@ const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
 
     size_t entry_index = first_invalid;
     if (entry_index == SIZE_MAX) {
-        size_t victim_way = cache->replacement_cursors[set] & (AVZ_BLOCK_CACHE_WAY_COUNT - 1);
-        cache->replacement_cursors[set] =
-            (uint8_t)((victim_way + 1) & (AVZ_BLOCK_CACHE_WAY_COUNT - 1));
-        entry_index = base + victim_way;
+        entry_index = base;
+        for (size_t way = 1; way < AVZ_BLOCK_CACHE_WAY_COUNT; way++) {
+            size_t candidate_index = base + way;
+            AVZBlockCacheEntry *candidate = &cache->entries[candidate_index];
+            AVZBlockCacheEntry *victim = &cache->entries[entry_index];
+            if ((candidate->prefetched && !victim->prefetched) ||
+                (candidate->prefetched == victim->prefetched &&
+                 candidate->last_used < victim->last_used)) {
+                entry_index = candidate_index;
+            }
+        }
         avz_retire_unused_prefetch(cache, &cache->entries[entry_index]);
         avz_unindex_entry(cache, entry_index);
         cache->entries[entry_index].serial = 0;
@@ -1072,15 +1196,19 @@ const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
     cache->entries[entry_index].serial = avz_allocate_block_serial(cache);
     cache->entries[entry_index].validated_code_mutation_epoch =
         cache->code_mutation_epoch;
+    cache->entries[entry_index].validated_shared_code_mutation_epoch =
+        avz_native_block_cache_shared_code_mutation_epoch(cache);
     cache->entries[entry_index].valid = 1;
     cache->entries[entry_index].prefetched = cache->batch_prefetch_active;
+    avz_touch_entry(cache, &cache->entries[entry_index]);
     avz_index_entry(cache, entry_index);
     avz_update_front_cache(cache, hash, entry_index);
     cache->statistics.decodes++;
     const AVZNativeDecodedBlock *result =
         &cache->entries[entry_index].block;
 
-    if (!cache->batch_prefetch_active && cache->ram != NULL) {
+    if (!cache->batch_prefetch_active && cache->ram != NULL &&
+        cache->batch_prefetch_limit != 0) {
         cache->batch_prefetch_active = 1;
         const AVZNativeDecodedBlock *current = result;
         size_t protected_set = set;
@@ -1225,6 +1353,18 @@ const AVZNativeInstruction *avz_native_decoded_block_instructions(
     return block == NULL ? NULL : block->instructions;
 }
 
+const uint8_t *avz_native_decoded_block_semantic_candidates(
+    const AVZNativeDecodedBlock *block
+) {
+    return block == NULL ? NULL : block->semantic_candidates;
+}
+
+const uint8_t *avz_native_decoded_block_trace_semantic_candidates(
+    const AVZNativeDecodedBlock *block
+) {
+    return block == NULL ? NULL : block->trace_semantic_candidates;
+}
+
 size_t avz_native_decoded_block_instruction_count(const AVZNativeDecodedBlock *block) {
     return block == NULL ? 0 : block->instruction_count;
 }
@@ -1235,6 +1375,18 @@ uint64_t avz_native_decoded_block_pc(const AVZNativeDecodedBlock *block) {
 
 int avz_native_decoded_block_uses_vector_state(const AVZNativeDecodedBlock *block) {
     return block != NULL && block->uses_vector_state;
+}
+
+int avz_native_decoded_block_is_chain_barrier(
+    const AVZNativeDecodedBlock *block
+) {
+    return block == NULL || block->chain_barrier;
+}
+
+int avz_native_decoded_block_requires_host_checkpoint(
+    const AVZNativeDecodedBlock *block
+) {
+    return block == NULL || block->requires_host_checkpoint;
 }
 
 size_t avz_native_decoded_block_code_page_count(
@@ -1287,6 +1439,11 @@ int avz_native_block_cache_register_trace_code_page(
     const uint64_t *token = &cache->code_page_generations[page_index];
     cache->trace_code_page_bits[page_index >> 3] |=
         (uint8_t)(1u << (page_index & 7u));
+    avz_guest_memory_mark_code_page(
+        cache->guest_memory,
+        physical_code_page,
+        cache->ram_base
+    );
     if (generation_token != NULL) {
         *generation_token = token;
     }
@@ -1310,6 +1467,141 @@ const uint64_t *avz_native_decoded_block_serial_token(
 ) {
     const AVZBlockCacheEntry *entry = avz_entry_for_block(cache, block);
     return entry != NULL ? &entry->serial : NULL;
+}
+
+static int avz_successor_is_current(
+    AVZNativeBlockCache *cache,
+    const AVZBlockSuccessor *successor
+) {
+    return successor->target != NULL &&
+        successor->target_serial != 0 &&
+        successor->target_serial_token != NULL &&
+        *successor->target_serial_token == successor->target_serial &&
+        avz_native_decoded_block_code_is_current(cache, successor->target);
+}
+
+static const AVZNativeDecodedBlock *avz_find_successor(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *source,
+    uint64_t source_serial,
+    const AVZNativeBlockKey *target_key,
+    int match_pc,
+    uint64_t *target_serial
+) {
+    if (target_serial != NULL) {
+        *target_serial = 0;
+    }
+    AVZBlockCacheEntry *source_entry = (AVZBlockCacheEntry *)
+        avz_entry_for_block(cache, source);
+    if (source_entry == NULL || !source_entry->valid || source_serial == 0 ||
+        source_entry->serial != source_serial || target_key == NULL ||
+        !avz_entry_code_is_current(cache, source_entry)) {
+        return NULL;
+    }
+
+    AVZNativeDecodedBlock *mutable_source = &source_entry->block;
+    AVZBlockSuccessor *best = NULL;
+    for (size_t index = 0; index < 2; index++) {
+        AVZBlockSuccessor *candidate = &mutable_source->successors[index];
+        if (!avz_successor_is_current(cache, candidate)) {
+            continue;
+        }
+        int matches = match_pc
+            ? avz_block_keys_equal(&candidate->target->key, target_key)
+            : avz_block_contexts_equal(&candidate->target->key, target_key);
+        if (matches && (best == NULL || candidate->last_used > best->last_used)) {
+            best = candidate;
+        }
+    }
+    if (best == NULL) {
+        return NULL;
+    }
+    mutable_source->successor_clock++;
+    if (mutable_source->successor_clock == 0) {
+        mutable_source->successor_clock = 1;
+    }
+    best->last_used = mutable_source->successor_clock;
+    if (target_serial != NULL) {
+        *target_serial = best->target_serial;
+    }
+    return best->target;
+}
+
+const AVZNativeDecodedBlock *avz_native_decoded_block_find_successor(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *source,
+    uint64_t source_serial,
+    const AVZNativeBlockKey *target_key,
+    uint64_t *target_serial
+) {
+    return avz_find_successor(
+        cache, source, source_serial, target_key, 1, target_serial
+    );
+}
+
+const AVZNativeDecodedBlock *avz_native_decoded_block_find_recent_successor(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *source,
+    uint64_t source_serial,
+    const AVZNativeBlockKey *target_context,
+    uint64_t *target_serial
+) {
+    return avz_find_successor(
+        cache, source, source_serial, target_context, 0, target_serial
+    );
+}
+
+void avz_native_decoded_block_record_successor(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *source,
+    uint64_t source_serial,
+    const AVZNativeDecodedBlock *target,
+    uint64_t target_serial
+) {
+    AVZBlockCacheEntry *source_entry = (AVZBlockCacheEntry *)
+        avz_entry_for_block(cache, source);
+    const AVZBlockCacheEntry *target_entry = avz_entry_for_block(cache, target);
+    if (source_entry == NULL || target_entry == NULL ||
+        !source_entry->valid || !target_entry->valid ||
+        source_serial == 0 || target_serial == 0 ||
+        source_entry->serial != source_serial ||
+        target_entry->serial != target_serial ||
+        !avz_entry_code_is_current(cache, source_entry) ||
+        !avz_entry_code_is_current(cache, (AVZBlockCacheEntry *)target_entry)) {
+        return;
+    }
+
+    AVZNativeDecodedBlock *mutable_source = &source_entry->block;
+    AVZBlockSuccessor *slot = NULL;
+    AVZBlockSuccessor *oldest = &mutable_source->successors[0];
+    for (size_t index = 0; index < 2; index++) {
+        AVZBlockSuccessor *candidate = &mutable_source->successors[index];
+        if (candidate->target == target &&
+            candidate->target_serial == target_serial) {
+            slot = candidate;
+            break;
+        }
+        if (!avz_successor_is_current(cache, candidate)) {
+            slot = candidate;
+            break;
+        }
+        if (candidate->last_used < oldest->last_used) {
+            oldest = candidate;
+        }
+    }
+    if (slot == NULL) {
+        slot = oldest;
+    }
+    mutable_source->successor_clock++;
+    if (mutable_source->successor_clock == 0) {
+        mutable_source->successor_clock = 1;
+    }
+    *slot = (AVZBlockSuccessor){
+        .target = target,
+        .target_serial_token = &target_entry->serial,
+        .target_serial = target_serial,
+        .last_used = mutable_source->successor_clock
+    };
 }
 
 int avz_native_decoded_block_code_is_current(
@@ -1354,6 +1646,22 @@ uint64_t avz_native_block_cache_code_mutation_epoch(
     const AVZNativeBlockCache *cache
 ) {
     return cache == NULL ? 0 : cache->code_mutation_epoch;
+}
+
+uint64_t avz_native_block_cache_shared_code_mutation_epoch(
+    const AVZNativeBlockCache *cache
+) {
+    return cache == NULL
+        ? 0
+        : avz_guest_memory_code_mutation_epoch(cache->guest_memory);
+}
+
+const uint64_t *avz_native_block_cache_shared_code_mutation_epoch_token(
+    const AVZNativeBlockCache *cache
+) {
+    return cache == NULL
+        ? NULL
+        : avz_guest_memory_code_mutation_epoch_token(cache->guest_memory);
 }
 
 const uint64_t *avz_native_block_cache_code_mutation_epoch_token(

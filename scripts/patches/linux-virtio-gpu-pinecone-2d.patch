@@ -1,6 +1,6 @@
 --- a/drivers/gpu/drm/virtio/virtgpu_submit.c
 +++ b/drivers/gpu/drm/virtio/virtgpu_submit.c
-@@ -19,6 +19,183 @@
+@@ -19,6 +19,193 @@
  
  #include "virtgpu_drv.h"
  
@@ -18,6 +18,8 @@
 +#define PINECONE_2D_SOURCE_IS_SOLID BIT(4)
 +#define PINECONE_2D_MASK_COMPONENT_ALPHA BIT(5)
 +#define PINECONE_2D_MASK_PACKED_A8 BIT(6)
++#define PINECONE_2D_SOURCE_PACKED_A8 BIT(7)
++#define PINECONE_2D_DESTINATION_PACKED_A8 BIT(8)
 +#define PINECONE_2D_LEGACY_FLAGS (PINECONE_2D_SOURCE_CONTAINS_ALPHA | \
 +				 PINECONE_2D_FILTER_BILINEAR | \
 +				 PINECONE_2D_HAS_MASK | PINECONE_2D_MASK_IS_SOLID)
@@ -27,7 +29,9 @@
 +				    PINECONE_2D_MASK_IS_SOLID | \
 +				    PINECONE_2D_SOURCE_IS_SOLID | \
 +				    PINECONE_2D_MASK_COMPONENT_ALPHA | \
-+				    PINECONE_2D_MASK_PACKED_A8)
++				    PINECONE_2D_MASK_PACKED_A8 | \
++				    PINECONE_2D_SOURCE_PACKED_A8 | \
++				    PINECONE_2D_DESTINATION_PACKED_A8)
 +
 +struct pinecone_2d_payload {
 +	__le32 magic;
@@ -110,21 +114,27 @@
 +	if (version == PINECONE_2D_VERSION && (operation == 3 || operation == 4))
 +		return !source && (slots || handle_count == expected_handles) &&
 +		       !(flags & (PINECONE_2D_SOURCE_CONTAINS_ALPHA |
-+				  PINECONE_2D_FILTER_BILINEAR)) &&
++				  PINECONE_2D_FILTER_BILINEAR |
++				  PINECONE_2D_SOURCE_PACKED_A8 |
++				  PINECONE_2D_DESTINATION_PACKED_A8)) &&
 +		       !payload->source_width && !payload->source_height;
-+	if (version != PINECONE_2D_EXACT_COMPOSITE_VERSION ||
-+	    (operation != 0 && operation != 1 && operation != 2 &&
-+	     operation != 3 && operation != 12))
++	if (version != PINECONE_2D_EXACT_COMPOSITE_VERSION || operation > 13)
 +		return false;
 +	if (operation == 0 || operation == 2)
 +		return !source && !(flags & PINECONE_2D_SOURCE_IS_SOLID) &&
++		       !(flags & PINECONE_2D_SOURCE_PACKED_A8) &&
 +		       (slots || handle_count == expected_handles) &&
 +		       !payload->source_width && !payload->source_height;
 +	if (flags & PINECONE_2D_SOURCE_IS_SOLID)
 +		return !source && (slots || handle_count == expected_handles) &&
 +		       !(flags & (PINECONE_2D_SOURCE_CONTAINS_ALPHA |
-+				  PINECONE_2D_FILTER_BILINEAR)) &&
++				  PINECONE_2D_FILTER_BILINEAR |
++				  PINECONE_2D_SOURCE_PACKED_A8)) &&
 +		       !payload->source_width && !payload->source_height;
++	if ((flags & PINECONE_2D_SOURCE_PACKED_A8) &&
++	    (!(flags & PINECONE_2D_SOURCE_CONTAINS_ALPHA) ||
++	     (flags & PINECONE_2D_FILTER_BILINEAR)))
++		return false;
 +	return source && (!slots || (source <= handle_count &&
 +	       source != destination && source != mask)) &&
 +	       (slots || handle_count == expected_handles + 1U) &&
@@ -184,7 +194,7 @@
  struct virtio_gpu_submit_post_dep {
  	struct drm_syncobj *syncobj;
  	struct dma_fence_chain *chain;
-@@ -348,10 +525,87 @@
+@@ -348,10 +523,87 @@
  
  	if (submit->sync_file)
  		fput(submit->sync_file->file);
@@ -272,7 +282,7 @@
  	virtio_gpu_cmd_submit(submit->vgdev, submit->buf, submit->exbuf->size,
  			      submit->vfpriv->ctx_id, submit->buflist,
  			      submit->out_fence);
-@@ -482,9 +736,13 @@
+@@ -482,9 +734,13 @@
  	struct virtio_gpu_submit submit;
  	u32 ring_idx = 0;
  	int ret = -EINVAL;
@@ -288,7 +298,7 @@
  
  	if (exbuf->flags & ~VIRTGPU_EXECBUF_FLAGS)
  		return ret;
-@@ -500,7 +758,8 @@
+@@ -500,7 +756,8 @@
  		ring_idx = exbuf->ring_idx;
  	}
  

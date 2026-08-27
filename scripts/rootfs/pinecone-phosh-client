@@ -24,18 +24,6 @@ if [ -f /usr/share/pinecone/phosh-ui/lockscreen.ui ]; then
 fi
 
 OSK_PID=
-if command -v squeekboard >/dev/null 2>&1; then
-  # Squeekboard has a substantial GTK startup cost. Starting it beside Phosh
-  # makes both processes contend for the interpreted guest CPU before the
-  # first shell frame. The lock screen does not need text input, so defer the
-  # OSK until Phosh has had an uncontested startup window.
-  (
-    sleep "${PINECONE_OSK_START_DELAY_SECONDS:-60}"
-    exec squeekboard
-  ) >>"$SESSION_LOG" 2>&1 &
-  OSK_PID=$!
-fi
-
 set -o pipefail 2>/dev/null || true
 /usr/libexec/phosh >> "$SESSION_LOG" 2>&1
 status=$?

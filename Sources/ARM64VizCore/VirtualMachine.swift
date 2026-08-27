@@ -482,7 +482,7 @@ public final class VirtualMachine {
         self.exceptionStormThreshold = 32
         self.timerCyclesPerInstruction = 1
         self.wallClockRunBudgetNanoseconds = nil
-        self.nativeCheckpointBlockInterval = 256
+        self.nativeCheckpointBlockInterval = 1_024
         self.hostPreemptionGenerationProvider = nil
         self.stopOnEL0Entry = false
         self.stopOnEL0Fault = false
@@ -929,9 +929,9 @@ public final class VirtualMachine {
 
     private func activateVirtualCPU(_ id: Int) {
         guard id != activeVCPUID else { return }
-        // Cooperative scheduling makes the context-switch boundary the point
-        // at which another observer may have modified an exclusive location.
-        clearExclusiveReservation()
+        // Host scheduling is invisible to the guest PE.  Keep each vCPU's
+        // local monitor across a cooperative slice; writes by another PE are
+        // detected by PhysicalMemory's shared reservation generation.
         let sharedCounterTicks = systemRegisters.counterTicks
         saveActiveVirtualCPU()
 
@@ -1245,6 +1245,18 @@ public final class VirtualMachine {
             virtualCPUs[activeVCPUID].architecture.lifecycle == .waitingForInterrupt
     }
 
+    public var hostTimerWaitNanoseconds: UInt64? {
+        guard let deadline = systemRegisters.nextUnmaskedTimerDeadline else {
+            return nil
+        }
+        guard let externalClock else {
+            return deadline > systemRegisters.counterTicks
+                ? deadline &- systemRegisters.counterTicks
+                : 0
+        }
+        return externalClock.nanosecondsUntil(deadlineTicks: deadline)
+    }
+
     public func recordWaitForEvent() {
         waitForEventCount &+= 1
     }
@@ -1264,9 +1276,13 @@ public final class VirtualMachine {
 
     func executeSystemMaintenanceInstruction(_ instruction: UInt32) {
         let crn = (instruction >> 12) & 0xf
-        if crn == 8 {
-            memory.invalidateSharedTranslationCaches()
+        guard crn == 8 else {
+            // Guest cache maintenance needs no host action: RAM writes are
+            // coherent and already advance executable-page generations.
+            return
         }
+
+        memory.invalidateSharedTranslationCaches()
         invalidateTranslationCache()
     }
 
@@ -1307,9 +1323,11 @@ public final class VirtualMachine {
     public func clearExclusiveReservation() {
         cpu.exclusiveReservationAddress = nil
         cpu.exclusiveReservationSize = nil
+        cpu.exclusiveReservationGeneration = nil
         for id in virtualCPUs.indices where id != activeVCPUID {
             virtualCPUs[id].architecture.cpu.exclusiveReservationAddress = nil
             virtualCPUs[id].architecture.cpu.exclusiveReservationSize = nil
+            virtualCPUs[id].architecture.cpu.exclusiveReservationGeneration = nil
         }
     }
 

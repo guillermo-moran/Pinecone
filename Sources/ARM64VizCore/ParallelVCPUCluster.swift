@@ -36,6 +36,26 @@ final class ParallelVCPUClock: @unchecked Sendable {
         return ticks
     }
 
+    func nanosecondsUntil(deadlineTicks: UInt64) -> UInt64 {
+        lock.lock()
+        advanceFromHostClock()
+        let current = counterTicks
+        lock.unlock()
+
+        guard deadlineTicks > current else { return 0 }
+        let delta = deadlineTicks &- current
+        let wholeSeconds = delta / Self.frequency
+        let remainingTicks = delta % Self.frequency
+        let maximumWholeSeconds = UInt64.max / 1_000_000_000
+        guard wholeSeconds <= maximumWholeSeconds else { return UInt64.max }
+        let wholeNanoseconds = wholeSeconds * 1_000_000_000
+        let fractionalNumerator = remainingTicks * 1_000_000_000
+        let fractionalNanoseconds = fractionalNumerator / Self.frequency +
+            (fractionalNumerator % Self.frequency == 0 ? 0 : 1)
+        let result = wholeNanoseconds.addingReportingOverflow(fractionalNanoseconds)
+        return result.overflow ? UInt64.max : result.partialValue
+    }
+
     private func advanceFromHostClock() {
         let now = DispatchTime.now().uptimeNanoseconds
         let elapsed = now &- lastHostNanoseconds
@@ -58,6 +78,11 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         private var state: VirtualCPUArchitecturalState
         private var failureDescription: String?
         private var executedSteps: UInt64 = 0
+        private var nativeSteps: UInt64 = 0
+        private var fallbackSteps: UInt64 = 0
+        fileprivate var runStepBudget = 262_144
+        fileprivate var requestedWallClockRunBudgetNanoseconds: UInt64?
+        fileprivate var requestedNativeCheckpointBlockInterval: UInt64
 
         init(
             id: Int,
@@ -68,6 +93,10 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
             self.vm = vm
             self.condition = condition
             self.state = vm.externalVirtualCPUStateSnapshot()
+            self.requestedWallClockRunBudgetNanoseconds =
+                vm.wallClockRunBudgetNanoseconds
+            self.requestedNativeCheckpointBlockInterval =
+                vm.nativeCheckpointBlockInterval
         }
 
         func start() {
@@ -129,6 +158,8 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
             state = architecture
             failureDescription = nil
             executedSteps = 0
+            nativeSteps = 0
+            fallbackSteps = 0
             condition.broadcast()
             condition.unlock()
         }
@@ -153,9 +184,19 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
             return value
         }
 
-        var diagnostics: (steps: UInt64, failure: String?) {
+        var diagnostics: (
+            steps: UInt64,
+            nativeSteps: UInt64,
+            fallbackSteps: UInt64,
+            failure: String?
+        ) {
             condition.lock()
-            let value = (executedSteps, failureDescription)
+            let value = (
+                executedSteps,
+                nativeSteps,
+                fallbackSteps,
+                failureDescription
+            )
             condition.unlock()
             return value
         }
@@ -173,19 +214,41 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
                     return
                 }
                 if state.lifecycle == .waitingForInterrupt {
-                    _ = condition.wait(until: Date(timeIntervalSinceNow: 1.0 / 120.0))
+                    if let waitNanoseconds = vm.hostTimerWaitNanoseconds {
+                        if waitNanoseconds > 0 {
+                            _ = condition.wait(until: Date(
+                                timeIntervalSinceNow:
+                                    Double(waitNanoseconds) / 1_000_000_000
+                            ))
+                        }
+                    } else {
+                        condition.wait()
+                    }
                     if shouldStop {
                         condition.unlock()
                         return
                     }
                 }
+                let maxSteps = runStepBudget
+                let wallClockRunBudgetNanoseconds =
+                    requestedWallClockRunBudgetNanoseconds
+                let nativeCheckpointBlockInterval =
+                    requestedNativeCheckpointBlockInterval
                 condition.unlock()
 
                 do {
-                    let result = try vm.run(maxSteps: 262_144)
+                    vm.wallClockRunBudgetNanoseconds =
+                        wallClockRunBudgetNanoseconds
+                    vm.nativeCheckpointBlockInterval =
+                        nativeCheckpointBlockInterval
+                    let result = try vm.run(maxSteps: maxSteps)
                     let currentState = vm.externalVirtualCPUStateSnapshot()
+                    let totals = (vm.backend as? SoftwareARM64Backend)?
+                        .executionTotals()
                     condition.lock()
                     executedSteps &+= UInt64(max(0, result.steps))
+                    nativeSteps = UInt64(max(0, totals?.nativeSteps ?? 0))
+                    fallbackSteps = UInt64(max(0, totals?.fallbackSteps ?? 0))
                     state = currentState
                     if case .halted = result.stopReason {
                         state.lifecycle = .halted
@@ -208,6 +271,7 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
     private var workers: [SecondaryWorker] = []
     private let stopLock = NSLock()
     private var stopped = false
+    private var hostWakeHandler: (@Sendable () -> Void)?
 
     init(primary: VirtualMachine) {
         precondition(primary.virtualCPUCount > 1)
@@ -265,14 +329,46 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
     public var diagnosticsSummary: String {
         let diagnostics = workers.map(\.diagnostics)
         let steps = diagnostics.reduce(UInt64(0)) { $0 &+ $1.steps }
+        let nativeSteps = diagnostics.reduce(UInt64(0)) {
+            $0 &+ $1.nativeSteps
+        }
+        let fallbackSteps = diagnostics.reduce(UInt64(0)) {
+            $0 &+ $1.fallbackSteps
+        }
         let failures = diagnostics.compactMap(\.failure)
         return " smp=parallel/\(primary.virtualCPUCount) secondary=\(steps)" +
+            " secondary-native=\(nativeSteps)" +
+            " secondary-fallback=\(fallbackSteps)" +
             (failures.isEmpty ? "" : " smp-error=\(failures.joined(separator: ","))")
+    }
+
+    public var secondaryExecutedSteps: UInt64 {
+        workers.reduce(UInt64(0)) { $0 &+ $1.diagnostics.steps }
+    }
+
+    public var secondaryExecutionTotals: (
+        nativeSteps: UInt64,
+        fallbackSteps: UInt64
+    ) {
+        workers.reduce(into: (nativeSteps: UInt64(0), fallbackSteps: UInt64(0))) {
+            totals, worker in
+            let diagnostics = worker.diagnostics
+            totals.nativeSteps &+= diagnostics.nativeSteps
+            totals.fallbackSteps &+= diagnostics.fallbackSteps
+        }
     }
 
     public func signal() {
         condition.lock()
+        let wakeHandler = hostWakeHandler
         condition.broadcast()
+        condition.unlock()
+        wakeHandler?()
+    }
+
+    public func setHostWakeHandler(_ handler: (@Sendable () -> Void)?) {
+        condition.lock()
+        hostWakeHandler = handler
         condition.unlock()
     }
 
@@ -293,6 +389,41 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
                 backend.enableBasicBlockExecution = true
                 backend.fallbackInterpreterPolicy = fallbackInterpreterPolicy
             }
+        }
+        condition.unlock()
+    }
+
+    public func configureRunBudget(
+        wallClockRunBudgetNanoseconds: UInt64?,
+        nativeCheckpointBlockInterval: UInt64,
+        secondaryRunStepBudget: Int = 262_144
+    ) {
+        condition.lock()
+        for worker in workers {
+            worker.requestedWallClockRunBudgetNanoseconds =
+                wallClockRunBudgetNanoseconds
+            worker.requestedNativeCheckpointBlockInterval = max(
+                1, nativeCheckpointBlockInterval)
+            worker.runStepBudget = max(1, secondaryRunStepBudget)
+        }
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    public func setNativeDirectBulkMappingEnabled(_ enabled: Bool) {
+        condition.lock()
+        for worker in workers {
+            (worker.vm.backend as? SoftwareARM64Backend)?
+                .setNativeDirectBulkMappingEnabled(enabled)
+        }
+        condition.unlock()
+    }
+
+    public func setNativeDetailedMemoryStatisticsEnabled(_ enabled: Bool) {
+        condition.lock()
+        for worker in workers {
+            (worker.vm.backend as? SoftwareARM64Backend)?
+                .setNativeDetailedMemoryStatisticsEnabled(enabled)
         }
         condition.unlock()
     }

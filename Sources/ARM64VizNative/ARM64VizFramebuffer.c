@@ -794,25 +794,30 @@ int avz_framebuffer_composite_bgra8(
     int source_is_solid,
     int bilinear_filtering,
     int component_alpha_mask,
-    int mask_is_packed_a8
+    int mask_is_packed_a8,
+    int source_is_packed_a8,
+    int destination_is_packed_a8
 ) {
     const int source_required = blend_operator != 0u && blend_operator != 2u;
+    const size_t source_bytes_per_pixel = source_is_packed_a8 ? 1u : 4u;
+    const size_t destination_bytes_per_pixel =
+        destination_is_packed_a8 ? 1u : 4u;
     if (destination == NULL || destination_width == 0 ||
         destination_height == 0 ||
-        (blend_operator != 0u && blend_operator != 1u &&
-         blend_operator != 2u && blend_operator != 3u &&
-         blend_operator != 12u) ||
+        blend_operator > 13u ||
         (source_required && !source_is_solid && source == NULL) ||
+        (source_is_packed_a8 && bilinear_filtering) ||
         destination_x > SIZE_MAX - destination_width ||
         destination_y > SIZE_MAX - destination_height ||
-        destination_x + destination_width > destination_stride / 4u ||
+        destination_x + destination_width >
+            destination_stride / destination_bytes_per_pixel ||
         (mask != NULL && mask_stride == 0) ||
         (source_required && !source_is_solid &&
-         !avz_framebuffer_scale_parameters_are_valid(
-            source, source_stride, source_x, source_y,
-            source_width, source_height, destination, destination_stride,
-            destination_x, destination_y,
-            destination_width, destination_height))) {
+         (source_width == 0 || source_height == 0 ||
+          source_x > SIZE_MAX - source_width ||
+          source_y > SIZE_MAX - source_height ||
+          source_x + source_width >
+              source_stride / source_bytes_per_pixel))) {
         return 0;
     }
 
@@ -824,12 +829,23 @@ int avz_framebuffer_composite_bgra8(
     };
     for (size_t y = 0; y < destination_height; y++) {
         uint8_t *destination_row = destination +
-            (destination_y + y) * destination_stride + destination_x * 4u;
+            (destination_y + y) * destination_stride +
+            destination_x * destination_bytes_per_pixel;
         const uint8_t *mask_row = mask != NULL ? mask + y * mask_stride : NULL;
         for (size_t x = 0; x < destination_width; x++) {
-            uint8_t *output = destination_row + x * 4u;
+            uint8_t packed_destination[4] = { 0, 0, 0, 0 };
+            uint8_t *output;
+            if (destination_is_packed_a8) {
+                packed_destination[3] = destination_row[x];
+                output = packed_destination;
+            } else {
+                output = destination_row + x * 4u;
+            }
             if (blend_operator == 0u) {
-                memset(output, 0, 4u);
+                if (destination_is_packed_a8)
+                    destination_row[x] = 0;
+                else
+                    memset(output, 0, 4u);
                 continue;
             }
             if (blend_operator == 2u)
@@ -850,9 +866,17 @@ int avz_framebuffer_composite_bgra8(
                 const size_t sampled_y = source_y +
                     avz_framebuffer_scaled_coordinate(
                         y, source_height, destination_height);
-                memcpy(sampled,
-                    source + sampled_y * source_stride + sampled_x * 4u,
-                    sizeof(sampled));
+                if (source_is_packed_a8) {
+                    sampled[0] = 0;
+                    sampled[1] = 0;
+                    sampled[2] = 0;
+                    sampled[3] = source[
+                        sampled_y * source_stride + sampled_x];
+                } else {
+                    memcpy(sampled,
+                        source + sampled_y * source_stride + sampled_x * 4u,
+                        sizeof(sampled));
+                }
             }
 
             uint8_t coverage[4];
@@ -872,6 +896,8 @@ int avz_framebuffer_composite_bgra8(
                     sampled[channel], coverage[channel]);
             if (blend_operator == 1u) {
                 memcpy(output, masked_source, sizeof(masked_source));
+                if (destination_is_packed_a8)
+                    destination_row[x] = output[3];
                 continue;
             }
             if (blend_operator == 12u) {
@@ -881,18 +907,99 @@ int avz_framebuffer_composite_bgra8(
                     output[channel] = value > UINT8_MAX
                         ? UINT8_MAX : (uint8_t)value;
                 }
+                if (destination_is_packed_a8)
+                    destination_row[x] = output[3];
                 continue;
             }
 
+            if (blend_operator == 13u) {
+                const float destination_alpha =
+                    (float)output[3] * (1.0f / 255.0f);
+                for (size_t channel = 0; channel < 4u; channel++) {
+                    const float channel_coverage =
+                        (float)coverage[channel] * (1.0f / 255.0f);
+                    const float source_alpha =
+                        (float)sampled[3] * (1.0f / 255.0f) *
+                        channel_coverage;
+                    const float source_value =
+                        (float)sampled[channel] * (1.0f / 255.0f) *
+                        channel_coverage;
+                    float source_factor = 1.0f;
+                    if (source_alpha > 0.0f) {
+                        source_factor =
+                            (1.0f - destination_alpha) / source_alpha;
+                        if (source_factor > 1.0f)
+                            source_factor = 1.0f;
+                        else if (source_factor < 0.0f)
+                            source_factor = 0.0f;
+                    }
+                    float result = source_value * source_factor +
+                        (float)output[channel] * (1.0f / 255.0f);
+                    if (result > 1.0f)
+                        result = 1.0f;
+                    else if (result < 0.0f)
+                        result = 0.0f;
+                    uint32_t quantized = (uint32_t)(result * 256.0f);
+                    output[channel] = quantized > UINT8_MAX
+                        ? UINT8_MAX : (uint8_t)quantized;
+                }
+                if (destination_is_packed_a8)
+                    destination_row[x] = output[3];
+                continue;
+            }
+
+            const uint8_t destination_alpha = output[3];
             for (size_t channel = 0; channel < 4u; channel++) {
                 const uint8_t covered_alpha = avz_framebuffer_multiply_255(
                     sampled[3], coverage[channel]);
-                uint16_t value = (uint16_t)masked_source[channel] +
+                uint8_t source_factor = UINT8_MAX;
+                uint8_t destination_factor =
+                    (uint8_t)(UINT8_MAX - covered_alpha);
+                switch (blend_operator) {
+                case 4u:
+                    source_factor = (uint8_t)(UINT8_MAX - destination_alpha);
+                    destination_factor = UINT8_MAX;
+                    break;
+                case 5u:
+                    source_factor = destination_alpha;
+                    destination_factor = 0;
+                    break;
+                case 6u:
+                    source_factor = 0;
+                    destination_factor = covered_alpha;
+                    break;
+                case 7u:
+                    source_factor = (uint8_t)(UINT8_MAX - destination_alpha);
+                    destination_factor = 0;
+                    break;
+                case 8u:
+                    source_factor = 0;
+                    destination_factor =
+                        (uint8_t)(UINT8_MAX - covered_alpha);
+                    break;
+                case 9u:
+                    source_factor = destination_alpha;
+                    break;
+                case 10u:
+                    source_factor = (uint8_t)(UINT8_MAX - destination_alpha);
+                    destination_factor = covered_alpha;
+                    break;
+                case 11u:
+                    source_factor = (uint8_t)(UINT8_MAX - destination_alpha);
+                    break;
+                default:
+                    break;
+                }
+                uint16_t value =
                     avz_framebuffer_multiply_255(
-                        output[channel], (uint8_t)(UINT8_MAX - covered_alpha));
+                        masked_source[channel], source_factor) +
+                    avz_framebuffer_multiply_255(
+                        output[channel], destination_factor);
                 output[channel] = value > UINT8_MAX
                     ? UINT8_MAX : (uint8_t)value;
             }
+            if (destination_is_packed_a8)
+                destination_row[x] = output[3];
         }
     }
     return 1;

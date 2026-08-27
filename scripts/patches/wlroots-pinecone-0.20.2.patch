@@ -1,0 +1,126 @@
+diff --git a/render/allocator/allocator.c b/render/allocator/allocator.c
+index b7dbf3d..b4255a4 100644
+--- a/render/allocator/allocator.c
++++ b/render/allocator/allocator.c
+@@ -128,7 +128,12 @@ struct wlr_allocator *wlr_allocator_autocreate(struct wlr_backend *backend,
+ 	}
+ 
++	bool pinecone_prefer_dmabuf =
++		getenv("PINECONE_WLROOTS_DMABUF") != NULL;
+ 	uint32_t shm_caps = WLR_BUFFER_CAP_SHM | WLR_BUFFER_CAP_DATA_PTR;
+-	if ((backend_caps & shm_caps) && (renderer_caps & shm_caps)) {
++	if ((backend_caps & shm_caps) && (renderer_caps & shm_caps)
++			&& !(pinecone_prefer_dmabuf && drm_fd >= 0 &&
++				(backend_caps & WLR_BUFFER_CAP_DMABUF) &&
++				(renderer_caps & WLR_BUFFER_CAP_DMABUF))) {
+ 		wlr_log(WLR_DEBUG, "Trying to create shm allocator");
+ 		if ((alloc = wlr_shm_allocator_create()) != NULL) {
+ 			return alloc;
+diff --git a/render/pass.c b/render/pass.c
+index 23bdf96..1b1c189 100644
+--- a/render/pass.c
++++ b/render/pass.c
+@@ -2,6 +2,8 @@
+ #include <string.h>
+ #include <wlr/render/interface.h>
+ 
++extern void pinecone_pixman_end_render_pass(void) __attribute__((weak));
++
+ void wlr_render_pass_init(struct wlr_render_pass *render_pass,
+ 		const struct wlr_render_pass_impl *impl) {
+ 	assert(impl->submit && impl->add_texture && impl->add_rect);
+@@ -11,7 +13,10 @@ void wlr_render_pass_init(struct wlr_render_pass *render_pass,
+ }
+ 
+ bool wlr_render_pass_submit(struct wlr_render_pass *render_pass) {
+-	return render_pass->impl->submit(render_pass);
++	if (pinecone_pixman_end_render_pass != NULL) {
++		pinecone_pixman_end_render_pass();
++	}
++	return render_pass->impl->submit(render_pass);
+ }
+ 
+ void wlr_render_pass_add_texture(struct wlr_render_pass *render_pass,
+diff --git a/render/wlr_renderer.c b/render/wlr_renderer.c
+index e65314c..46385a6 100644
+--- a/render/wlr_renderer.c
++++ b/render/wlr_renderer.c
+@@ -28,6 +28,9 @@
+ #include "render/wlr_renderer.h"
+ #include "util/env.h"
+ 
++extern void pinecone_pixman_begin_render_pass(void) __attribute__((weak));
++extern void pinecone_pixman_end_render_pass(void) __attribute__((weak));
++
+ void wlr_renderer_init(struct wlr_renderer *renderer,
+ 		const struct wlr_renderer_impl *impl, uint32_t render_buffer_caps) {
+ 	assert(impl->begin_buffer_pass);
+@@ -311,7 +314,15 @@ struct wlr_render_pass *wlr_renderer_begin_buffer_pass(struct wlr_renderer *rend
+ 		options = &default_options;
+ 	}
+ 
+-	return renderer->impl->begin_buffer_pass(renderer, buffer, options);
++	if (pinecone_pixman_begin_render_pass != NULL) {
++		pinecone_pixman_begin_render_pass();
++	}
++	struct wlr_render_pass *pass =
++		renderer->impl->begin_buffer_pass(renderer, buffer, options);
++	if (pass == NULL && pinecone_pixman_end_render_pass != NULL) {
++		pinecone_pixman_end_render_pass();
++	}
++	return pass;
+ }
+ 
+ struct wlr_render_timer *wlr_render_timer_create(struct wlr_renderer *renderer) {
+diff --git a/types/buffer/buffer.c b/types/buffer/buffer.c
+index 48a10d9..625e054 100644
+--- a/types/buffer/buffer.c
++++ b/types/buffer/buffer.c
+@@ -1,6 +1,8 @@
+ #include <assert.h>
+ #include <drm_fourcc.h>
+ #include <string.h>
++extern void pinecone_pixman_begin_cpu_access(void) __attribute__((weak));
++extern void pinecone_pixman_end_cpu_access(void) __attribute__((weak));
+ #include <wlr/interfaces/wlr_buffer.h>
+ #include "render/pixel_format.h"
+ #include "types/wlr_buffer.h"
+@@ -86,6 +88,10 @@ bool wlr_buffer_begin_data_ptr_access(struct wlr_buffer *buffer, uint32_t flags,
+ 	if (!buffer->impl->begin_data_ptr_access) {
+ 		return false;
+ 	}
++	if (pinecone_pixman_begin_cpu_access)
++		pinecone_pixman_begin_cpu_access();
+ 	if (!buffer->impl->begin_data_ptr_access(buffer, flags, data, format, stride)) {
++		if (pinecone_pixman_end_cpu_access)
++			pinecone_pixman_end_cpu_access();
+ 		return false;
+ 	}
+@@ -97,6 +103,8 @@ void wlr_buffer_end_data_ptr_access(struct wlr_buffer *buffer) {
+ 	assert(buffer->accessing_data_ptr);
+ 	buffer->impl->end_data_ptr_access(buffer);
+ 	buffer->accessing_data_ptr = false;
++	if (pinecone_pixman_end_cpu_access)
++		pinecone_pixman_end_cpu_access();
+ }
+ 
+ bool wlr_buffer_get_shm(struct wlr_buffer *buffer,
+diff --git a/types/output/output.c b/types/output/output.c
+index 3715950..2729569 100644
+--- a/types/output/output.c
++++ b/types/output/output.c
+@@ -1,4 +1,5 @@
+ #include <assert.h>
++extern void pinecone_pixman_output_commit(void) __attribute__((weak));
+ #include <drm_fourcc.h>
+ #include <stdlib.h>
+ #include <wlr/backend.h>
+@@ -822,6 +823,8 @@ bool wlr_output_commit_state(struct wlr_output *output,
+ 
++	if (pinecone_pixman_output_commit)
++		pinecone_pixman_output_commit();
+ 	output_apply_commit(output, &pending);
+ 	output_send_commit_event(output, &pending);
+ 
+ 	if (new_back_buffer) {
+ 		wlr_buffer_unlock(pending.buffer);

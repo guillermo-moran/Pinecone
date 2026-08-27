@@ -27,6 +27,7 @@ private struct LinuxConsoleView: View {
                 selectedView: selectedView,
                 keyboardVisible: activeKeyboardFocused,
                 status: model.status,
+                performanceFeed: model.performanceFeed,
                 selectView: selectView,
                 toggleKeyboard: toggleKeyboard,
                 reset: {
@@ -93,7 +94,7 @@ private struct LinuxConsoleView: View {
                 feed: model.displayFeed,
                 focused: $displayFocused,
                 onTouch: model.sendTouch,
-                copyFrame: model.withDisplayFrameBytes,
+                copyFrame: model.displayFrameLease,
                 onPresented: model.recordDisplayPresented,
                 sendText: model.sendGuestKeyboardText,
                 sendKey: model.sendGuestKey
@@ -148,6 +149,7 @@ private struct GuestControlDrawer: View {
     let selectedView: GuestViewMode
     let keyboardVisible: Bool
     let status: MobileOSHostModel.HostStatus
+    @ObservedObject var performanceFeed: HostPerformanceFeed
     let selectView: (GuestViewMode) -> Void
     let toggleKeyboard: () -> Void
     let reset: () -> Void
@@ -155,76 +157,80 @@ private struct GuestControlDrawer: View {
     let stop: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            Button {
-                withAnimation(.snappy(duration: 0.22)) {
-                    isPresented.toggle()
+        VStack(alignment: .trailing, spacing: 6) {
+            ExecutionCounterBadge(feed: performanceFeed)
+
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.snappy(duration: 0.22)) {
+                        isPresented.toggle()
+                    }
+                } label: {
+                    Image(systemName: isPresented ? "chevron.right" : "chevron.left")
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 28, height: 46)
                 }
-            } label: {
-                Image(systemName: isPresented ? "chevron.right" : "chevron.left")
-                    .font(.system(size: 13, weight: .bold))
-                    .frame(width: 28, height: 46)
-            }
-            .buttonStyle(PineconeDrawerButtonStyle())
-            .accessibilityLabel(isPresented ? "Close controls" : "Open controls")
+                .buttonStyle(PineconeDrawerButtonStyle())
+                .accessibilityLabel(isPresented ? "Close controls" : "Open controls")
 
-            if isPresented {
-                VStack(spacing: 6) {
-                    drawerButton(
-                        image: "terminal",
-                        label: "Show terminal",
-                        selected: selectedView == .terminal
-                    ) {
-                        selectView(.terminal)
-                    }
-                    drawerButton(
-                        image: "display",
-                        label: "Show guest display",
-                        selected: selectedView == .display
-                    ) {
-                        selectView(.display)
-                    }
+                if isPresented {
+                    VStack(spacing: 6) {
+                        drawerButton(
+                            image: "terminal",
+                            label: "Show terminal",
+                            selected: selectedView == .terminal
+                        ) {
+                            selectView(.terminal)
+                        }
+                        drawerButton(
+                            image: "display",
+                            label: "Show guest display",
+                            selected: selectedView == .display
+                        ) {
+                            selectView(.display)
+                        }
 
-                    Divider()
-                        .overlay(Color.white.opacity(0.18))
-                        .frame(width: 28)
-                        .padding(.vertical, 2)
+                        Divider()
+                            .overlay(Color.white.opacity(0.18))
+                            .frame(width: 28)
+                            .padding(.vertical, 2)
 
-                    drawerButton(
-                        image: keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
-                        label: keyboardVisible ? "Hide keyboard" : "Show keyboard",
-                        disabled: status != .running
-                    ) {
-                        toggleKeyboard()
+                        drawerButton(
+                            image: keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
+                            label: keyboardVisible ? "Hide keyboard" : "Show keyboard",
+                            disabled: status != .running
+                        ) {
+                            toggleKeyboard()
+                        }
+                        drawerButton(
+                            image: "arrow.counterclockwise",
+                            label: "Reset VM",
+                            disabled: status == .booting
+                        ) {
+                            reset()
+                        }
+                        drawerButton(
+                            image: "power",
+                            label: "Reboot guest",
+                            disabled: status != .running
+                        ) {
+                            reboot()
+                        }
+                        drawerButton(
+                            image: "stop.fill",
+                            label: "Stop VM",
+                            disabled: status != .running && status != .booting,
+                            role: .destructive
+                        ) {
+                            stop()
+                        }
                     }
-                    drawerButton(
-                        image: "arrow.counterclockwise",
-                        label: "Reset VM",
-                        disabled: status == .booting
-                    ) {
-                        reset()
-                    }
-                    drawerButton(
-                        image: "power",
-                        label: "Reboot guest",
-                        disabled: status != .running
-                    ) {
-                        reboot()
-                    }
-                    drawerButton(
-                        image: "stop.fill",
-                        label: "Stop VM",
-                        disabled: status != .running && status != .booting,
-                        role: .destructive
-                    ) {
-                        stop()
-                    }
+                    .frame(width: 46)
+                    .padding(6)
+                    .background(.ultraThinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
-                .frame(width: 46)
-                .padding(6)
-                .background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
         .animation(.snappy(duration: 0.22), value: isPresented)
@@ -250,6 +256,51 @@ private struct GuestControlDrawer: View {
         .disabled(disabled)
         .opacity(disabled ? 0.34 : 1)
         .accessibilityLabel(label)
+    }
+}
+
+private struct ExecutionCounterBadge: View {
+    @ObservedObject var feed: HostPerformanceFeed
+
+    var body: some View {
+        let snapshot = feed.snapshot
+        VStack(alignment: .leading, spacing: 1) {
+            counterRow(label: "native", value: snapshot.nativeSteps)
+            counterRow(label: "fallback", value: snapshot.fallbackSteps)
+        }
+        .font(.system(size: 9, weight: .medium, design: .monospaced))
+        .foregroundStyle(Color.white.opacity(0.78))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "Native instructions \(snapshot.nativeSteps), fallback instructions \(snapshot.fallbackSteps)"
+        )
+    }
+
+    private func counterRow(label: String, value: Int) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+            Spacer(minLength: 4)
+            Text(Self.compact(value))
+                .foregroundStyle(Color.white)
+        }
+        .frame(width: 84)
+    }
+
+    private static func compact(_ value: Int) -> String {
+        switch value {
+        case 1_000_000_000...:
+            return String(format: "%.1fB", Double(value) / 1_000_000_000)
+        case 1_000_000...:
+            return String(format: "%.1fM", Double(value) / 1_000_000)
+        case 10_000...:
+            return String(format: "%.1fK", Double(value) / 1_000)
+        default:
+            return String(value)
+        }
     }
 }
 
@@ -328,12 +379,12 @@ private struct GuestFramebufferView: View {
         let x = UInt32(layout.width / 2)
         let startY = UInt32(layout.height - 1)
         let endY: UInt32 = 0
-        let steps: UInt32 = 32
+        let steps: UInt32 = 96
         Task { @MainActor in
             for step in 0...steps {
                 let y = startY - ((startY - endY) * step / steps)
                 onTouch(x, y, true)
-                try? await Task.sleep(nanoseconds: 40_000_000)
+                try? await Task.sleep(nanoseconds: 20_000_000)
             }
             onTouch(x, endY, false)
         }
@@ -439,14 +490,17 @@ private final class GuestTouchCaptureUIView: UIView {
             width: CGFloat(layout.width) * scale,
             height: CGFloat(layout.height) * scale
         )
-        guard viewport.contains(location) else { return nil }
+        let clampedLocation = CGPoint(
+            x: min(viewport.maxX, max(viewport.minX, location.x)),
+            y: min(viewport.maxY, max(viewport.minY, location.y))
+        )
         let x = min(layout.width - 1, max(
             0,
-            Int((location.x - viewport.minX) * CGFloat(layout.width) / viewport.width)
+            Int((clampedLocation.x - viewport.minX) * CGFloat(layout.width) / viewport.width)
         ))
         let y = min(layout.height - 1, max(
             0,
-            Int((location.y - viewport.minY) * CGFloat(layout.height) / viewport.height)
+            Int((clampedLocation.y - viewport.minY) * CGFloat(layout.height) / viewport.height)
         ))
         return (UInt32(x), UInt32(y))
     }

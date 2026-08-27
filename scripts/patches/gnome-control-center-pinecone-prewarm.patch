@@ -1,0 +1,133 @@
+diff --git a/shell/cc-application.c b/shell/cc-application.c
+index 68dcb93..428573a 100644
+--- a/shell/cc-application.c
++++ b/shell/cc-application.c
+@@ -20,6 +20,8 @@
+ #include "config.h"
+ 
++#include <errno.h>
+ #include <stdlib.h>
++#include <sys/resource.h>
+ 
+ #include <adwaita.h>
+ #include <gio/gio.h>
+@@ -28,6 +30,9 @@ struct _CcApplication {
+   CcShellModel *model;
+ 
+   CcWindow *window;
++
++  gboolean pinecone_prewarm_held;
++  gboolean pinecone_prewarm_scheduled;
+ };
+ 
+ static void cc_application_quit (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
+@@ -44,5 +49,6 @@ const GOptionEntry all_options[] = {
+   { "search", 's', 0, G_OPTION_ARG_STRING, NULL, N_("Search for the string"), "SEARCH" },
+   { "list", 'l', 0, G_OPTION_ARG_NONE, NULL, N_("List possible panel names and exit"), NULL },
++  { "pinecone-prewarm", 0, G_OPTION_FLAG_HIDDEN, G_OPTION_ARG_NONE, NULL, NULL, NULL },
+   { G_OPTION_REMAINING, '\0', 0, G_OPTION_ARG_FILENAME_ARRAY, NULL,
+     N_("Panel to display"), N_("[PANEL] [ARGUMENT…]") },
+   { NULL, 0, 0, 0, NULL, NULL, NULL } /* end the list */
+@@ -133,6 +139,49 @@ is_supported_desktop (void)
+   return FALSE;
+ }
+ 
++static void
++cc_application_ensure_window (CcApplication *self)
++{
++  if (self->window)
++    return;
++
++  self->window = cc_window_new (GTK_APPLICATION (self), self->model);
++  g_object_add_weak_pointer (G_OBJECT (self->window),
++                             (gpointer *) &self->window);
++}
++
++static void
++pinecone_write_prewarm_ready_file (void)
++{
++  const char *path = g_getenv ("PINECONE_SETTINGS_PREWARM_READY_FILE");
++  g_autoptr(GError) error = NULL;
++
++  if (path == NULL || *path == '\0')
++    return;
++
++  if (!g_file_set_contents (path, "", 0, &error))
++    g_warning ("Failed to publish Pinecone Settings prewarm state: %s",
++               error->message);
++}
++
++static gboolean
++pinecone_finish_prewarm (gpointer user_data)
++{
++  CcApplication *self = CC_APPLICATION (user_data);
++
++  self->pinecone_prewarm_scheduled = FALSE;
++  cc_application_ensure_window (self);
++
++  /* Realize the complete Settings hierarchy and its GdkSurface without
++   * mapping it. A later normal GApplication activation only has to present
++   * the already linked, parsed, styled and realized process. */
++  gtk_widget_realize (GTK_WIDGET (self->window));
++  pinecone_write_prewarm_ready_file ();
++  g_message ("Pinecone Settings prewarm ready");
++
++  return G_SOURCE_REMOVE;
++}
++
+ static gint
+ cc_application_handle_local_options (GApplication *application, GVariantDict *options)
+ {
+@@ -178,6 +227,30 @@ cc_application_command_line (GApplication            *application,
+   if (debug)
+     cc_log_init ();
+ 
++  if (g_variant_dict_contains (options, "pinecone-prewarm")) {
++    cc_application_ensure_window (self);
++    if (!self->pinecone_prewarm_held) {
++      g_application_hold (application);
++      self->pinecone_prewarm_held = TRUE;
++    }
++    if (!self->pinecone_prewarm_scheduled) {
++      self->pinecone_prewarm_scheduled = TRUE;
++      g_idle_add_full (G_PRIORITY_LOW,
++                       pinecone_finish_prewarm,
++                       g_object_ref (self),
++                       g_object_unref);
++    }
++    return 0;
++  }
++
++  /* The hidden prewarm instance is intentionally background-priority while
++   * it parses resources and realizes its window. Restore the compositor's
++   * interactive priority before handling the real launch request. */
++  if (self->pinecone_prewarm_held &&
++      setpriority (PRIO_PROCESS, 0, -5) != 0)
++    g_warning ("Failed to restore Pinecone Settings priority: %s",
++               g_strerror (errno));
++
+   g_application_activate (application);
+ 
+   if (g_variant_dict_lookup (options, "search", "&s", &search_str)) {
+@@ -237,6 +310,11 @@ cc_application_quit (GSimpleAction *simple,
+ 
+   if (self->window)
+     gtk_window_destroy (GTK_WINDOW (self->window));
++
++  if (self->pinecone_prewarm_held) {
++    self->pinecone_prewarm_held = FALSE;
++    g_application_release (G_APPLICATION (self));
++  }
+ }
+ 
+ static void
+@@ -245,8 +323,7 @@ cc_application_activate (GApplication *application)
+ {
+   CcApplication *self = CC_APPLICATION (application);
+ 
+-  if (!self->window)
+-    self->window = cc_window_new (GTK_APPLICATION (application), self->model);
++  cc_application_ensure_window (self);
+ 
+   gtk_window_present (GTK_WINDOW (self->window));
+ }

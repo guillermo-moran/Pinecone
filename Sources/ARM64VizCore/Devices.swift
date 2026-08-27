@@ -105,10 +105,11 @@ public final class SimpleInterruptController: InterruptController {
     public func raise(line: UInt32) {
         withLock {
             increment(&raisedCounts, line: line)
-            guard !active.contains(line) else {
+            if active.contains(line) {
                 increment(&activeRaiseDropCounts, line: line)
-                return
             }
+            // GIC interrupt state may be active and pending at the same time.
+            // Preserve a reassertion until EOI instead of losing the event.
             if !pending.contains(line) {
                 pending.append(line)
             }
@@ -166,7 +167,6 @@ public final class SimpleInterruptController: InterruptController {
             increment(&raisedCounts, line: line)
             if targetedActive[targetVCPU, default: []].contains(line) {
                 increment(&activeRaiseDropCounts, line: line)
-                return
             }
             if !targetedPending[targetVCPU, default: []].contains(line) {
                 targetedPending[targetVCPU, default: []].append(line)
@@ -880,6 +880,43 @@ public struct VirtualFramebufferFrameMetadata: Sendable, Equatable {
 
     public var damagedByteCount: Int {
         damage.reduce(0) { $0 + $1.width * $1.height * bytesPerPixel }
+    }
+}
+
+public final class VirtualFramebufferFrameLease: @unchecked Sendable {
+    public let metadata: VirtualFramebufferFrameMetadata
+
+    private let storageOwner: AnyObject
+    private let baseAddress: UnsafeRawPointer
+    private let byteCount: Int
+    private let releaseHandler: @Sendable () -> Void
+
+    init(
+        metadata: VirtualFramebufferFrameMetadata,
+        storageOwner: AnyObject,
+        baseAddress: UnsafeRawPointer,
+        byteCount: Int,
+        releaseHandler: @escaping @Sendable () -> Void = {}
+    ) {
+        self.metadata = metadata
+        self.storageOwner = storageOwner
+        self.baseAddress = baseAddress
+        self.byteCount = byteCount
+        self.releaseHandler = releaseHandler
+    }
+
+    deinit {
+        releaseHandler()
+    }
+
+    public func withUnsafeBytes<R>(
+        _ body: (UnsafeRawBufferPointer) throws -> R
+    ) rethrows -> R {
+        defer { _fixLifetime(storageOwner) }
+        return try body(UnsafeRawBufferPointer(
+            start: baseAddress,
+            count: byteCount
+        ))
     }
 }
 

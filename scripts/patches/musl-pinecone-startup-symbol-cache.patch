@@ -1,0 +1,407 @@
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -157,6 +157,40 @@
+ static struct fdpic_loadmap *app_loadmap;
+ static struct fdpic_dummy_loadmap app_dummy_loadmap;
+ 
++enum {
++	STARTUP_SYM_CACHE_SET_COUNT = 4096,
++	STARTUP_SYM_CACHE_WAY_COUNT = 4,
++	STARTUP_SYM_INDEX_MIN_SLOT_COUNT = 4096,
++	STARTUP_SYM_INDEX_MAX_SLOT_COUNT = 262144,
++};
++
++struct startup_sym_cache_entry {
++	const char *name;
++	struct symdef def;
++	uint32_t hash;
++	unsigned char need_def;
++	unsigned char valid;
++};
++
++struct startup_sym_index_entry {
++	const char *name;
++	struct symdef allow_undefined_def;
++	struct symdef required_def;
++	uint32_t hash;
++	unsigned char has_allow_undefined;
++	unsigned char has_required;
++	unsigned char valid;
++};
++
++static struct startup_sym_cache_entry *startup_sym_cache;
++static size_t startup_sym_cache_bytes;
++static size_t startup_sym_cache_replacement;
++static int startup_sym_cache_active;
++static struct startup_sym_index_entry *startup_sym_index;
++static size_t startup_sym_index_slot_count;
++static size_t startup_sym_index_bytes;
++static int startup_sym_index_active;
++
+ struct debug *_dl_debug_addr = &debug;
+ 
+ extern weak hidden char __ehdr_start[];
+@@ -307,7 +341,137 @@
+ #ifndef ARCH_SYM_REJECT_UND
+ #define ARCH_SYM_REJECT_UND(s) 0
+ #endif
++
++static int symbol_is_acceptable(Sym *sym, int need_def)
++{
++	if (!sym->st_shndx &&
++	    (need_def || (sym->st_info&0xf) == STT_TLS ||
++	     ARCH_SYM_REJECT_UND(sym)))
++		return 0;
++	if (!sym->st_value && (sym->st_info&0xf) != STT_TLS)
++		return 0;
++	if (!(1<<(sym->st_info&0xf) & OK_TYPES))
++		return 0;
++	if (!(1<<(sym->st_info>>4) & OK_BINDS))
++		return 0;
++	return 1;
++}
++
++static inline size_t startup_sym_cache_set(uint32_t hash, int need_def)
++{
++	uint32_t mixed = hash ^ (hash >> 16);
++	if (need_def)
++		mixed ^= 0x9e3779b9U;
++	return mixed & (STARTUP_SYM_CACHE_SET_COUNT - 1);
++}
++
++static inline size_t startup_sym_index_slot(uint32_t hash)
++{
++	uint32_t mixed = hash ^ (hash >> 16);
++	mixed *= 0x9e3779b1U;
++	return mixed & (startup_sym_index_slot_count - 1);
++}
++
++static inline int startup_sym_index_lookup(
++	struct dso *start,
++	const char *name,
++	uint32_t hash,
++	int need_def,
++	int use_deps,
++	struct symdef *def)
++{
++	if (!startup_sym_index_active || use_deps || start != head)
++		return 0;
++
++	hash |= 1;
++	size_t slot = startup_sym_index_slot(hash);
++	for (size_t probe = 0; probe < startup_sym_index_slot_count; probe++) {
++		struct startup_sym_index_entry *entry = startup_sym_index + slot;
++		if (!entry->valid)
++			return 0;
++		if (entry->hash == hash && !strcmp(entry->name, name)) {
++			if (need_def) {
++				if (!entry->has_required)
++					return 0;
++				*def = entry->required_def;
++			} else {
++				if (!entry->has_allow_undefined)
++					return 0;
++				*def = entry->allow_undefined_def;
++			}
++			return 1;
++		}
++		slot = (slot + 1) & (startup_sym_index_slot_count - 1);
++	}
++	return 0;
++}
+ 
++static inline int startup_sym_cache_lookup(
++	struct dso *start,
++	const char *name,
++	uint32_t hash,
++	int need_def,
++	int use_deps,
++	struct symdef *def)
++{
++	if (!startup_sym_cache_active || use_deps || start != head)
++		return 0;
++
++	size_t base = startup_sym_cache_set(hash, need_def) *
++		STARTUP_SYM_CACHE_WAY_COUNT;
++	for (size_t way = 0; way < STARTUP_SYM_CACHE_WAY_COUNT; way++) {
++		struct startup_sym_cache_entry *entry =
++			startup_sym_cache + base + way;
++		if (entry->valid && entry->hash == hash &&
++		    entry->need_def == need_def &&
++		    !strcmp(entry->name, name)) {
++			*def = entry->def;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static inline void startup_sym_cache_store(
++	struct dso *start,
++	const char *name,
++	uint32_t hash,
++	int need_def,
++	int use_deps,
++	struct symdef def)
++{
++	if (!startup_sym_cache_active || use_deps || start != head)
++		return;
++
++	size_t base = startup_sym_cache_set(hash, need_def) *
++		STARTUP_SYM_CACHE_WAY_COUNT;
++	struct startup_sym_cache_entry *destination = 0;
++	for (size_t way = 0; way < STARTUP_SYM_CACHE_WAY_COUNT; way++) {
++		struct startup_sym_cache_entry *entry =
++			startup_sym_cache + base + way;
++		if (entry->valid && entry->hash == hash &&
++		    entry->need_def == need_def &&
++		    !strcmp(entry->name, name)) {
++			destination = entry;
++			break;
++		}
++		if (!entry->valid && !destination)
++			destination = entry;
++	}
++	if (!destination) {
++		size_t way = startup_sym_cache_replacement++ &
++			(STARTUP_SYM_CACHE_WAY_COUNT - 1);
++		destination = startup_sym_cache + base + way;
++	}
++	*destination = (struct startup_sym_cache_entry) {
++		.name = name,
++		.def = def,
++		.hash = hash,
++		.need_def = need_def,
++		.valid = 1,
++	};
++}
++
+ #if defined(__GNUC__)
+ __attribute__((always_inline))
+ #endif
+@@ -317,6 +481,11 @@
+ 	size_t ghm = 1ul << gh % (8*sizeof(size_t));
+ 	struct symdef def = {0};
+ 	struct dso **deps = use_deps ? dso->deps : 0;
++	struct dso *start = dso;
++	if (startup_sym_index_lookup(start, s, gh, need_def, use_deps, &def))
++		return def;
++	if (startup_sym_cache_lookup(start, s, gh, need_def, use_deps, &def))
++		return def;
+ 	for (; dso; dso=use_deps ? *deps++ : dso->syms_next) {
+ 		Sym *sym;
+ 		if ((ght = dso->ghashtab)) {
+@@ -326,19 +495,12 @@
+ 			sym = sysv_lookup(s, h, dso);
+ 		}
+ 		if (!sym) continue;
+-		if (!sym->st_shndx)
+-			if (need_def || (sym->st_info&0xf) == STT_TLS
+-			    || ARCH_SYM_REJECT_UND(sym))
+-				continue;
+-		if (!sym->st_value)
+-			if ((sym->st_info&0xf) != STT_TLS)
+-				continue;
+-		if (!(1<<(sym->st_info&0xf) & OK_TYPES)) continue;
+-		if (!(1<<(sym->st_info>>4) & OK_BINDS)) continue;
++		if (!symbol_is_acceptable(sym, need_def)) continue;
+ 		def.sym = sym;
+ 		def.dso = dso;
+ 		break;
+ 	}
++	startup_sym_cache_store(start, s, gh, need_def, use_deps, def);
+ 	return def;
+ }
+ 
+@@ -1020,8 +1182,171 @@
+ 	p = (void *)__syscall(SYS_mmap, 0, n, prot, flags, -1, 0);
+ #endif
+ 	return (unsigned long)p > -4096UL ? 0 : p;
++}
++
++static struct startup_sym_index_entry *startup_sym_index_find_or_add(
++	const char *name, uint32_t hash)
++{
++	hash |= 1;
++	size_t slot = startup_sym_index_slot(hash);
++	for (size_t probe = 0; probe < startup_sym_index_slot_count; probe++) {
++		struct startup_sym_index_entry *entry = startup_sym_index + slot;
++		if (!entry->valid) {
++			entry->name = name;
++			entry->hash = hash;
++			entry->valid = 1;
++			return entry;
++		}
++		if (entry->hash == hash && !strcmp(entry->name, name))
++			return entry;
++		slot = (slot + 1) & (startup_sym_index_slot_count - 1);
++	}
++	return 0;
++}
++
++static int startup_sym_index_add_symbol(struct dso *p, size_t index)
++{
++	Sym *sym = p->syms + index;
++	if (!sym->st_name || (p->versym && p->versym[index] < 0))
++		return 1;
++
++	const char *name = p->strings + sym->st_name;
++	uint32_t hash = gnu_hash(name);
++	Sym *selected;
++	if (p->ghashtab)
++		selected = gnu_lookup(hash, p->ghashtab, p, name);
++	else
++		selected = sysv_lookup(name, sysv_hash(name), p);
++
++	/* Match find_sym2 exactly when a DSO contains duplicate names. */
++	if (selected != sym)
++		return 1;
++
++	struct startup_sym_index_entry *entry =
++		startup_sym_index_find_or_add(name, hash);
++	if (!entry)
++		return 0;
++	if (!entry->has_allow_undefined && symbol_is_acceptable(sym, 0)) {
++		entry->allow_undefined_def =
++			(struct symdef) { .sym = sym, .dso = p };
++		entry->has_allow_undefined = 1;
++	}
++	if (!entry->has_required && symbol_is_acceptable(sym, 1)) {
++		entry->required_def =
++			(struct symdef) { .sym = sym, .dso = p };
++		entry->has_required = 1;
++	}
++	return 1;
+ }
+ 
++static size_t startup_sym_index_candidate_count(void)
++{
++	size_t count = 0;
++	for (struct dso *p = head; p; p = p->syms_next) {
++		size_t dso_count = 0;
++		if (p->ghashtab) {
++			size_t first = p->ghashtab[1];
++			size_t end = count_syms(p);
++			if (end > first)
++				dso_count = end - first;
++		} else if (p->hashtab) {
++			dso_count = p->hashtab[1];
++		}
++		if (dso_count > STARTUP_SYM_INDEX_MAX_SLOT_COUNT - count)
++			return STARTUP_SYM_INDEX_MAX_SLOT_COUNT;
++		count += dso_count;
++	}
++	return count;
++}
++
++static void startup_sym_index_prepare(void)
++{
++	size_t candidate_count = startup_sym_index_candidate_count();
++	if (!candidate_count)
++		return;
++
++	size_t slot_count = STARTUP_SYM_INDEX_MIN_SLOT_COUNT;
++	while (slot_count < STARTUP_SYM_INDEX_MAX_SLOT_COUNT &&
++	    candidate_count > slot_count / 2)
++		slot_count *= 2;
++	if (slot_count > (size_t)-1 / sizeof(struct startup_sym_index_entry))
++		return;
++
++	startup_sym_index_bytes =
++		slot_count * sizeof(struct startup_sym_index_entry);
++	startup_sym_index = dl_mmap(startup_sym_index_bytes);
++	if (!startup_sym_index) {
++		startup_sym_index_bytes = 0;
++		return;
++	}
++	startup_sym_index_slot_count = slot_count;
++
++	int complete = 1;
++	for (struct dso *p = head; p && complete; p = p->syms_next) {
++		if (p->ghashtab) {
++			size_t first = p->ghashtab[1];
++			size_t end = count_syms(p);
++			for (size_t i = first; i < end; i++) {
++				if (!startup_sym_index_add_symbol(p, i)) {
++					complete = 0;
++					break;
++				}
++			}
++		} else if (p->hashtab) {
++			size_t bucket_count = p->hashtab[0];
++			size_t symbol_count = p->hashtab[1];
++			Elf_Symndx *buckets = p->hashtab + 2;
++			Elf_Symndx *chains = buckets + bucket_count;
++			for (size_t bucket = 0; bucket < bucket_count && complete;
++			    bucket++) {
++				size_t steps = 0;
++				for (size_t i = buckets[bucket]; i && i < symbol_count &&
++				    steps++ < symbol_count; i = chains[i]) {
++					if (!startup_sym_index_add_symbol(p, i)) {
++						complete = 0;
++						break;
++					}
++				}
++			}
++		}
++	}
++
++	/* A partial table is safe: absent entries use musl's normal lookup. */
++	startup_sym_index_active = 1;
++}
++
++static void startup_sym_cache_prepare(void)
++{
++	startup_sym_cache_bytes =
++		STARTUP_SYM_CACHE_SET_COUNT * STARTUP_SYM_CACHE_WAY_COUNT *
++		sizeof(struct startup_sym_cache_entry);
++	startup_sym_cache = dl_mmap(startup_sym_cache_bytes);
++	if (startup_sym_cache) {
++		startup_sym_cache_replacement = 0;
++		startup_sym_cache_active = 1;
++	} else {
++		startup_sym_cache_bytes = 0;
++	}
++	startup_sym_index_prepare();
++}
++
++static void startup_sym_cache_destroy(void)
++{
++	startup_sym_index_active = 0;
++	if (startup_sym_index)
++		munmap(startup_sym_index, startup_sym_index_bytes);
++	startup_sym_index = 0;
++	startup_sym_index_slot_count = 0;
++	startup_sym_index_bytes = 0;
++
++	startup_sym_cache_active = 0;
++	if (startup_sym_cache)
++		munmap(startup_sym_cache, startup_sym_cache_bytes);
++	startup_sym_cache = 0;
++	startup_sym_cache_bytes = 0;
++	startup_sym_cache_replacement = 0;
++}
++
+ static void makefuncdescs(struct dso *p)
+ {
+ 	static int self_done;
+@@ -2022,7 +2347,9 @@
+ 	static_tls_cnt = tls_cnt;
+ 
+ 	/* The main program must be relocated LAST since it may contain
+-	 * copy relocations which depend on libraries' relocations. */
++	 * copy relocations which depend on libraries' relocations. The DSO
++	 * graph is immutable from this point until runtime mode begins. */
++	startup_sym_cache_prepare();
+ 	reloc_all(app.next);
+ 	reloc_all(&app);
+ 
+@@ -2054,6 +2381,7 @@
+ 	if (find_sym(head, "aligned_alloc", 1).dso != &ldso)
+ 		__aligned_alloc_replaced = 1;
+ 
++	startup_sym_cache_destroy();
+ 	/* Switch to runtime mode: any further failures in the dynamic
+ 	 * linker are a reportable failure rather than a fatal startup
+ 	 * error. */
+

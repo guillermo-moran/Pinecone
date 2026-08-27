@@ -1,0 +1,154 @@
+diff --git a/src/calls-manager.c b/src/calls-manager.c
+index 2e23634..f01d412 100644
+--- a/src/calls-manager.c
++++ b/src/calls-manager.c
+@@ -384,6 +384,9 @@ phosh_calls_manager_idle_init (PhoshManager *manager)
+ {
+   PhoshCallsManager *self = PHOSH_CALLS_MANAGER (manager);
+ 
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0)
++    return;
++
+   phosh_dbus_object_manager_client_new_for_bus (G_BUS_TYPE_SESSION,
+                                                 G_DBUS_OBJECT_MANAGER_CLIENT_FLAGS_DO_NOT_AUTO_START,
+                                                 BUS_NAME,
+diff --git a/src/emergency-calls-manager.c b/src/emergency-calls-manager.c
+index e8a5221..aef7ccd 100644
+--- a/src/emergency-calls-manager.c
++++ b/src/emergency-calls-manager.c
+@@ -319,6 +319,9 @@ phosh_emergency_calls_manager_idle_init (PhoshManager *manager)
+ {
+   PhoshEmergencyCallsManager *self = PHOSH_EMERGENCY_CALLS_MANAGER (manager);
+ 
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0)
++    return;
++
+   /* Connect to call's emergency call DBus interface */
+   phosh_dbus_emergency_calls_proxy_new_for_bus (G_BUS_TYPE_SESSION,
+                                                 G_DBUS_PROXY_FLAGS_NONE,
+diff --git a/src/network-auth-manager.c b/src/network-auth-manager.c
+index a709aba..9993227 100644
+--- a/src/network-auth-manager.c
++++ b/src/network-auth-manager.c
+@@ -716,6 +716,12 @@ phosh_network_auth_manager_constructed (GObject *object)
+ 
+   self->cancel = g_cancellable_new ();
+ 
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0) {
++    self->register_cancel = g_cancellable_new ();
++    G_OBJECT_CLASS (phosh_network_auth_manager_parent_class)->constructed (object);
++    return;
++  }
++
+   setup_network_agent (self);
+   g_debug ("Network-auth-manager initialized");
+ 
+diff --git a/src/polkit-auth-agent.c b/src/polkit-auth-agent.c
+index 9636bfd..f777db4 100644
+--- a/src/polkit-auth-agent.c
++++ b/src/polkit-auth-agent.c
+@@ -375,6 +375,9 @@ phosh_polkit_auth_agent_constructed (GObject *object)
+   G_OBJECT_CLASS (phosh_polkit_auth_agent_parent_class)->constructed (object);
+ 
+   self->cancellable = g_cancellable_new ();
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0)
++    return;
++
+   agent_register_async (self, self->cancellable, on_agent_registered, NULL);
+ }
+ 
+diff --git a/src/session-manager.c b/src/session-manager.c
+index 4461586..70e5cc0 100644
+--- a/src/session-manager.c
++++ b/src/session-manager.c
+@@ -349,6 +349,11 @@ phosh_session_manager_constructed (GObject *object)
+ 
+   g_autoptr (GError) err = NULL;
+ 
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0) {
++    G_OBJECT_CLASS (phosh_session_manager_parent_class)->constructed (object);
++    return;
++  }
++
+   /* Sync call since this happens early in startup and we need it right away */
+   self->proxy = phosh_dbus_session_manager_proxy_new_for_bus_sync (
+     G_BUS_TYPE_SESSION,
+diff --git a/src/shell.c b/src/shell.c
+index af8f115..5cc84b9 100644
+--- a/src/shell.c
++++ b/src/shell.c
+@@ -828,6 +828,7 @@ setup_idle_cb (PhoshShell *self)
+ {
+   g_autoptr (GError) err = NULL;
+   PhoshShellPrivate *priv = phosh_shell_get_instance_private (self);
++  gboolean pinecone_profile = g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0;
+ 
+   priv->debug_control = phosh_debug_control_new ();
+   priv->app_tracker = phosh_app_tracker_new ();
+@@ -841,11 +842,13 @@ setup_idle_cb (PhoshShell *self)
+   /* Connecivity manager needs Wi-Fi manager: */
+   priv->connectivity_manager = phosh_connectivity_manager_new ();
+ 
+-  priv->sensor_proxy_manager = phosh_sensor_proxy_manager_new (&err);
+-  if (priv->sensor_proxy_manager)
+-    priv->ambient = phosh_ambient_new (priv->sensor_proxy_manager);
+-  else
+-    g_message ("Failed to connect to sensor-proxy: %s", err->message);
++  if (!pinecone_profile) {
++    priv->sensor_proxy_manager = phosh_sensor_proxy_manager_new (&err);
++    if (priv->sensor_proxy_manager)
++      priv->ambient = phosh_ambient_new (priv->sensor_proxy_manager);
++    else
++      g_message ("Failed to connect to sensor-proxy: %s", err->message);
++  }
+ 
+   priv->layout_manager = phosh_layout_manager_new ();
+   /* PhoshHome needs the background manager */
+@@ -883,7 +886,8 @@ setup_idle_cb (PhoshShell *self)
+                            self,
+                            G_CONNECT_SWAPPED);
+ 
+-  phosh_shell_get_location_manager (self);
++  if (!pinecone_profile)
++    phosh_shell_get_location_manager (self);
+   if (priv->sensor_proxy_manager) {
+     priv->proximity = phosh_proximity_new (priv->sensor_proxy_manager,
+                                            priv->calls_manager);
+@@ -897,9 +901,10 @@ setup_idle_cb (PhoshShell *self)
+   priv->mount_manager = phosh_mount_manager_new ();
+   priv->gtk_mount_manager = phosh_gtk_mount_manager_new ();
+ 
+-  phosh_session_manager_register (priv->session_manager,
+-                                  PHOSH_APP_ID,
+-                                  g_getenv ("DESKTOP_AUTOSTART_ID"));
++  if (!pinecone_profile)
++    phosh_session_manager_register (priv->session_manager,
++                                    PHOSH_APP_ID,
++                                    g_getenv ("DESKTOP_AUTOSTART_ID"));
+   g_unsetenv ("DESKTOP_AUTOSTART_ID");
+ 
+   priv->gnome_shell_manager = phosh_gnome_shell_manager_get_default ();
+@@ -1159,7 +1164,8 @@ phosh_shell_constructed (GObject *object)
+ 
+   priv->faders = g_ptr_array_new_with_free_func ((GDestroyNotify) (gtk_widget_destroy));
+ 
+-  phosh_system_prompter_register ();
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") != 0)
++    phosh_system_prompter_register ();
+   priv->polkit_auth_agent = phosh_polkit_auth_agent_new ();
+ 
+   priv->feedback_manager = phosh_feedback_manager_new ();
+diff --git a/src/suspend-manager.c b/src/suspend-manager.c
+index c2db6db..bc48a03 100644
+--- a/src/suspend-manager.c
++++ b/src/suspend-manager.c
+@@ -126,6 +126,9 @@ phosh_suspend_manager_idle_init (PhoshManager *manager)
+ {
+   PhoshSuspendManager *self = PHOSH_SUSPEND_MANAGER (manager);
+ 
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_PROFILE"), "1") == 0)
++    return;
++
+   phosh_dbus_login_manager_proxy_new_for_bus (
+     G_BUS_TYPE_SYSTEM,
+     G_DBUS_PROXY_FLAGS_NONE,

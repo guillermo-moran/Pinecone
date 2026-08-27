@@ -18,6 +18,8 @@ struct ARM64VizCommand {
         switch command {
         case "run-toy":
             try runToy()
+        case "benchmark-native":
+            try benchmarkNative(arguments: arguments)
         case "run-mobile":
             try disabledJavaScriptMobileOSCommand(command)
         case "build-mobile-image":
@@ -63,6 +65,67 @@ struct ARM64VizCommand {
         print("")
         print("[arm64viz] backend=\(machine.vm.backend.name)")
         print("[arm64viz] stop=\(result.stopReason) steps=\(result.steps)")
+    }
+
+    private static func benchmarkNative(arguments: [String]) throws {
+        let requestedSteps = try optionalValue(after: "--steps", in: arguments)
+            .flatMap(Int.init) ?? 100_000_000
+        guard requestedSteps > 0 else {
+            throw VMError.deviceError("--steps must be greater than zero")
+        }
+
+        let backend = SoftwareARM64Backend()
+        backend.enableBasicBlockExecution = true
+        backend.fallbackInterpreterPolicy = .nativeOnly
+        let machine = try MachineFactory.makeResearchMachine(backend: backend)
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        let words: [UInt32] = [
+            0x9100_0400, // add x0, x0, #1
+            0x9100_0421, // add x1, x1, #1
+            0xf100_0442, // subs x2, x2, #1
+            0x54ff_ffa1  // b.ne entry
+        ]
+        var program = Data(capacity: words.count * MemoryLayout<UInt32>.size)
+        for word in words {
+            var encoded = word.littleEndian
+            withUnsafeBytes(of: &encoded) { program.append(contentsOf: $0) }
+        }
+
+        try machine.vm.loadBinary([UInt8](program), at: entry)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.cpu.x[2] = UInt64.max
+        machine.vm.systemRegisterTraceCapacity = 0
+        machine.vm.systemRegisterReadTraceCapacity = 0
+        machine.vm.disableInstructionTrace()
+        machine.vm.enableMMIOTrace(capacity: 0)
+        machine.vm.enableGuestMemoryTrace(capacity: 0)
+        machine.vm.timerCyclesPerInstruction = 0
+        machine.vm.wallClockRunBudgetNanoseconds = nil
+        machine.vm.nativeCheckpointBlockInterval = 65_536
+
+        let warmupSteps = min(2_000_000, requestedSteps)
+        _ = try machine.vm.run(maxSteps: warmupSteps)
+        let totalsBefore = backend.executionTotals()
+        let start = DispatchTime.now().uptimeNanoseconds
+        let result = try machine.vm.run(maxSteps: requestedSteps)
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- start
+        let totalsAfter = backend.executionTotals()
+        let nativeSteps = totalsAfter.nativeSteps - totalsBefore.nativeSteps
+        let fallbackSteps = totalsAfter.fallbackSteps - totalsBefore.fallbackSteps
+        let seconds = Double(elapsed) / 1_000_000_000
+        let millionsPerSecond = seconds > 0
+            ? Double(nativeSteps) / seconds / 1_000_000
+            : 0
+
+        print(String(
+            format: "native-benchmark steps=%d native=%d fallback=%d seconds=%.6f mips=%.3f stop=%@",
+            result.steps,
+            nativeSteps,
+            fallbackSteps,
+            seconds,
+            millionsPerSecond,
+            result.stopReason.description
+        ))
     }
 
     private static func runMobile(imagePath: String?, verboseBoot: Bool) throws {
@@ -750,6 +813,9 @@ struct ARM64VizCommand {
             """
             arm64viz commands:
               run-toy    Run the dependency-free toy ARM64 UART guest.
+              benchmark-native [--steps n]
+                         Measure the trained native C execution loop without
+                         tracing, timers, MMIO, or interpreter fallback.
               run-mobile [--verbose] [path.mosimg]
                          Disabled: JavaScript MobileOS is archived.
               build-mobile-image [--verbose] <path.mosimg>

@@ -58,6 +58,16 @@ public struct ARM64BackendNamedCount: Codable, Equatable {
     }
 }
 
+public struct ARM64BackendExecutionTotals: Codable, Equatable, Sendable {
+    public let nativeSteps: Int
+    public let fallbackSteps: Int
+
+    public init(nativeSteps: Int, fallbackSteps: Int) {
+        self.nativeSteps = nativeSteps
+        self.fallbackSteps = fallbackSteps
+    }
+}
+
 public struct ARM64BackendPerformanceSnapshot: Codable, Equatable {
     public let decodedBasicBlockExecutions: Int
     public let decodedBasicBlockSteps: Int
@@ -84,6 +94,10 @@ public struct ARM64BackendPerformanceSnapshot: Codable, Equatable {
     public let nativeInstructionFetchHits: Int
     public let nativeInstructionTLBHits: Int
     public let nativeInstructionTLBMisses: Int
+    public let nativeInstructionTLBHotHits: Int
+    public let nativeInstructionTLBColdMisses: Int
+    public let nativeInstructionTLBConflictMisses: Int
+    public let nativeInstructionTLBInvalidationMisses: Int
     public let nativePageTableWalks: Int
     public let nativePageTableFaults: Int
     public let nativeTranslationCallbackWalks: Int
@@ -137,6 +151,10 @@ public struct ARM64BackendPerformanceSnapshot: Codable, Equatable {
         nativeInstructionFetchHits: Int,
         nativeInstructionTLBHits: Int,
         nativeInstructionTLBMisses: Int,
+        nativeInstructionTLBHotHits: Int,
+        nativeInstructionTLBColdMisses: Int,
+        nativeInstructionTLBConflictMisses: Int,
+        nativeInstructionTLBInvalidationMisses: Int,
         nativePageTableWalks: Int,
         nativePageTableFaults: Int,
         nativeTranslationCallbackWalks: Int,
@@ -189,6 +207,10 @@ public struct ARM64BackendPerformanceSnapshot: Codable, Equatable {
         self.nativeInstructionFetchHits = nativeInstructionFetchHits
         self.nativeInstructionTLBHits = nativeInstructionTLBHits
         self.nativeInstructionTLBMisses = nativeInstructionTLBMisses
+        self.nativeInstructionTLBHotHits = nativeInstructionTLBHotHits
+        self.nativeInstructionTLBColdMisses = nativeInstructionTLBColdMisses
+        self.nativeInstructionTLBConflictMisses = nativeInstructionTLBConflictMisses
+        self.nativeInstructionTLBInvalidationMisses = nativeInstructionTLBInvalidationMisses
         self.nativePageTableWalks = nativePageTableWalks
         self.nativePageTableFaults = nativePageTableFaults
         self.nativeTranslationCallbackWalks = nativeTranslationCallbackWalks

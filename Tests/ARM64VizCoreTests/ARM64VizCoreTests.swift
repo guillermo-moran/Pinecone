@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import ARM64VizNative
 import XCTest
 @testable import ARM64VizCore
 
@@ -19,6 +20,29 @@ private final class SequencedHostGeneration: @unchecked Sendable {
         defer { lock.unlock() }
         return reads
     }
+}
+
+private final class CallbackMMIODevice: MMIODevice, @unchecked Sendable {
+    let name: String
+    let range: AddressRange
+    var onRead: (UInt64, MMIOWidth) throws -> UInt64
+
+    init(
+        name: String,
+        base: GuestAddress,
+        onRead: @escaping (UInt64, MMIOWidth) throws -> UInt64
+    ) {
+        self.name = name
+        range = AddressRange(start: base, length: 0x1000)
+        self.onRead = onRead
+    }
+
+    func read(offset: UInt64, width: MMIOWidth) throws -> UInt64 {
+        try onRead(offset, width)
+    }
+
+    func write(offset: UInt64, width: MMIOWidth, value: UInt64) throws {}
+    func reset() {}
 }
 
 final class ARM64VizCoreTests: XCTestCase {
@@ -149,6 +173,91 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try memory.read32(at: 0x4000_0020), 0xddcc_bbaa)
     }
 
+    func testPhysicalMemoryAcquireReleasePublishesVirtQueuePayload() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 4096)
+        let payloadAddress = memory.base + 0x100
+        let ownershipAddress = memory.base + 0x200
+        let iterations: UInt64 = 10_000
+        let completion = DispatchGroup()
+        let failureLock = NSLock()
+        var failures: [Error] = []
+
+        func record(_ error: Error) {
+            failureLock.lock()
+            failures.append(error)
+            failureLock.unlock()
+        }
+
+        completion.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { completion.leave() }
+            do {
+                for value in 1...iterations {
+                    while try memory.read16Acquire(at: ownershipAddress) != 0 {
+                        sched_yield()
+                    }
+                    try memory.write64(value, at: payloadAddress)
+                    try memory.write16Release(1, at: ownershipAddress)
+                }
+            } catch {
+                record(error)
+            }
+        }
+
+        completion.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { completion.leave() }
+            do {
+                for expected in 1...iterations {
+                    while try memory.read16Acquire(at: ownershipAddress) == 0 {
+                        sched_yield()
+                    }
+                    let actual = try memory.read64(at: payloadAddress)
+                    guard actual == expected else {
+                        throw VMError.deviceError(
+                            "acquire observed payload \(actual), expected \(expected)"
+                        )
+                    }
+                    try memory.write16Release(0, at: ownershipAddress)
+                }
+            } catch {
+                record(error)
+            }
+        }
+
+        XCTAssertEqual(completion.wait(timeout: .now() + 10), .success)
+        XCTAssertTrue(failures.isEmpty, "acquire/release failures: \(failures)")
+        XCTAssertEqual(try memory.read64(at: payloadAddress), iterations)
+        XCTAssertEqual(try memory.read16(at: ownershipAddress), 0)
+    }
+
+    func testPhysicalMemoryDisjointPagesDoNotShareAnAccessLock() throws {
+        let pageSize = 4_096
+        let memory = PhysicalMemory(
+            base: 0x4000_0000,
+            size: pageSize * 2
+        )
+        avz_guest_memory_lock_range(memory.nativeMemoryHandle, 0, 1)
+        defer {
+            avz_guest_memory_unlock_range(memory.nativeMemoryHandle, 0, 1)
+        }
+
+        let completed = expectation(description: "disjoint page write")
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? memory.write8(
+                0x5a,
+                at: memory.base + GuestAddress(pageSize)
+            )
+            completed.fulfill()
+        }
+
+        wait(for: [completed], timeout: 1)
+        XCTAssertEqual(
+            try memory.read8(at: memory.base + GuestAddress(pageSize)),
+            0x5a
+        )
+    }
+
     func testPhysicalMemorySnapshotAndRestoreUseIndependentStorage() throws {
         let memory = PhysicalMemory(base: 0x4000_0000, size: 16 * 1024)
 
@@ -208,6 +317,71 @@ final class ARM64VizCoreTests: XCTestCase {
         ).isEmpty)
     }
 
+    func testPhysicalMemoryDeviceWritesDoNotPolluteGuestDirtyPages() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 8_192)
+        let baseline = memory.advanceDirtyEpoch()
+        let destination = memory.base + 128
+        let bytes: [UInt8] = [0x10, 0x20, 0x30, 0x40]
+
+        try bytes.withUnsafeBytes {
+            try memory.copyDeviceBytes(
+                from: $0.baseAddress!,
+                count: $0.count,
+                to: destination
+            )
+        }
+        let through = memory.advanceDirtyEpoch()
+
+        XCTAssertEqual(try memory.readBytes(at: destination, count: 4), bytes)
+        XCTAssertTrue(memory.dirtyRanges(
+            at: memory.base,
+            count: memory.size,
+            afterEpoch: baseline,
+            throughEpoch: through
+        ).isEmpty)
+    }
+
+    func testOwnedDeviceDMADoesNotPermanentlyRegisterFramebufferPages() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 8_192)
+        let address = memory.base + 256
+        let source: [UInt8] = Array(0..<64)
+        try memory.load(source, at: address)
+        memory.beginConcurrentExecution()
+
+        XCTAssertFalse(memory.isDeviceSharedRangeRegistered(
+            at: address,
+            count: source.count
+        ))
+        var snapshot = [UInt8](repeating: 0, count: source.count)
+        try snapshot.withUnsafeMutableBytes {
+            try memory.copyOwnedDeviceBytes(
+                from: address,
+                count: source.count,
+                to: $0.baseAddress!
+            )
+        }
+        XCTAssertEqual(snapshot, source)
+        XCTAssertFalse(memory.isDeviceSharedRangeRegistered(
+            at: address,
+            count: source.count
+        ))
+
+        let replacement = source.reversed()
+        let replacementBytes = Array(replacement)
+        try replacementBytes.withUnsafeBytes {
+            try memory.copyOwnedDeviceBytes(
+                from: $0.baseAddress!,
+                count: $0.count,
+                to: address
+            )
+        }
+        XCTAssertFalse(memory.isDeviceSharedRangeRegistered(
+            at: address,
+            count: source.count
+        ))
+        XCTAssertEqual(try memory.readBytes(at: address, count: source.count), replacementBytes)
+    }
+
     func testNativeCPUStoreMarksGuestMemoryDirtyPage() throws {
         let backend = SoftwareARM64Backend()
         backend.fallbackInterpreterPolicy = .nativeOnly
@@ -246,6 +420,71 @@ final class ARM64VizCoreTests: XCTestCase {
 
         try bus.register(first)
         XCTAssertThrowsError(try bus.register(second))
+    }
+
+    func testMMIOBusReleasesRegistryLockAndKeepsVCPUContextThreadLocal() throws {
+        let bus = MMIOBus()
+        let slowEntered = DispatchSemaphore(value: 0)
+        let fastFinished = DispatchSemaphore(value: 0)
+        let releaseSlow = DispatchSemaphore(value: 0)
+        let completion = DispatchGroup()
+        let resultLock = NSLock()
+        var observedVCPUs: [Int] = []
+        var errors: [Error] = []
+
+        let slow = CallbackMMIODevice(name: "slow", base: 0x1000) { _, _ in
+            slowEntered.signal()
+            XCTAssertEqual(fastFinished.wait(timeout: .now() + 1), .success)
+            resultLock.lock()
+            observedVCPUs.append(bus.currentVCPUID)
+            resultLock.unlock()
+            _ = releaseSlow.wait(timeout: .now() + 1)
+            return 1
+        }
+        let fast = CallbackMMIODevice(name: "fast", base: 0x3000) { _, _ in
+            resultLock.lock()
+            observedVCPUs.append(bus.currentVCPUID)
+            resultLock.unlock()
+            fastFinished.signal()
+            fastFinished.signal()
+            return 2
+        }
+        try bus.register(slow)
+        try bus.register(fast)
+
+        completion.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { completion.leave() }
+            do {
+                _ = try bus.read(address: 0x1000, width: .word, targetVCPU: 1)
+            } catch {
+                resultLock.lock()
+                errors.append(error)
+                resultLock.unlock()
+            }
+        }
+        XCTAssertEqual(slowEntered.wait(timeout: .now() + 1), .success)
+
+        completion.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { completion.leave() }
+            do {
+                _ = try bus.read(address: 0x3000, width: .word, targetVCPU: 2)
+            } catch {
+                resultLock.lock()
+                errors.append(error)
+                resultLock.unlock()
+                fastFinished.signal()
+                fastFinished.signal()
+            }
+        }
+
+        XCTAssertEqual(fastFinished.wait(timeout: .now() + 1), .success)
+        releaseSlow.signal()
+        XCTAssertEqual(completion.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(errors.isEmpty)
+        XCTAssertEqual(observedVCPUs.sorted(), [1, 2])
+        XCTAssertEqual(bus.currentVCPUID, 0)
     }
 
     func testToyGuestWritesToUART() throws {
@@ -492,6 +731,7 @@ final class ARM64VizCoreTests: XCTestCase {
 
     func testSoftwareBackendUsesFastRAMForUnsignedImmediateLoadStores() throws {
         let backend = SoftwareARM64Backend()
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let entry = ARM64VizMachineLayout.toyEntryPoint
         let dataAddress = entry + 0x100
@@ -524,6 +764,7 @@ final class ARM64VizCoreTests: XCTestCase {
 
     func testSoftwareBackendServicesNativeMMIOWithoutUnsupportedExit() throws {
         let backend = SoftwareARM64Backend()
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let entry = ARM64VizMachineLayout.toyEntryPoint
         let program = littleEndianWords([
@@ -639,6 +880,7 @@ final class ARM64VizCoreTests: XCTestCase {
 
     func testSoftwareBackendUsesNativeCoreForPostConsoleIntegerHotspots() throws {
         let backend = SoftwareARM64Backend()
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let entry = ARM64VizMachineLayout.toyEntryPoint
         let program = littleEndianWords([
@@ -678,6 +920,7 @@ final class ARM64VizCoreTests: XCTestCase {
 
     func testSoftwareBackendCollapsesNativeStorePairFillLoop() throws {
         let backend = SoftwareARM64Backend()
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let entry = ARM64VizMachineLayout.toyEntryPoint
         let target = entry + 0x1000
@@ -714,11 +957,12 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try machine.vm.memory.read8(at: target - 1), 0)
         XCTAssertEqual(try machine.vm.memory.read8(at: target + 128), 0)
         XCTAssertGreaterThanOrEqual(backend.nativeBasicBlockSteps, 12)
-        XCTAssertGreaterThanOrEqual(backend.nativeFastRAMWriteHits, 16)
+        XCTAssertGreaterThanOrEqual(backend.nativeFillHits, 1)
     }
 
     func testSoftwareBackendUsesNativeCoreForSignedAndRegisterOffsetLoadStores() throws {
         let backend = SoftwareARM64Backend()
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let entry = ARM64VizMachineLayout.toyEntryPoint
         let dataAddress = entry + 0x100
@@ -754,6 +998,7 @@ final class ARM64VizCoreTests: XCTestCase {
 
     func testSoftwareBackendUsesNativeCoreForPairLoadStores() throws {
         let backend = SoftwareARM64Backend()
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let entry = ARM64VizMachineLayout.toyEntryPoint
         let dataAddress = entry + 0x200
@@ -783,8 +1028,10 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try machine.vm.memory.read64(at: dataAddress), 0x1122_3344_5566_7788)
         XCTAssertEqual(try machine.vm.memory.read64(at: dataAddress + 8), 0x8877_6655_4433_2211)
         XCTAssertGreaterThanOrEqual(backend.nativeBasicBlockExecutions, 1)
-        XCTAssertGreaterThanOrEqual(backend.nativeFastRAMWriteHits, 2)
-        XCTAssertGreaterThanOrEqual(backend.nativeFastRAMReadHits, 2)
+        // The C memory backend locks and accounts each pair transfer as one
+        // transaction even though both architectural registers are moved.
+        XCTAssertGreaterThanOrEqual(backend.nativeFastRAMWriteHits, 1)
+        XCTAssertGreaterThanOrEqual(backend.nativeFastRAMReadHits, 1)
     }
 
     func testSoftwareBackendUsesNativeCoreForLogicalShiftedRegister() throws {
@@ -1388,6 +1635,17 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(backend.nativeBasicBlockExecutions, 1)
         XCTAssertGreaterThanOrEqual(backend.nativeBasicBlockSteps, 3)
         XCTAssertGreaterThanOrEqual(backend.performanceSnapshot().nativeBasicBlockSteps, 3)
+        let totals = backend.executionTotals()
+        XCTAssertGreaterThanOrEqual(totals.nativeSteps, 3)
+        XCTAssertEqual(totals.fallbackSteps, 0)
+        let countersOnlySnapshot = backend.performanceSnapshot(
+            unsupportedLimit: 0,
+            fallbackLimit: 0,
+            ineligibleLimit: 0
+        )
+        XCTAssertTrue(countersOnlySnapshot.unsupportedInstructions.isEmpty)
+        XCTAssertTrue(countersOnlySnapshot.decodedFallbackGadgets.isEmpty)
+        XCTAssertTrue(countersOnlySnapshot.nativeIneligibleGadgets.isEmpty)
     }
 
     func testStopOnUARTOutputRecordsMMIOTrace() throws {
@@ -1432,7 +1690,7 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertNil(interrupts.peekPending())
     }
 
-    func testInterruptControllerDoesNotRequeueActiveLine() {
+    func testInterruptControllerPreservesReassertedActiveLineUntilEOI() {
         let interrupts = SimpleInterruptController()
         interrupts.setEnabled(line: 27, enabled: true)
         interrupts.raise(line: 27)
@@ -1442,12 +1700,29 @@ final class ARM64VizCoreTests: XCTestCase {
 
         interrupts.raise(line: 27)
 
+        // The line remains active on this CPU, so it is not deliverable yet.
         XCTAssertNil(interrupts.peekPending())
 
         interrupts.complete(line: 27)
-        interrupts.raise(line: 27)
 
         XCTAssertEqual(interrupts.peekPending(), 27)
+        XCTAssertEqual(interrupts.acknowledge(), 27)
+        interrupts.complete(line: 27)
+        XCTAssertNil(interrupts.peekPending())
+    }
+
+    func testInterruptControllerPreservesTargetedReassertionUntilEOI() {
+        let interrupts = SimpleInterruptController()
+        interrupts.setEnabled(line: 27, enabled: true, targetVCPU: 1)
+        interrupts.raise(line: 27, targetVCPU: 1)
+
+        XCTAssertEqual(interrupts.acknowledge(targetVCPU: 1), 27)
+        interrupts.raise(line: 27, targetVCPU: 1)
+        XCTAssertNil(interrupts.peekPending(targetVCPU: 1))
+
+        interrupts.complete(line: 27, targetVCPU: 1)
+
+        XCTAssertEqual(interrupts.peekPending(targetVCPU: 1), 27)
     }
 
     func testInterruptControllerDiagnosticsTrackLifecycleCounts() {
@@ -1886,6 +2161,140 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try machine.vm.memory.read32(at: usedRing + 8), 408)
     }
 
+    func testVirtIOGPUDeferredCompletionPublishesUsedRingAfterFence() throws {
+        let machine = try MachineFactory.makeResearchMachine()
+        let accelerator = DeferredVirtQueueGraphicsAccelerator()
+        let base = ARM64VizMachineLayout.virtioDisplayBase
+        let descriptorTable: GuestAddress = 0x4018_8000
+        let availableRing: GuestAddress = 0x4018_9000
+        let usedRing: GuestAddress = 0x4018_a000
+        let requestAddress: GuestAddress = 0x4018_b000
+        let responseAddress: GuestAddress = 0x4018_c000
+        let backingAddress: GuestAddress = 0x4018_d000
+        var availableIndex: UInt16 = 0
+
+        try configureVirtioQueue(
+            machine: machine,
+            base: base,
+            descriptorTable: descriptorTable,
+            availableRing: availableRing,
+            usedRing: usedRing
+        )
+
+        var createPayload: [UInt8] = []
+        [UInt32(1), 1, 2, 2].forEach { appendLE32($0, to: &createPayload) }
+        XCTAssertEqual(try submitGPUCommandType(
+            0x0101,
+            payload: createPayload,
+            machine: machine,
+            base: base,
+            descriptorTable: descriptorTable,
+            availableRing: availableRing,
+            usedRing: usedRing,
+            requestAddress: requestAddress,
+            responseAddress: responseAddress,
+            availableIndex: &availableIndex
+        ), 0x1100)
+
+        try machine.vm.memory.writeBytes([UInt8](repeating: 0, count: 16), at: backingAddress)
+        var attachPayload: [UInt8] = []
+        appendLE32(1, to: &attachPayload)
+        appendLE32(1, to: &attachPayload)
+        appendLE64(backingAddress, to: &attachPayload)
+        appendLE32(16, to: &attachPayload)
+        appendLE32(0, to: &attachPayload)
+        XCTAssertEqual(try submitGPUCommandType(
+            0x0106,
+            payload: attachPayload,
+            machine: machine,
+            base: base,
+            descriptorTable: descriptorTable,
+            availableRing: availableRing,
+            usedRing: usedRing,
+            requestAddress: requestAddress,
+            responseAddress: responseAddress,
+            availableIndex: &availableIndex
+        ), 0x1100)
+
+        try machine.vm.writePhysical(base + 0x064, width: .word, value: 1)
+        machine.virtioDisplay.attachGraphicsAccelerator(accelerator)
+        let request = makeParavirtualGPUFillCommand(resourceID: 1, width: 2, height: 2)
+        let deferredCommandCount = 3
+        for commandIndex in 0..<deferredCommandCount {
+            let commandRequestAddress = requestAddress + UInt64(commandIndex * 0x100)
+            let commandResponseAddress = responseAddress + UInt64(commandIndex * 0x100)
+            let descriptorIndex = UInt16(commandIndex * 2)
+            try writeMemoryBytesForTest(
+                request,
+                at: commandRequestAddress,
+                into: machine.vm.memory
+            )
+            try machine.vm.memory.writeBytes(
+                [UInt8](repeating: 0, count: 24),
+                at: commandResponseAddress
+            )
+            try writeVirtioDescriptor(
+                machine: machine,
+                at: descriptorTable,
+                index: descriptorIndex,
+                address: commandRequestAddress,
+                length: UInt32(request.count),
+                flags: 1,
+                next: descriptorIndex + 1
+            )
+            try writeVirtioDescriptor(
+                machine: machine,
+                at: descriptorTable,
+                index: descriptorIndex + 1,
+                address: commandResponseAddress,
+                length: 24,
+                flags: 2,
+                next: 0
+            )
+            let ringSlot = UInt64(4 + (UInt32(availableIndex) % 8) * 2)
+            try machine.vm.memory.write16(
+                descriptorIndex,
+                at: availableRing + ringSlot
+            )
+            availableIndex &+= 1
+        }
+        try machine.vm.memory.write16(availableIndex, at: availableRing + 2)
+        try machine.vm.writePhysical(base + 0x050, width: .word, value: 0)
+
+        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 2)
+        XCTAssertEqual(accelerator.pendingCount, deferredCommandCount)
+        XCTAssertEqual(try machine.vm.readPhysical(base + 0x060, width: .word), 0)
+        XCTAssertEqual(
+            try machine.vm.memory.readBytes(at: backingAddress, count: 16),
+            [UInt8](repeating: 0, count: 16)
+        )
+
+        for commandIndex in 0..<deferredCommandCount {
+            accelerator.completeNext(success: true)
+            XCTAssertEqual(
+                try machine.vm.memory.read16(at: usedRing + 2),
+                UInt16(3 + commandIndex)
+            )
+            let commandResponseAddress = responseAddress + UInt64(commandIndex * 0x100)
+            XCTAssertEqual(
+                readLE32ForTest(
+                    try machine.vm.memory.readBytes(
+                        at: commandResponseAddress,
+                        count: 24
+                    ),
+                    at: 0
+                ),
+                0x1100
+            )
+        }
+        XCTAssertEqual(accelerator.pendingCount, 0)
+        XCTAssertEqual(try machine.vm.readPhysical(base + 0x060, width: .word), 1)
+        XCTAssertEqual(
+            try machine.vm.memory.readBytes(at: backingAddress, count: 16),
+            [UInt8](repeating: 0x7a, count: 16)
+        )
+    }
+
     func testVirtIOGPUStagesTransfersAndPublishesOnlyOnFlush() throws {
         let machine = try MachineFactory.makeResearchMachine()
         let frameCommitted = expectation(description: "virtio-gpu frame commit callback")
@@ -2059,6 +2468,15 @@ final class ARM64VizCoreTests: XCTestCase {
         }
         XCTAssertEqual(repeatedBaseAddress, directBaseAddress)
 
+        let heldFrameLease = try XCTUnwrap(
+            machine.virtioDisplay.displayFrameLease(
+                afterGeneration: firstFrame.generation
+            )
+        )
+        let heldPixelBeforeFlush = heldFrameLease.withUnsafeBytes {
+            Array($0[4..<8])
+        }
+
         let untransferredPixels = [UInt8](repeating: 0xee, count: 16)
         try writeMemoryBytesForTest(untransferredPixels, at: backingAddress, into: machine.vm.memory)
         let backingFrame = try XCTUnwrap(
@@ -2087,6 +2505,11 @@ final class ARM64VizCoreTests: XCTestCase {
         let secondFrame = try XCTUnwrap(machine.virtioDisplay.displaySnapshot(afterGeneration: partialFrame.generation))
         XCTAssertGreaterThan(secondFrame.generation, firstFrame.generation)
         XCTAssertEqual(Array(secondFrame.pixels[0..<8]), [0xdd, 0xdd, 0xdd, 0xff, 0xdd, 0xdd, 0xdd, 0xff])
+        XCTAssertEqual(heldPixelBeforeFlush, [0xd1, 0xd2, 0xd3, 0xff])
+        XCTAssertEqual(
+            heldFrameLease.withUnsafeBytes { Array($0[4..<8]) },
+            heldPixelBeforeFlush
+        )
 
         var secondCreatePayload: [UInt8] = []
         appendLE32(2, to: &secondCreatePayload)
@@ -2330,6 +2753,9 @@ final class ARM64VizCoreTests: XCTestCase {
     func testVirtIOMMIOBlockDeviceSupportsDiscoveryQueueSetupAndInterruptAck() throws {
         let machine = try MachineFactory.makeResearchMachine(blockStorageSize: 4096)
         let base = ARM64VizMachineLayout.virtioBlockBase
+        let descriptorTable: GuestAddress = 0x4010_0000
+        let availableRing: GuestAddress = 0x4010_1000
+        let usedRing: GuestAddress = 0x4010_2000
         let line = try XCTUnwrap(machine.virtioBlock.interruptLine)
         machine.vm.interruptController.setEnabled(line: line, enabled: true)
 
@@ -2341,10 +2767,10 @@ final class ARM64VizCoreTests: XCTestCase {
 
         try machine.vm.writePhysical(base + 0x030, width: .word, value: 0)
         try machine.vm.writePhysical(base + 0x038, width: .word, value: 8)
-        try machine.vm.writePhysical(base + 0x080, width: .word, value: 0x1234_5000)
+        try machine.vm.writePhysical(base + 0x080, width: .word, value: descriptorTable)
         try machine.vm.writePhysical(base + 0x084, width: .word, value: 0)
-        try machine.vm.writePhysical(base + 0x090, width: .word, value: 0x1234_6000)
-        try machine.vm.writePhysical(base + 0x0a0, width: .word, value: 0x1234_7000)
+        try machine.vm.writePhysical(base + 0x090, width: .word, value: availableRing)
+        try machine.vm.writePhysical(base + 0x0a0, width: .word, value: usedRing)
         try machine.vm.writePhysical(base + 0x044, width: .word, value: 1)
         try machine.vm.writePhysical(base + 0x070, width: .word, value: 0xf)
         try machine.vm.writePhysical(base + 0x050, width: .word, value: 0)
@@ -2358,6 +2784,35 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try machine.vm.readPhysical(base + 0x060, width: .word), 0)
         XCTAssertNil(machine.vm.interruptController.peekPending())
         XCTAssertEqual(try machine.vm.readPhysical(base + 0x070, width: .word), 0xf)
+    }
+
+    func testVirtIOQueueReadyRegistersAllSharedRingPages() throws {
+        let machine = try MachineFactory.makeResearchMachine(blockStorageSize: 4096)
+        let base = ARM64VizMachineLayout.virtioBlockBase
+        let descriptorTable: GuestAddress = 0x4010_0000
+        let availableRing: GuestAddress = 0x4010_1000
+        let usedRing: GuestAddress = 0x4010_2000
+
+        machine.vm.memory.beginConcurrentExecution()
+        XCTAssertFalse(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: descriptorTable, count: 8 * 16))
+
+        try configureVirtioQueue(
+            machine: machine,
+            base: base,
+            descriptorTable: descriptorTable,
+            availableRing: availableRing,
+            usedRing: usedRing
+        )
+
+        XCTAssertTrue(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: descriptorTable, count: 8 * 16))
+        XCTAssertTrue(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: availableRing, count: 6 + 8 * 2))
+        XCTAssertTrue(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: usedRing, count: 6 + 8 * 8))
+        XCTAssertFalse(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: usedRing + 0x1_000, count: 2))
     }
 
     func testFileBackedVirtIOBlockStoragePersistsBoundedWritesAndZeroes() throws {
@@ -2410,6 +2865,146 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try reopened.read(at: 96 * 1024, count: 32), Array(repeating: 0x5a, count: 32))
     }
 
+    func testMappedBlockStorageRejectsInvalidRangesAndSkipsEmptyVectorSegments() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let imageURL = directory.appendingPathComponent("mapped-block.img")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(repeating: 0, count: 16 * 1024).write(to: imageURL)
+
+        let storage = try FileBackedVirtIOBlockStorage(url: imageURL)
+        XCTAssertThrowsError(try storage.read(at: -1, count: 1))
+        XCTAssertThrowsError(try storage.read(at: storage.count, count: 1))
+        XCTAssertThrowsError(try storage.write([1, 2], at: storage.count - 1))
+        XCTAssertThrowsError(try storage.zero(at: storage.count + 1, count: 0))
+
+        let first = Array(repeating: UInt8(0x31), count: 127)
+        let second = Array(repeating: UInt8(0x72), count: 193)
+        let empty: [UInt8] = []
+        try first.withUnsafeBytes { firstBuffer in
+            try empty.withUnsafeBytes { emptyBuffer in
+                try second.withUnsafeBytes { secondBuffer in
+                    try storage.write(
+                        from: [firstBuffer, emptyBuffer, secondBuffer],
+                        at: 4093
+                    )
+                }
+            }
+        }
+
+        var firstRead = Array(repeating: UInt8(0), count: first.count)
+        var secondRead = Array(repeating: UInt8(0), count: second.count)
+        var emptyRead: [UInt8] = []
+        try firstRead.withUnsafeMutableBytes { firstBuffer in
+            try emptyRead.withUnsafeMutableBytes { emptyBuffer in
+                try secondRead.withUnsafeMutableBytes { secondBuffer in
+                    try storage.read(
+                        into: [firstBuffer, emptyBuffer, secondBuffer],
+                        at: 4093
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(firstRead, first)
+        XCTAssertEqual(secondRead, second)
+    }
+
+    func testMappedBlockStorageHandlesLargeScatterGatherVectors() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let imageURL = directory.appendingPathComponent("large-vector-block.img")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(repeating: 0, count: 16 * 1024).write(to: imageURL)
+
+        let segmentCount = 65
+        let segmentSize = 17
+        let byteCount = segmentCount * segmentSize
+        let offset = 701
+        let source = (0..<byteCount).map { UInt8(truncatingIfNeeded: $0 * 37) }
+        let storage = try FileBackedVirtIOBlockStorage(url: imageURL)
+
+        try source.withUnsafeBytes { bytes in
+            let segments = (0..<segmentCount).map { index in
+                UnsafeRawBufferPointer(
+                    start: bytes.baseAddress!.advanced(by: index * segmentSize),
+                    count: segmentSize
+                )
+            }
+            try storage.write(from: segments, at: offset)
+        }
+
+        var destination = Array(repeating: UInt8(0), count: byteCount)
+        try destination.withUnsafeMutableBytes { bytes in
+            let segments = (0..<segmentCount).map { index in
+                UnsafeMutableRawBufferPointer(
+                    start: bytes.baseAddress!.advanced(by: index * segmentSize),
+                    count: segmentSize
+                )
+            }
+            try storage.read(into: segments, at: offset)
+        }
+        XCTAssertEqual(destination, source)
+    }
+
+    func testMappedBlockStorageSerializesConcurrentRequestsAndFlushesDurably() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let imageURL = directory.appendingPathComponent("concurrent-block.img")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sectorCount = 32
+        let sectorSize = 4096
+        try Data(repeating: 0, count: sectorCount * sectorSize).write(to: imageURL)
+
+        do {
+            let storage = try FileBackedVirtIOBlockStorage(url: imageURL)
+            let failureLock = NSLock()
+            var failures: [Error] = []
+            DispatchQueue.concurrentPerform(iterations: sectorCount) { sector in
+                do {
+                    let byte = UInt8(truncatingIfNeeded: sector &+ 1)
+                    let payload = Array(repeating: byte, count: sectorSize)
+                    try storage.write(payload, at: sector * sectorSize)
+                    let actual = try storage.read(
+                        at: sector * sectorSize,
+                        count: sectorSize
+                    )
+                    if actual != payload {
+                        throw VMError.deviceError(
+                            "mapped block storage returned stale sector \(sector)"
+                        )
+                    }
+                } catch {
+                    failureLock.lock()
+                    failures.append(error)
+                    failureLock.unlock()
+                }
+            }
+            XCTAssertTrue(failures.isEmpty, "concurrent mapped I/O failed: \(failures)")
+            try storage.flush()
+        }
+
+        let reopened = try FileBackedVirtIOBlockStorage(url: imageURL)
+        for sector in 0..<sectorCount {
+            let expected = UInt8(truncatingIfNeeded: sector &+ 1)
+            XCTAssertEqual(
+                try reopened.read(at: sector * sectorSize, count: sectorSize),
+                Array(repeating: expected, count: sectorSize)
+            )
+        }
+    }
+
     func testMMIOAccessCountersTrackBeyondTraceCapacity() throws {
         let machine = try MachineFactory.makeResearchMachine(blockStorageSize: 4096)
         let base = ARM64VizMachineLayout.virtioBlockBase
@@ -2450,8 +3045,33 @@ final class ARM64VizCoreTests: XCTestCase {
         try writeVirtioDescriptor(machine: machine, at: descriptorTable, index: 2, address: status, length: 1, flags: 2, next: 0)
         try machine.vm.memory.write16(1, at: availableRing + 2)
         try machine.vm.memory.write16(0, at: availableRing + 4)
+        machine.vm.memory.beginConcurrentExecution()
         try machine.vm.writePhysical(base + 0x050, width: .word, value: 0)
 
+        XCTAssertTrue(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: descriptorTable,
+            count: 16
+        ))
+        XCTAssertTrue(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: availableRing,
+            count: 8
+        ))
+        XCTAssertTrue(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: usedRing,
+            count: 12
+        ))
+        XCTAssertFalse(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: header,
+            count: 16
+        ))
+        XCTAssertFalse(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: data,
+            count: 512
+        ))
+        XCTAssertFalse(machine.vm.memory.isDeviceSharedRangeRegistered(
+            at: status,
+            count: 1
+        ))
         XCTAssertEqual(try machine.vm.memory.read8(at: status), 0)
         XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 1)
         XCTAssertEqual(try machine.vm.memory.read32(at: usedRing + 4), 0)
@@ -2499,7 +3119,9 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try machine.vm.memory.read32(at: usedRing + 8), 1)
         XCTAssertEqual(machine.virtioBlock.completedBlockRequests, 1)
         XCTAssertEqual(machine.virtioBlock.completedBlockRequestTypes[4], 1)
+#if DEBUG
         XCTAssertTrue(machine.virtioBlock.recentBlockRequestSummaries.last?.contains("flush") == true)
+#endif
     }
 
     func testVirtIOMMIOBlockDeviceSupportsDiscardAndWriteZeroesRequests() throws {
@@ -2545,7 +3167,9 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.virtioBlock.completedBlockRequests, 2)
         XCTAssertEqual(machine.virtioBlock.completedBlockRequestTypes[13], 1)
         XCTAssertEqual(machine.virtioBlock.completedBlockRequestTypes[11], 1)
+#if DEBUG
         XCTAssertTrue(machine.virtioBlock.recentBlockRequestSummaries.last?.contains("discard") == true)
+#endif
     }
 
     func testVirtIONetworkTransmitQueuePublishesEthernetFrames() throws {
@@ -2735,8 +3359,13 @@ final class ARM64VizCoreTests: XCTestCase {
             XCTAssertEqual(try machine.vm.memory.read32(at: address + 4), event.2)
         }
 
-        machine.virtioInput.enqueueTouch(x: 400, y: 300, isDown: true)
-        machine.virtioInput.enqueueTouch(x: 350, y: 200, isDown: true)
+        machine.virtioInput.enqueueTouches([
+            TouchEvent(x: 400, y: 300, isDown: true),
+            TouchEvent(x: 350, y: 200, isDown: true)
+        ])
+        XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 3)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 1)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 2)
         for index in UInt16(0)..<6 {
             try machine.vm.memory.write16(
                 index,
@@ -2745,6 +3374,9 @@ final class ARM64VizCoreTests: XCTestCase {
         }
         try machine.vm.memory.write16(14, at: availableRing + 2)
         machine.virtioInput.enqueueTouch(x: 320, y: 80, isDown: true)
+        XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 4)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 2)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 2)
         XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 14)
         let moveExpected: [(UInt16, UInt16, UInt32)] = [
             (3, 0, 320),
@@ -2804,6 +3436,10 @@ final class ARM64VizCoreTests: XCTestCase {
         machine.virtioInput.enqueueTouch(x: 240, y: 700, isDown: true)
         XCTAssertEqual(machine.virtioInput.inputSamplesReceived, 1)
         XCTAssertEqual(machine.virtioInput.inputFramesGenerated, 1)
+        XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 1)
+        XCTAssertEqual(machine.virtioInput.deliveredInputFrameCount, 0)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 0)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 1)
         XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 8)
         XCTAssertEqual(machine.virtioInput.inputEventsDelivered, 0)
         XCTAssertGreaterThan(machine.virtioInput.inputQueueStarvations, 0)
@@ -2826,6 +3462,10 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 0)
         XCTAssertEqual(machine.virtioInput.inputEventsDelivered, 8)
         XCTAssertEqual(machine.virtioInput.inputFramesDelivered, 1)
+        XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 1)
+        XCTAssertEqual(machine.virtioInput.deliveredInputFrameCount, 1)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 1)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 1)
         XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 8)
     }
 
@@ -4788,6 +5428,105 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.vm.instructionTrace[1].decode, "stlr-64")
     }
 
+    func testNativeExclusiveSpinlockIsCorrectUnderParallelContention() throws {
+        var decodedLDAXR = AVZNativeInstruction()
+        var decodedSTLXR = AVZNativeInstruction()
+        XCTAssertNotEqual(avz_native_decode_instruction(0x885f_fc03, &decodedLDAXR), 0)
+        XCTAssertNotEqual(avz_native_decode_instruction(0x8804_fc03, &decodedSTLXR), 0)
+        XCTAssertEqual(decodedLDAXR.kind, UInt16(AVZ_NATIVE_OP_LOAD_STORE_EXCLUSIVE))
+        XCTAssertEqual(decodedSTLXR.kind, UInt16(AVZ_NATIVE_OP_LOAD_STORE_EXCLUSIVE))
+        XCTAssertEqual(decodedLDAXR.flags & 2, 2)
+        XCTAssertEqual(decodedSTLXR.flags & 2, 2)
+
+        let memoryBase: GuestAddress = 0x4000_0000
+        let table0 = memoryBase + 0x1_000
+        let table1 = memoryBase + 0x2_000
+        let table2 = memoryBase + 0x3_000
+        let table3 = memoryBase + 0x4_000
+        let codePhysical = memoryBase + 0x10_000
+        let dataPhysical = memoryBase + 0x11_000
+        let entry: GuestAddress = 0x1_000
+        let lockAddress: GuestAddress = 0x2_000
+        let counterAddress: GuestAddress = 0x2_008
+        let iterations: UInt64 = 10_000
+        let memory = PhysicalMemory(base: memoryBase, size: 0x20_000)
+        let program = littleEndianWords([
+            0x885f_fc03, // ldaxr w3, [x0]
+            0x35ff_ffe3, // cbnz w3, .-4
+            0x5280_0023, // mov w3, #1
+            0x8804_7c03, // stxr w4, w3, [x0]
+            0x35ff_ff84, // cbnz w4, .-16
+            0xf940_0025, // ldr x5, [x1]
+            0x9100_04a5, // add x5, x5, #1
+            0xf900_0025, // str x5, [x1]
+            0x089f_fc1f, // stlrb wzr, [x0]
+            0xf100_0442, // subs x2, x2, #1
+            0x54ff_fec1, // b.ne .-40
+            0xd440_0000  // hlt #0
+        ])
+        try memory.write64(table1 | 0x3, at: table0)
+        try memory.write64(table2 | 0x3, at: table1)
+        try memory.write64(table3 | 0x3, at: table2)
+        try memory.write64(codePhysical | 0x403, at: table3 + 8)
+        try memory.write64(dataPhysical | 0x403, at: table3 + 16)
+        try memory.load(program, at: codePhysical)
+        try memory.write32(0, at: dataPhysical)
+        try memory.write64(0, at: dataPhysical + 8)
+
+        func makeVM() -> (VirtualMachine, SoftwareARM64Backend) {
+            let backend = SoftwareARM64Backend()
+            backend.enableBasicBlockExecution = true
+            backend.fallbackInterpreterPolicy = .nativeOnly
+            let vm = VirtualMachine(memory: memory, backend: backend)
+            vm.reset(entryPoint: entry)
+            vm.cpu.x[0] = lockAddress
+            vm.cpu.x[1] = counterAddress
+            vm.cpu.x[2] = iterations
+            vm.writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0)
+            vm.writeSystemRegister(ARM64SystemRegister.tcrEL1, value: 16)
+            vm.writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1)
+            vm.systemRegisterTraceCapacity = 0
+            vm.systemRegisterReadTraceCapacity = 0
+            vm.disableInstructionTrace()
+            vm.enableMMIOTrace(capacity: 0)
+            vm.enableGuestMemoryTrace(capacity: 0)
+            vm.timerCyclesPerInstruction = 0
+            return (vm, backend)
+        }
+
+        let (firstVM, firstBackend) = makeVM()
+        let (secondVM, secondBackend) = makeVM()
+        let group = DispatchGroup()
+        let resultLock = NSLock()
+        var results: [Result<RunResult, Error>] = []
+        for vm in [firstVM, secondVM] {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = Result { try vm.run(maxSteps: 2_000_000) }
+                resultLock.lock()
+                results.append(result)
+                resultLock.unlock()
+                group.leave()
+            }
+        }
+
+        XCTAssertEqual(group.wait(timeout: .now() + 20), .success)
+        XCTAssertEqual(results.count, 2)
+        for result in results {
+            XCTAssertEqual(try result.get().stopReason, .halted)
+        }
+        let exclusiveStatistics = memory.nativeExclusiveStatistics
+        XCTAssertEqual(exclusiveStatistics.write_successes, iterations * 2)
+        XCTAssertGreaterThan(exclusiveStatistics.write_conflicts, 0)
+        XCTAssertGreaterThan(exclusiveStatistics.nonzero_reads, 0)
+        XCTAssertEqual(try memory.read32(at: dataPhysical), 0)
+        XCTAssertEqual(try memory.read64(at: dataPhysical + 8), iterations * 2)
+        XCTAssertEqual(firstBackend.swiftFallbackSingleInstructionSteps, 0)
+        XCTAssertEqual(secondBackend.swiftFallbackSingleInstructionSteps, 0)
+        XCTAssertEqual(firstBackend.unsupportedInstructionCounts, [0xd440_0000: 1])
+        XCTAssertEqual(secondBackend.unsupportedInstructionCounts, [0xd440_0000: 1])
+    }
+
     func testUnprivilegedSignedImmediateLoadUsesSignedOffset() throws {
         let machine = try MachineFactory.makeResearchMachine()
         let entry = ARM64VizMachineLayout.toyEntryPoint
@@ -5981,6 +6720,47 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(result.lastException?.vectorAddress, vectorSync)
     }
 
+    func testSynchronousExceptionClearsNativeExclusiveReservation() throws {
+        let machine = try MachineFactory.makeResearchMachine()
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        let dataAddress = entry + 0x1000
+        let vectorBase = entry + 0x2000
+        let vectorSync = vectorBase + 0x200
+        let program = littleEndianWords([
+            0xc85f_7c20, // ldxr x0, [x1]
+            encodeSVC(immediate: 0),
+            0xd440_0000
+        ])
+        let vector = littleEndianWords([
+            0xc802_7c23, // stxr w2, x3, [x1]
+            0xd440_0000
+        ])
+
+        try machine.vm.loadBinary(program, at: entry)
+        try machine.vm.loadBinary(vector, at: vectorSync)
+        try machine.vm.memory.write64(0x1111_2222_3333_4444, at: dataAddress)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.cpu.pstate = ARM64PState.el1hMasked
+        machine.vm.cpu.x[1] = dataAddress
+        machine.vm.cpu.x[3] = 0xaaaa_bbbb_cccc_dddd
+        try writeSystemRegister(
+            ARM64SystemRegister.vbarEL1,
+            value: vectorBase,
+            into: machine.vm
+        )
+
+        let result = try machine.vm.run(maxSteps: 8)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(machine.vm.cpu.x[2], 1)
+        XCTAssertEqual(
+            try machine.vm.memory.read64(at: dataAddress),
+            0x1111_2222_3333_4444
+        )
+        XCTAssertNil(machine.vm.cpu.exclusiveReservationAddress)
+        XCTAssertNil(machine.vm.cpu.exclusiveReservationSize)
+    }
+
     func testStopOnEL0EntryRecordsExceptionLevelTransition() throws {
         let machine = try MachineFactory.makeResearchMachine()
         let entry = ARM64VizMachineLayout.toyEntryPoint
@@ -6294,7 +7074,7 @@ final class ARM64VizCoreTests: XCTestCase {
         let program = littleEndianWords([
             0xf940_0020, // ldr x0, [x1]
             0xf900_0043, // str x3, [x2]
-            0xd50b_7e21, // dc civac, x1; modeled as a translation-cache boundary
+            0xd508_831f, // tlbi vmalle1is
             0xf940_0024, // ldr x4, [x1]
             0xd440_0000
         ])
@@ -6380,6 +7160,7 @@ final class ARM64VizCoreTests: XCTestCase {
     func testNativeMemorySessionRetainsTLBAcrossRunsAndHonorsHostInvalidation() throws {
         let backend = SoftwareARM64Backend()
         backend.fallbackInterpreterPolicy = .nativeOnly
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let table0 = ARM64VizMachineLayout.ramBase + 0x1000
         let table1 = ARM64VizMachineLayout.ramBase + 0x2000
@@ -6443,6 +7224,7 @@ final class ARM64VizCoreTests: XCTestCase {
     func testNativeFastTLBIsInvalidatedWhenIRQEntersEL1() throws {
         let backend = SoftwareARM64Backend()
         backend.fallbackInterpreterPolicy = .nativeOnly
+        backend.setNativeDetailedMemoryStatisticsEnabled(true)
         let machine = try MachineFactory.makeResearchMachine(backend: backend)
         let table0 = ARM64VizMachineLayout.ramBase + 0x1000
         let table1 = ARM64VizMachineLayout.ramBase + 0x2000
@@ -7218,6 +8000,28 @@ final class ARM64VizCoreTests: XCTestCase {
         return bytes
     }
 
+    private func makeParavirtualGPUFillCommand(
+        resourceID: UInt32,
+        width: UInt32,
+        height: UInt32
+    ) -> [UInt8] {
+        var payload: [UInt8] = []
+        appendLE32(PineconeGraphicsProtocol.magic, to: &payload)
+        appendLE16(PineconeGraphicsProtocol.version, to: &payload)
+        appendLE16(3, to: &payload)
+        [
+            UInt32(0), 0, resourceID,
+            0, 0, 0, 0,
+            width, height, 0xff00_0000,
+            0, 0, 0, 0
+        ].forEach { appendLE32($0, to: &payload) }
+        var requestPayload: [UInt8] = []
+        appendLE32(UInt32(payload.count), to: &requestPayload)
+        appendLE32(0, to: &requestPayload)
+        requestPayload.append(contentsOf: payload)
+        return makeVirtioGPUCommand(type: 0x0207, payload: requestPayload)
+    }
+
     private func appendGPUKitRectangle(x: UInt32, y: UInt32, width: UInt32, height: UInt32, to bytes: inout [UInt8]) {
         appendLE32(x, to: &bytes)
         appendLE32(y, to: &bytes)
@@ -7230,6 +8034,11 @@ final class ARM64VizCoreTests: XCTestCase {
         bytes.append(UInt8(truncatingIfNeeded: value >> 8))
         bytes.append(UInt8(truncatingIfNeeded: value >> 16))
         bytes.append(UInt8(truncatingIfNeeded: value >> 24))
+    }
+
+    private func appendLE16(_ value: UInt16, to bytes: inout [UInt8]) {
+        bytes.append(UInt8(truncatingIfNeeded: value))
+        bytes.append(UInt8(truncatingIfNeeded: value >> 8))
     }
 
     private func appendLE64(_ value: UInt64, to bytes: inout [UInt8]) {
@@ -7658,5 +8467,63 @@ final class ARM64VizCoreTests: XCTestCase {
 
     private func writeSystemRegister(_ key: ARM64SystemRegisterKey, value: UInt64, into vm: VirtualMachine) throws {
         vm.writeSystemRegister(key, value: value)
+    }
+}
+
+private final class DeferredVirtQueueGraphicsAccelerator: PineconeGraphicsAccelerator,
+    @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [(
+        workItems: [PineconeGraphicsWorkItem],
+        completion: @Sendable (Bool) -> Void
+    )] = []
+
+    var pendingCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending.count
+    }
+
+    func execute(
+        _ command: PineconeGraphicsCommand,
+        source: PineconeGraphicsSurface?,
+        mask: PineconeGraphicsSurface?,
+        destination: PineconeGraphicsSurface
+    ) -> Bool {
+        false
+    }
+
+    func executeBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool {
+        false
+    }
+
+    func executeBatchAsync(
+        _ workItems: [PineconeGraphicsWorkItem],
+        completion: @escaping @Sendable (Bool) -> Void
+    ) -> Bool {
+        lock.lock()
+        pending.append((workItems, completion))
+        lock.unlock()
+        return true
+    }
+
+    func complete(success: Bool) {
+        completeNext(success: success)
+    }
+
+    func completeNext(success: Bool) {
+        lock.lock()
+        let item = pending.isEmpty ? nil : pending.removeFirst()
+        lock.unlock()
+        guard let item else { return }
+        if success {
+            for workItem in item.workItems {
+                workItem.destination.bytes.initializeMemory(
+                    as: UInt8.self,
+                    repeating: 0x7a
+                )
+            }
+        }
+        item.completion(success)
     }
 }

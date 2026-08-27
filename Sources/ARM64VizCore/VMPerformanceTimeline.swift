@@ -6,6 +6,8 @@ public enum VMPerformanceMilestone: String, Codable, CaseIterable, Sendable {
     case interactiveWorkloadStarted
     case interactiveWorkloadReady
     case firstVisibleFrame
+    case applicationLaunchRequested
+    case applicationFirstVisibleFrame
 }
 
 public struct VMFramePipelineSnapshot: Codable, Equatable, Sendable {
@@ -21,8 +23,31 @@ public struct VMFramePipelineSnapshot: Codable, Equatable, Sendable {
     public let uploadedBytes: UInt64
 }
 
+public struct VMExecutionMilestoneSnapshot: Codable, Equatable, Sendable {
+    public let primaryNativeSteps: Int
+    public let primaryFallbackSteps: Int
+    public let secondarySteps: UInt64
+    public let secondaryNativeSteps: UInt64
+    public let secondaryFallbackSteps: UInt64
+
+    public init(
+        primaryNativeSteps: Int,
+        primaryFallbackSteps: Int,
+        secondarySteps: UInt64,
+        secondaryNativeSteps: UInt64 = 0,
+        secondaryFallbackSteps: UInt64 = 0
+    ) {
+        self.primaryNativeSteps = primaryNativeSteps
+        self.primaryFallbackSteps = primaryFallbackSteps
+        self.secondarySteps = secondarySteps
+        self.secondaryNativeSteps = secondaryNativeSteps
+        self.secondaryFallbackSteps = secondaryFallbackSteps
+    }
+}
+
 public struct VMPerformanceTimelineSnapshot: Codable, Equatable, Sendable {
     public let elapsedMilliseconds: [String: Double]
+    public let executionAtMilestones: [String: VMExecutionMilestoneSnapshot]
     public let touchLatencyP50Milliseconds: Double?
     public let touchLatencyP95Milliseconds: Double?
     public let touchSampleCount: Int
@@ -30,12 +55,14 @@ public struct VMPerformanceTimelineSnapshot: Codable, Equatable, Sendable {
 
     public init(
         elapsedMilliseconds: [String: Double],
+        executionAtMilestones: [String: VMExecutionMilestoneSnapshot] = [:],
         touchLatencyP50Milliseconds: Double?,
         touchLatencyP95Milliseconds: Double?,
         touchSampleCount: Int,
         framePipeline: VMFramePipelineSnapshot
     ) {
         self.elapsedMilliseconds = elapsedMilliseconds
+        self.executionAtMilestones = executionAtMilestones
         self.touchLatencyP50Milliseconds = touchLatencyP50Milliseconds
         self.touchLatencyP95Milliseconds = touchLatencyP95Milliseconds
         self.touchSampleCount = touchSampleCount
@@ -45,10 +72,15 @@ public struct VMPerformanceTimelineSnapshot: Codable, Equatable, Sendable {
 
 public final class VMPerformanceTimeline: @unchecked Sendable {
     private static let maximumTouchSamples = 256
+    private static let maximumActivePresentationGapNanoseconds: UInt64 =
+        1_000_000_000
     private let lock = NSLock()
     private let clock: @Sendable () -> UInt64
     private let startNanoseconds: UInt64
     private var milestones: [VMPerformanceMilestone: UInt64] = [:]
+    private var executionAtMilestones: [
+        VMPerformanceMilestone: VMExecutionMilestoneSnapshot
+    ] = [:]
     private var touchLatencyNanoseconds: [UInt64] = []
     private var publishedFrames: [UInt64: (commit: UInt64, publish: UInt64)] = [:]
     private var commitToPublishNanoseconds: [UInt64] = []
@@ -71,11 +103,17 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
     }
 
     @discardableResult
-    public func mark(_ milestone: VMPerformanceMilestone) -> Bool {
+    public func mark(
+        _ milestone: VMPerformanceMilestone,
+        execution: VMExecutionMilestoneSnapshot? = nil
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard milestones[milestone] == nil else { return false }
         milestones[milestone] = clock()
+        if let execution {
+            executionAtMilestones[milestone] = execution
+        }
         return true
     }
 
@@ -132,7 +170,9 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
         }
         publishedFrames = publishedFrames.filter { $0.key > generation }
         if let previous = lastPresentationNanoseconds,
-           presentedAtNanoseconds > previous {
+           presentedAtNanoseconds > previous,
+           presentedAtNanoseconds - previous <=
+            Self.maximumActivePresentationGapNanoseconds {
             Self.append(
                 presentedAtNanoseconds - previous,
                 to: &presentationIntervalsNanoseconds
@@ -146,6 +186,7 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
     public func snapshot() -> VMPerformanceTimelineSnapshot {
         lock.lock()
         let milestoneCopy = milestones
+        let executionCopy = executionAtMilestones
         let touchCopy = touchLatencyNanoseconds
         let framePipeline = VMFramePipelineSnapshot(
             frameSampleCount: commitToPresentNanoseconds.count,
@@ -166,6 +207,9 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
         }
         return VMPerformanceTimelineSnapshot(
             elapsedMilliseconds: elapsed,
+            executionAtMilestones: executionCopy.reduce(into: [:]) {
+                $0[$1.key.rawValue] = $1.value
+            },
             touchLatencyP50Milliseconds: Self.percentile(touchCopy, fraction: 0.50),
             touchLatencyP95Milliseconds: Self.percentile(touchCopy, fraction: 0.95),
             touchSampleCount: touchCopy.count,

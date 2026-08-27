@@ -41,7 +41,10 @@ final class InMemoryVirtIOBlockStorage: VirtIOBlockStorage {
     }
 
     func read(into buffers: [UnsafeMutableRawBufferPointer], at offset: Int) throws {
-        let byteCount = try totalByteCount(buffers.map(\.count), offset: offset)
+        let byteCount = try totalByteCount(
+            buffers.lazy.map(\.count),
+            offset: offset
+        )
         try validateRange(offset: offset, count: byteCount)
         var sourceOffset = offset
         for buffer in buffers where !buffer.isEmpty {
@@ -57,7 +60,10 @@ final class InMemoryVirtIOBlockStorage: VirtIOBlockStorage {
     }
 
     func write(from buffers: [UnsafeRawBufferPointer], at offset: Int) throws {
-        let byteCount = try totalByteCount(buffers.map(\.count), offset: offset)
+        let byteCount = try totalByteCount(
+            buffers.lazy.map(\.count),
+            offset: offset
+        )
         try validateRange(offset: offset, count: byteCount)
         var destinationOffset = offset
         for buffer in buffers where !buffer.isEmpty {
@@ -96,7 +102,10 @@ final class InMemoryVirtIOBlockStorage: VirtIOBlockStorage {
     }
 
 
-    private func totalByteCount(_ counts: [Int], offset: Int) throws -> Int {
+    private func totalByteCount<Counts: Sequence>(
+        _ counts: Counts,
+        offset: Int
+    ) throws -> Int where Counts.Element == Int {
         try counts.reduce(0) { total, count in
             guard count >= 0, total <= Int.max - count else {
                 throw VMError.deviceError("block storage vector length overflow at offset \(offset)")
@@ -109,34 +118,37 @@ final class InMemoryVirtIOBlockStorage: VirtIOBlockStorage {
 public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked Sendable {
     public let count: Int
 
-    private static let zeroChunk = Array(repeating: UInt8(0), count: 64 * 1024)
-
-    private let fileDescriptor: Int32
-    private let lock = NSLock()
+    private let nativeStorage: OpaquePointer
 
     public init(url: URL) throws {
-        let descriptor = open(url.path, O_RDWR)
-        guard descriptor >= 0 else {
-            throw Self.posixError(operation: "open", path: url.path)
+        var errorCode: Int32 = 0
+        guard let storage = url.path.withCString({ path in
+            avz_file_block_storage_open(path, &errorCode)
+        }) else {
+            let code = errorCode == 0 ? EIO : errorCode
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(code),
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "open mapped block storage \(url.path) failed: " +
+                        String(cString: strerror(code))
+                ]
+            )
         }
-
-        var status = stat()
-        guard fstat(descriptor, &status) == 0 else {
-            let error = Self.posixError(operation: "fstat", path: url.path)
-            close(descriptor)
-            throw error
+        let byteCount = avz_file_block_storage_size(storage)
+        guard byteCount > 0, byteCount <= UInt64(Int.max) else {
+            avz_file_block_storage_close(storage)
+            throw VMError.deviceError(
+                "block storage file has an invalid size: \(url.path)"
+            )
         }
-        guard status.st_size > 0, UInt64(status.st_size) <= UInt64(Int.max) else {
-            close(descriptor)
-            throw VMError.deviceError("block storage file has an invalid size: \(url.path)")
-        }
-
-        fileDescriptor = descriptor
-        count = Int(status.st_size)
+        nativeStorage = storage
+        count = Int(byteCount)
     }
 
     deinit {
-        close(fileDescriptor)
+        avz_file_block_storage_close(nativeStorage)
     }
 
     public func read(at offset: Int, count requestedCount: Int) throws -> [UInt8] {
@@ -145,17 +157,26 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
             return []
         }
 
-        return try lock.withLock {
-            var result = Array(repeating: UInt8(0), count: requestedCount)
-            try result.withUnsafeMutableBytes { buffer in
-                try readFully(
-                    into: buffer.baseAddress!,
-                    count: requestedCount,
-                    offset: offset
+        var result = Array(repeating: UInt8(0), count: requestedCount)
+        try result.withUnsafeMutableBytes { buffer in
+            var segment = AVZBlockIOSegment(
+                base: buffer.baseAddress,
+                length: buffer.count
+            )
+            let ioResult = avz_file_block_storage_readv(
+                nativeStorage,
+                &segment,
+                1,
+                UInt64(offset)
+            )
+            guard ioResult == Int64(requestedCount) else {
+                throw Self.nativeIOError(
+                    operation: "mapped block read",
+                    result: ioResult
                 )
             }
-            return result
         }
+        return result
     }
 
     public func write(_ bytes: [UInt8], at offset: Int) throws {
@@ -164,58 +185,88 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
             return
         }
 
-        try lock.withLock {
-            try bytes.withUnsafeBytes { buffer in
-                try writeFully(
-                    from: buffer.baseAddress!,
-                    count: bytes.count,
-                    offset: offset
+        try bytes.withUnsafeBytes { buffer in
+            var segment = AVZBlockIOSegment(
+                base: UnsafeMutableRawPointer(mutating: buffer.baseAddress),
+                length: buffer.count
+            )
+            let ioResult = avz_file_block_storage_writev(
+                nativeStorage,
+                &segment,
+                1,
+                UInt64(offset)
+            )
+            guard ioResult == Int64(bytes.count) else {
+                throw Self.nativeIOError(
+                    operation: "mapped block write",
+                    result: ioResult
                 )
             }
         }
     }
 
     public func read(into buffers: [UnsafeMutableRawBufferPointer], at offset: Int) throws {
-        let byteCount = try validatedVectorByteCount(buffers.map(\.count), offset: offset)
+        let byteCount = try validatedVectorByteCount(
+            buffers.lazy.map(\.count),
+            offset: offset
+        )
         guard byteCount > 0 else { return }
-        try lock.withLock {
-            let segments = buffers.map {
-                AVZBlockIOSegment(base: $0.baseAddress, length: $0.count)
-            }
-            let result = segments.withUnsafeBufferPointer { segmentBuffer in
-                avz_block_io_preadv(
-                    fileDescriptor,
-                    segmentBuffer.baseAddress,
-                    segmentBuffer.count,
-                    UInt64(offset)
+        try withUnsafeTemporaryAllocation(
+            of: AVZBlockIOSegment.self,
+            capacity: buffers.count
+        ) { segments in
+            var segmentCount = 0
+            for buffer in buffers where !buffer.isEmpty {
+                segments[segmentCount] = AVZBlockIOSegment(
+                    base: buffer.baseAddress,
+                    length: buffer.count
                 )
+                segmentCount += 1
             }
-            guard result == Int64(byteCount) else {
-                throw Self.nativeIOError(operation: "preadv", result: result)
+            let ioResult = avz_file_block_storage_readv(
+                nativeStorage,
+                segments.baseAddress,
+                segmentCount,
+                UInt64(offset)
+            )
+            guard ioResult == Int64(byteCount) else {
+                throw Self.nativeIOError(
+                    operation: "mapped block readv",
+                    result: ioResult
+                )
             }
         }
     }
 
     public func write(from buffers: [UnsafeRawBufferPointer], at offset: Int) throws {
-        let byteCount = try validatedVectorByteCount(buffers.map(\.count), offset: offset)
+        let byteCount = try validatedVectorByteCount(
+            buffers.lazy.map(\.count),
+            offset: offset
+        )
         guard byteCount > 0 else { return }
-        try lock.withLock {
-            let segments = buffers.map {
-                AVZBlockIOSegment(
-                    base: UnsafeMutableRawPointer(mutating: $0.baseAddress),
-                    length: $0.count
+        try withUnsafeTemporaryAllocation(
+            of: AVZBlockIOSegment.self,
+            capacity: buffers.count
+        ) { segments in
+            var segmentCount = 0
+            for buffer in buffers where !buffer.isEmpty {
+                segments[segmentCount] = AVZBlockIOSegment(
+                    base: UnsafeMutableRawPointer(mutating: buffer.baseAddress),
+                    length: buffer.count
                 )
+                segmentCount += 1
             }
-            let result = segments.withUnsafeBufferPointer { segmentBuffer in
-                avz_block_io_pwritev(
-                    fileDescriptor,
-                    segmentBuffer.baseAddress,
-                    segmentBuffer.count,
-                    UInt64(offset)
+            let ioResult = avz_file_block_storage_writev(
+                nativeStorage,
+                segments.baseAddress,
+                segmentCount,
+                UInt64(offset)
+            )
+            guard ioResult == Int64(byteCount) else {
+                throw Self.nativeIOError(
+                    operation: "mapped block writev",
+                    result: ioResult
                 )
-            }
-            guard result == Int64(byteCount) else {
-                throw Self.nativeIOError(operation: "pwritev", result: result)
             }
         }
     }
@@ -226,27 +277,26 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
             return
         }
 
-        try lock.withLock {
-            var written = 0
-            try Self.zeroChunk.withUnsafeBytes { buffer in
-                while written < requestedCount {
-                    let chunkCount = min(buffer.count, requestedCount - written)
-                    try writeFully(
-                        from: buffer.baseAddress!,
-                        count: chunkCount,
-                        offset: offset + written
-                    )
-                    written += chunkCount
-                }
-            }
+        let result = avz_file_block_storage_zero(
+            nativeStorage,
+            UInt64(offset),
+            UInt64(requestedCount)
+        )
+        guard result == 0 else {
+            throw Self.nativeIOError(
+                operation: "mapped block zero",
+                result: Int64(result)
+            )
         }
     }
 
     public func flush() throws {
-        try lock.withLock {
-            guard fsync(fileDescriptor) == 0 else {
-                throw Self.posixError(operation: "fsync")
-            }
+        let result = avz_file_block_storage_flush(nativeStorage)
+        guard result == 0 else {
+            throw Self.nativeIOError(
+                operation: "mapped block flush",
+                result: Int64(result)
+            )
         }
     }
 
@@ -254,26 +304,10 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
         try read(at: 0, count: count)
     }
 
-    private func readFully(into destination: UnsafeMutableRawPointer, count: Int, offset: Int) throws {
-        var completed = 0
-        while completed < count {
-            let result = pread(
-                fileDescriptor,
-                destination.advanced(by: completed),
-                count - completed,
-                off_t(offset + completed)
-            )
-            if result < 0, errno == EINTR {
-                continue
-            }
-            guard result > 0 else {
-                throw Self.posixError(operation: result == 0 ? "pread reached EOF" : "pread")
-            }
-            completed += result
-        }
-    }
-
-    private func validatedVectorByteCount(_ counts: [Int], offset: Int) throws -> Int {
+    private func validatedVectorByteCount<Counts: Sequence>(
+        _ counts: Counts,
+        offset: Int
+    ) throws -> Int where Counts.Element == Int {
         let byteCount = try counts.reduce(0) { total, count in
             guard count >= 0, total <= Int.max - count else {
                 throw VMError.deviceError("block storage vector length overflow at offset \(offset)")
@@ -293,25 +327,6 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
         )
     }
 
-    private func writeFully(from source: UnsafeRawPointer, count: Int, offset: Int) throws {
-        var completed = 0
-        while completed < count {
-            let result = pwrite(
-                fileDescriptor,
-                source.advanced(by: completed),
-                count - completed,
-                off_t(offset + completed)
-            )
-            if result < 0, errno == EINTR {
-                continue
-            }
-            guard result > 0 else {
-                throw Self.posixError(operation: "pwrite")
-            }
-            completed += result
-        }
-    }
-
     private func validateRange(offset: Int, count requestedCount: Int) throws {
         guard offset >= 0,
               requestedCount >= 0,
@@ -321,20 +336,5 @@ public final class FileBackedVirtIOBlockStorage: VirtIOBlockStorage, @unchecked 
                 "block storage range offset=\(offset) count=\(requestedCount) exceeds \(count) bytes"
             )
         }
-    }
-
-    private static func posixError(operation: String, path: String? = nil) -> VMError {
-        let errorNumber = errno
-        let reason = String(cString: strerror(errorNumber))
-        let target = path.map { " \($0)" } ?? ""
-        return .deviceError("\(operation)\(target) failed: \(reason) (errno \(errorNumber))")
-    }
-}
-
-private extension NSLock {
-    func withLock<T>(_ body: () throws -> T) rethrows -> T {
-        lock()
-        defer { unlock() }
-        return try body()
     }
 }
