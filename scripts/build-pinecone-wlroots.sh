@@ -55,17 +55,17 @@ limactl shell "${INSTANCE}" sudo -u "${GUEST_USER}" -g abuild sh -lc \
   "cd '${GUEST_BUILD_DIR}' && abuild -r"
 
 GUEST_PACKAGE="$(limactl shell "${INSTANCE}" sh -lc \
-  "find ~/packages -path '*/aarch64/wlroots0.20-0.20.2-r3.apk' -print -quit")"
+  "find ~/packages -path '*/aarch64/wlroots0.20-0.20.2-r4.apk' -print -quit")"
 [[ -n "${GUEST_PACKAGE}" ]] || {
   echo "wlroots runtime package was not produced" >&2
   exit 1
 }
 limactl copy "${INSTANCE}:${GUEST_PACKAGE}" "${OUTPUT_DIR}/"
 
-PACKAGE="${OUTPUT_DIR}/wlroots0.20-0.20.2-r3.apk"
+PACKAGE="${OUTPUT_DIR}/wlroots0.20-0.20.2-r4.apk"
 INFO="$(bsdtar -xOf "${PACKAGE}" .PKGINFO)"
 grep -qx 'pkgname = wlroots0.20' <<<"${INFO}"
-grep -qx 'pkgver = 0.20.2-r3' <<<"${INFO}"
+grep -qx 'pkgver = 0.20.2-r4' <<<"${INFO}"
 grep -qx 'arch = aarch64' <<<"${INFO}"
 bsdtar -tf "${PACKAGE}" | grep -q '^usr/lib/libwlroots-0.20.so$'
 

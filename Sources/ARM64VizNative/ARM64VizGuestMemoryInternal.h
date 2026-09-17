@@ -17,6 +17,8 @@ enum {
         AVZ_FAST_INSTRUCTION_TLB_SET_COUNT * AVZ_FAST_TLB_WAY_COUNT,
     AVZ_FAST_DATA_HOT_COUNT = 1024,
     AVZ_FAST_INSTRUCTION_HOT_COUNT = 16,
+    AVZ_TLBI_JOURNAL_COUNT = 64,
+    AVZ_TLBI_VA_SLOT_COUNT = 4096,
     AVZ_GUEST_MEMORY_LOCK_STRIPE_COUNT = 4096,
     AVZ_FAST_DIRTY_HOT_COUNT = 4096,
     AVZ_EXCLUSIVE_GRANULE_SHIFT = 4,
@@ -36,6 +38,11 @@ typedef struct {
     uint16_t contiguous_span;
     uint64_t context_tag;
     uint64_t generation;
+    uint64_t tlbi_epoch;
+    uint16_t asid;
+    uint8_t global;
+    /* Zero means unknown (callback mapping); otherwise includes block/contiguous extent. */
+    uint8_t leaf_shift;
     uint8_t valid;
 } AVZNativeFastTLBEntry;
 
@@ -63,6 +70,8 @@ struct AVZGuestMemory {
     _Atomic uint64_t current_write_generation;
     _Atomic uint64_t code_mutation_epoch;
     _Atomic uint64_t translation_epoch;
+    atomic_flag translation_lock;
+    AVZNativeTLBI translation_journal[AVZ_TLBI_JOURNAL_COUNT];
     _Atomic uint64_t exclusive_reads;
     _Atomic uint64_t exclusive_nonzero_reads;
     _Atomic uint64_t exclusive_write_successes;
@@ -106,13 +115,22 @@ struct AVZNativeMemoryFastPath {
     uint8_t instruction_hot_replacement;
     AVZNativeThreadRegisterState thread_registers;
     AVZNativeArchitecturalState architectural_state;
+    AVZNativeCounterClock counter_clock;
+    uint64_t counter_refresh_instructions;
     AVZNativeStage1TranslationState translation_state;
     uint64_t low_translation_context_tag;
     uint64_t high_translation_context_tag;
     uint64_t low_translation_context_hash;
     uint64_t high_translation_context_hash;
     uint64_t translation_generation;
+    uint64_t hot_translation_generation;
+    uint64_t tlbi_epoch;
+    uint64_t asid_tlbi_epochs[65536];
+    uint64_t va_asid_tlbi_epochs[AVZ_TLBI_VA_SLOT_COUNT];
+    uint64_t va_all_tlbi_epochs[AVZ_TLBI_VA_SLOT_COUNT];
+    uint64_t va_global_tlbi_epochs[AVZ_TLBI_VA_SLOT_COUNT];
     uint64_t observed_shared_translation_epoch;
+    uint16_t translation_asid;
     uint8_t native_translation_enabled;
     uint8_t translation_fault_pending;
     uint8_t detailed_statistics_enabled;
@@ -126,6 +144,18 @@ struct AVZNativeMemoryFastPath {
     AVZNativeMemoryFastPathStatistics statistics;
     AVZGuestMemory *guest_memory;
 };
+
+int avz_native_fast_revalidate_tlb_entry(
+    AVZNativeMemoryFastPath *fast_path, AVZNativeFastTLBEntry *entry
+);
+
+static inline int avz_native_fast_tlb_entry_is_current(
+    AVZNativeMemoryFastPath *fast_path, AVZNativeFastTLBEntry *entry
+) {
+    if (!entry->global && entry->asid != fast_path->translation_asid) return 0;
+    return entry->tlbi_epoch == fast_path->tlbi_epoch ||
+        avz_native_fast_revalidate_tlb_entry(fast_path, entry);
+}
 
 /*
  * Complete an ordinary RAM load in the CPU translation unit when its direct
@@ -169,9 +199,9 @@ static inline int avz_native_fast_memory_try_read_hot(
     const size_t hot_index = (size_t)(
         (virtual_page ^ (context_tag >> AVZ_FAST_PAGE_SHIFT)) &
         (AVZ_FAST_DATA_HOT_COUNT - 1u));
-    const AVZNativeFastTLBEntry *entry = &fast_path->read_hot[hot_index];
+    AVZNativeFastTLBEntry *entry = &fast_path->read_hot[hot_index];
     if (!entry->valid ||
-        entry->generation != fast_path->translation_generation ||
+        entry->generation != fast_path->hot_translation_generation ||
         entry->contiguous_span < page_offset + width ||
         entry->virtual_page != virtual_page ||
         entry->context_tag != context_tag || entry->host_page == NULL ||
@@ -321,9 +351,9 @@ static inline int avz_native_fast_memory_try_write_hot(
     const size_t hot_index = (size_t)(
         (virtual_page ^ (context_tag >> AVZ_FAST_PAGE_SHIFT)) &
         (AVZ_FAST_DATA_HOT_COUNT - 1u));
-    const AVZNativeFastTLBEntry *entry = &fast_path->write_hot[hot_index];
+    AVZNativeFastTLBEntry *entry = &fast_path->write_hot[hot_index];
     if (!entry->valid ||
-        entry->generation != fast_path->translation_generation ||
+        entry->generation != fast_path->hot_translation_generation ||
         entry->contiguous_span < page_offset + width ||
         entry->virtual_page != virtual_page ||
         entry->context_tag != context_tag || entry->host_page == NULL ||

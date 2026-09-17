@@ -382,6 +382,58 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try memory.readBytes(at: address, count: source.count), replacementBytes)
     }
 
+    func testOwnedDeviceRectangleDMAGathersAndScattersFragmentedRows() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 8_192)
+        let first = memory.base + 128
+        let second = memory.base + 512
+        let ranges = [
+            (address: first, count: 8),
+            (address: second, count: 8),
+        ]
+        try memory.load(Array(0..<8), at: first)
+        try memory.load(Array(8..<16), at: second)
+
+        var gathered = [UInt8](repeating: 0xee, count: 16)
+        try gathered.withUnsafeMutableBytes { bytes in
+            try memory.copyOwnedDeviceRectangle(
+                from: ranges,
+                logicalOffset: 2,
+                rowByteCount: 4,
+                rowStride: 8,
+                rowCount: 2,
+                to: bytes.baseAddress!,
+                destinationByteCount: bytes.count
+            )
+        }
+        XCTAssertEqual(
+            gathered,
+            [0xee, 0xee, 2, 3, 4, 5, 0xee, 0xee,
+             0xee, 0xee, 10, 11, 12, 13, 0xee, 0xee]
+        )
+
+        gathered[2...5] = [22, 23, 24, 25]
+        gathered[10...13] = [30, 31, 32, 33]
+        try gathered.withUnsafeBytes { bytes in
+            try memory.copyOwnedDeviceRectangle(
+                from: bytes.baseAddress!,
+                sourceByteCount: bytes.count,
+                logicalOffset: 2,
+                rowByteCount: 4,
+                rowStride: 8,
+                rowCount: 2,
+                to: ranges
+            )
+        }
+        XCTAssertEqual(
+            try memory.readBytes(at: first, count: 8),
+            [0, 1, 22, 23, 24, 25, 6, 7]
+        )
+        XCTAssertEqual(
+            try memory.readBytes(at: second, count: 8),
+            [8, 9, 30, 31, 32, 33, 14, 15]
+        )
+    }
+
     func testNativeCPUStoreMarksGuestMemoryDirtyPage() throws {
         let backend = SoftwareARM64Backend()
         backend.fallbackInterpreterPolicy = .nativeOnly
@@ -2162,6 +2214,14 @@ final class ARM64VizCoreTests: XCTestCase {
     }
 
     func testVirtIOGPUDeferredCompletionPublishesUsedRingAfterFence() throws {
+        try checkGPUDeferredCompletion(independentResources: false)
+    }
+
+    func testVirtIOGPUIndependentResourcesRemainConcurrent() throws {
+        try checkGPUDeferredCompletion(independentResources: true)
+    }
+
+    private func checkGPUDeferredCompletion(independentResources: Bool) throws {
         let machine = try MachineFactory.makeResearchMachine()
         let accelerator = DeferredVirtQueueGraphicsAccelerator()
         let base = ARM64VizMachineLayout.virtioDisplayBase
@@ -2181,8 +2241,10 @@ final class ARM64VizCoreTests: XCTestCase {
             usedRing: usedRing
         )
 
+        let resourceCount = independentResources ? 3 : 1
+        for resourceID in 1...resourceCount {
         var createPayload: [UInt8] = []
-        [UInt32(1), 1, 2, 2].forEach { appendLE32($0, to: &createPayload) }
+        [UInt32(resourceID), 1, 2, 2].forEach { appendLE32($0, to: &createPayload) }
         XCTAssertEqual(try submitGPUCommandType(
             0x0101,
             payload: createPayload,
@@ -2198,9 +2260,9 @@ final class ARM64VizCoreTests: XCTestCase {
 
         try machine.vm.memory.writeBytes([UInt8](repeating: 0, count: 16), at: backingAddress)
         var attachPayload: [UInt8] = []
+        appendLE32(UInt32(resourceID), to: &attachPayload)
         appendLE32(1, to: &attachPayload)
-        appendLE32(1, to: &attachPayload)
-        appendLE64(backingAddress, to: &attachPayload)
+        appendLE64(backingAddress + UInt64((resourceID - 1) * 0x100), to: &attachPayload)
         appendLE32(16, to: &attachPayload)
         appendLE32(0, to: &attachPayload)
         XCTAssertEqual(try submitGPUCommandType(
@@ -2216,11 +2278,15 @@ final class ARM64VizCoreTests: XCTestCase {
             availableIndex: &availableIndex
         ), 0x1100)
 
+        }
+
         try machine.vm.writePhysical(base + 0x064, width: .word, value: 1)
         machine.virtioDisplay.attachGraphicsAccelerator(accelerator)
-        let request = makeParavirtualGPUFillCommand(resourceID: 1, width: 2, height: 2)
         let deferredCommandCount = 3
         for commandIndex in 0..<deferredCommandCount {
+            let request = makeParavirtualGPUFillCommand(
+                resourceID: independentResources ? UInt32(commandIndex + 1) : 1,
+                width: 2, height: 2)
             let commandRequestAddress = requestAddress + UInt64(commandIndex * 0x100)
             let commandResponseAddress = responseAddress + UInt64(commandIndex * 0x100)
             let descriptorIndex = UInt16(commandIndex * 2)
@@ -2261,8 +2327,9 @@ final class ARM64VizCoreTests: XCTestCase {
         try machine.vm.memory.write16(availableIndex, at: availableRing + 2)
         try machine.vm.writePhysical(base + 0x050, width: .word, value: 0)
 
-        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 2)
-        XCTAssertEqual(accelerator.pendingCount, deferredCommandCount)
+        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), UInt16(resourceCount * 2))
+        // Overlapping writes reserve this resource until its fence completes.
+        XCTAssertEqual(accelerator.pendingCount, independentResources ? deferredCommandCount : 1)
         XCTAssertEqual(try machine.vm.readPhysical(base + 0x060, width: .word), 0)
         XCTAssertEqual(
             try machine.vm.memory.readBytes(at: backingAddress, count: 16),
@@ -2273,7 +2340,7 @@ final class ARM64VizCoreTests: XCTestCase {
             accelerator.completeNext(success: true)
             XCTAssertEqual(
                 try machine.vm.memory.read16(at: usedRing + 2),
-                UInt16(3 + commandIndex)
+                UInt16(resourceCount * 2 + 1 + commandIndex)
             )
             let commandResponseAddress = responseAddress + UInt64(commandIndex * 0x100)
             XCTAssertEqual(
@@ -3440,6 +3507,7 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.virtioInput.deliveredInputFrameCount, 0)
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 0)
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 1)
+        XCTAssertNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 1))
         XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 8)
         XCTAssertEqual(machine.virtioInput.inputEventsDelivered, 0)
         XCTAssertGreaterThan(machine.virtioInput.inputQueueStarvations, 0)
@@ -3467,6 +3535,10 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 1)
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 1)
         XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 8)
+        XCTAssertNotNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 1))
+        XCTAssertNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 2))
+        machine.virtioInput.reset()
+        XCTAssertNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 1))
     }
 
     func testVirtIOKeyboardPublishesKeysAndRepeatCapabilities() throws {
@@ -3645,6 +3717,9 @@ final class ARM64VizCoreTests: XCTestCase {
     }
 
     func testLinkLocalNetworkBackendAnswersDNSAQueries() throws {
+        let factory = FakeOutboundNetworkFactory()
+        factory.resolvedIPv4ByHost["dl-cdn.alpinelinux.org"] = [203, 0, 113, 10]
+        let backend = LinkLocalVirtIONetworkBackend(outboundNetworkFactory: factory)
         let queryName = ["dl-cdn", "alpinelinux", "org"]
         var dnsQuery: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
         for label in queryName {
@@ -3660,7 +3735,8 @@ final class ARM64VizCoreTests: XCTestCase {
             payload: dnsQuery
         )
 
-        let response = try XCTUnwrap(LinkLocalVirtIONetworkBackend.response(to: frame))
+        backend.transmit(frame: frame)
+        let response = try XCTUnwrap(waitForReceiveFrame(from: backend))
         let ipStart = 14
         let udpStart = ipStart + 20
         let dnsStart = udpStart + 8
@@ -3671,10 +3747,13 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(readBE16(response, at: udpStart + 2), 49152)
         XCTAssertEqual(readBE16(response, at: dnsStart), 0x1234)
         XCTAssertEqual(readBE16(response, at: dnsStart + 6), 1)
-        XCTAssertEqual(Array(response.suffix(4)), LinkLocalVirtIONetworkBackend.hostIPv4)
+        XCTAssertEqual(Array(response.suffix(4)), [203, 0, 113, 10])
     }
 
     func testLinkLocalNetworkBackendPreservesMultiQuestionDNSResponses() throws {
+        let factory = FakeOutboundNetworkFactory()
+        factory.resolvedIPv4ByHost["dl-cdn.alpinelinux.org"] = [203, 0, 113, 10]
+        let backend = LinkLocalVirtIONetworkBackend(outboundNetworkFactory: factory)
         let queryName = ["dl-cdn", "alpinelinux", "org"]
         var dnsQuery: [UInt8] = [0x22, 0x33, 0x01, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0]
         for queryType: UInt16 in [1, 28] {
@@ -3694,13 +3773,14 @@ final class ARM64VizCoreTests: XCTestCase {
             payload: dnsQuery
         )
 
-        let response = try XCTUnwrap(LinkLocalVirtIONetworkBackend.response(to: frame))
+        backend.transmit(frame: frame)
+        let response = try XCTUnwrap(waitForReceiveFrame(from: backend))
         let dnsStart = 14 + 20 + 8
 
         XCTAssertEqual(readBE16(response, at: dnsStart), 0x2233)
         XCTAssertEqual(readBE16(response, at: dnsStart + 4), 2)
         XCTAssertEqual(readBE16(response, at: dnsStart + 6), 1)
-        XCTAssertEqual(Array(response.suffix(4)), LinkLocalVirtIONetworkBackend.hostIPv4)
+        XCTAssertEqual(Array(response.suffix(4)), [203, 0, 113, 10])
     }
 
     func testLinkLocalNetworkBackendAnswersDNSAAAAQueriesWithNoData() throws {
@@ -3881,7 +3961,7 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(clientSequence, clientInitialSequence + 1 + UInt32(request.count))
     }
 
-    func testLinkLocalNetworkBackendResolvesAlpineProxyHostToLocalGateway() throws {
+    func testLinkLocalNetworkBackendResolvesPublicAlpineHostWithoutHijackingHTTPS() throws {
         let factory = FakeOutboundNetworkFactory()
         factory.resolvedIPv4ByHost["dl-cdn.alpinelinux.org"] = [203, 0, 113, 10]
         let backend = LinkLocalVirtIONetworkBackend(outboundNetworkFactory: factory)
@@ -3901,7 +3981,32 @@ final class ARM64VizCoreTests: XCTestCase {
         ))
 
         let response = try XCTUnwrap(waitForReceiveFrame(from: backend))
-        XCTAssertEqual(Array(response.suffix(4)), LinkLocalVirtIONetworkBackend.hostIPv4)
+        XCTAssertEqual(Array(response.suffix(4)), [203, 0, 113, 10])
+    }
+
+    func testLinkLocalNetworkBackendDNSFailureDoesNotInventGatewayAnswer() throws {
+        for address: [UInt8]? in [nil, [203, 0, 113]] {
+            let factory = FakeOutboundNetworkFactory()
+            factory.resolvedIPv4ByHost["missing.invalid"] = address
+            let backend = LinkLocalVirtIONetworkBackend(outboundNetworkFactory: factory)
+            var query: [UInt8] = [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+            for label in ["missing", "invalid"] {
+                query.append(UInt8(label.utf8.count))
+                query += Array(label.utf8)
+            }
+            query += [0, 0, 1, 0, 1]
+            backend.transmit(frame: makeIPv4UDPFrame(
+                sourcePort: 53000,
+                destinationIP: LinkLocalVirtIONetworkBackend.dnsIPv4,
+                destinationPort: 53,
+                payload: query
+            ))
+            let response = try XCTUnwrap(waitForReceiveFrame(from: backend))
+            let dnsStart = 14 + 20 + 8
+            XCTAssertEqual(readBE16(response, at: dnsStart + 2) & 0xf, 2)
+            XCTAssertEqual(readBE16(response, at: dnsStart + 6), 0)
+            XCTAssertEqual(response.count, dnsStart + query.count)
+        }
     }
 
     func testLinkLocalNetworkBackendUsesOutboundResolverForNonProxyDNSAQueries() throws {
@@ -3978,6 +4083,28 @@ final class ARM64VizCoreTests: XCTestCase {
         connection.fireClose()
         let fin = try XCTUnwrap(waitForReceiveFrame(from: backend))
         XCTAssertEqual(tcpFlags(fin) & 0x01, 0x01)
+    }
+
+    func testLinkLocalNetworkBackendReleasesCanceledBrowserConnection() throws {
+        let factory = FakeOutboundNetworkFactory()
+        let connection = FakeOutboundTCPConnection()
+        factory.tcpConnection = connection
+        let backend = LinkLocalVirtIONetworkBackend(outboundNetworkFactory: factory)
+        backend.transmit(frame: makeIPv4TCPFrame(
+            sourcePort: 41000, destinationIP: [203, 0, 113, 10], destinationPort: 443,
+            sequence: 100, acknowledgment: 0, flags: 0x02, payload: []
+        ))
+        let synAck = try XCTUnwrap(waitForReceiveFrame(from: backend))
+        XCTAssertEqual(backend.activeTCPConnectionCount, 1)
+        backend.transmit(frame: makeIPv4TCPFrame(
+            sourcePort: 41000, destinationIP: [203, 0, 113, 10], destinationPort: 443,
+            sequence: 101, acknowledgment: readBE32(synAck, at: 38) &+ 1,
+            flags: 0x14, payload: []
+        ))
+        XCTAssertEqual(connection.cancelCount, 1)
+        XCTAssertEqual(backend.activeTCPConnectionCount, 0)
+        XCTAssertFalse(backend.hasPendingAsynchronousTraffic)
+        XCTAssertNil(backend.receive())
     }
 
     func testLinkLocalNetworkBackendSplitsOutboundTCPResponsesIntoMTUSizedFrames() throws {

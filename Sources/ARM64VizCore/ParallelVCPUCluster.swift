@@ -1,45 +1,44 @@
 import Foundation
+import ARM64VizNative
 
 final class ParallelVCPUClock: @unchecked Sendable {
     private static let frequency: UInt64 = 24_000_000
     private let lock = NSLock()
-    private var counterTicks: UInt64 = 0
-    private var lastHostNanoseconds = DispatchTime.now().uptimeNanoseconds
+    private var clock = AVZNativeCounterClock()
+
+    init() {
+        precondition(avz_native_counter_clock_initialize(&clock, 0, UInt32(Self.frequency)) != 0)
+    }
 
     func reset() {
         lock.lock()
-        counterTicks = 0
-        lastHostNanoseconds = DispatchTime.now().uptimeNanoseconds
+        precondition(avz_native_counter_clock_initialize(&clock, 0, UInt32(Self.frequency)) != 0)
         lock.unlock()
     }
 
     func synchronize(_ registers: inout ARM64SystemRegisterBank) {
         lock.lock()
-        advanceFromHostClock()
-        let ticks = counterTicks
+        let ticks = avz_native_counter_clock_read(&clock)
         lock.unlock()
         registers.synchronizeCounterTicks(ticks)
     }
 
-    func publish(_ ticks: UInt64) {
+    var nativeConfiguration: AVZNativeCounterClock {
         lock.lock()
-        advanceFromHostClock()
-        counterTicks = max(counterTicks, ticks)
-        lock.unlock()
+        defer { lock.unlock() }
+        return clock
     }
 
     var currentTicks: UInt64 {
         lock.lock()
-        advanceFromHostClock()
-        let ticks = counterTicks
+        let ticks = avz_native_counter_clock_read(&clock)
         lock.unlock()
         return ticks
     }
 
     func nanosecondsUntil(deadlineTicks: UInt64) -> UInt64 {
         lock.lock()
-        advanceFromHostClock()
-        let current = counterTicks
+        let current = avz_native_counter_clock_read(&clock)
         lock.unlock()
 
         guard deadlineTicks > current else { return 0 }
@@ -56,15 +55,6 @@ final class ParallelVCPUClock: @unchecked Sendable {
         return result.overflow ? UInt64.max : result.partialValue
     }
 
-    private func advanceFromHostClock() {
-        let now = DispatchTime.now().uptimeNanoseconds
-        let elapsed = now &- lastHostNanoseconds
-        lastHostNanoseconds = now
-        let seconds = elapsed / 1_000_000_000
-        let nanoseconds = elapsed % 1_000_000_000
-        counterTicks &+= seconds &* Self.frequency
-        counterTicks &+= nanoseconds &* Self.frequency / 1_000_000_000
-    }
 }
 
 public final class ParallelVCPUCluster: @unchecked Sendable {
@@ -80,18 +70,31 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         private var executedSteps: UInt64 = 0
         private var nativeSteps: UInt64 = 0
         private var fallbackSteps: UInt64 = 0
+        private var lastProfileTimestamp: UInt64 = 0
+        fileprivate var hotPCProfile: [[String: String]] = []
+        private let profilingEnabled: Bool
+        private let failureWakeHandler: @Sendable () -> Void
         fileprivate var runStepBudget = 262_144
+        fileprivate var continuousExecutionPacing = false
+        fileprivate var latestHostWakeNanoseconds: UInt64?
+        private let executionPacer = HostExecutionPacer()
         fileprivate var requestedWallClockRunBudgetNanoseconds: UInt64?
         fileprivate var requestedNativeCheckpointBlockInterval: UInt64
 
         init(
             id: Int,
             vm: VirtualMachine,
-            condition: NSCondition
+            condition: NSCondition,
+            failureWakeHandler: @escaping @Sendable () -> Void
         ) {
             self.id = id
             self.vm = vm
             self.condition = condition
+            self.failureWakeHandler = failureWakeHandler
+            let environment = ProcessInfo.processInfo.environment
+            profilingEnabled = environment["PINECONE_HOT_PC_PROFILE"] == "1" ||
+                environment["PINECONE_SIMULATOR_HOT_PC_PROFILE"] == "1"
+            (vm.backend as? SoftwareARM64Backend)?.setNativeHotPCProfilingEnabled(profilingEnabled)
             self.state = vm.externalVirtualCPUStateSnapshot()
             self.requestedWallClockRunBudgetNanoseconds =
                 vm.wallClockRunBudgetNanoseconds
@@ -237,6 +240,7 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
                 condition.unlock()
 
                 do {
+                    let runStarted = DispatchTime.now().uptimeNanoseconds
                     vm.wallClockRunBudgetNanoseconds =
                         wallClockRunBudgetNanoseconds
                     vm.nativeCheckpointBlockInterval =
@@ -245,13 +249,37 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
                     let currentState = vm.externalVirtualCPUStateSnapshot()
                     let totals = (vm.backend as? SoftwareARM64Backend)?
                         .executionTotals()
+                    var profile: [[String: String]]?
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if profilingEnabled && now &- lastProfileTimestamp >= 1_000_000_000 {
+                        lastProfileTimestamp = now
+                        profile = (vm.backend as? SoftwareARM64Backend)?.nativeHotPCSnapshot(limit: 32).map {
+                            ["vcpu": String(id), "pc": "0x" + String($0.pc, radix: 16),
+                             "samples": String($0.samples), "lr": "0x" + String($0.linkRegister, radix: 16),
+                             "instructions": $0.instructions.map { String(format: "%08x", $0) }.joined(separator: " ")]
+                        }
+                    }
                     condition.lock()
+                    if let profile { hotPCProfile = profile }
                     executedSteps &+= UInt64(max(0, result.steps))
                     nativeSteps = UInt64(max(0, totals?.nativeSteps ?? 0))
                     fallbackSteps = UInt64(max(0, totals?.fallbackSteps ?? 0))
                     state = currentState
                     if case .halted = result.stopReason {
                         state.lifecycle = .halted
+                    }
+                    if continuousExecutionPacing && state.lifecycle == .runnable && !shouldStop &&
+                       !vm.hasPendingInterruptForAnyVirtualCPU {
+                        let delay = executionPacer.delayNanoseconds(
+                            afterRunDuration: now &- runStarted,
+                            nowNanoseconds: now,
+                            latestInteractionNanoseconds: latestHostWakeNanoseconds)
+                        if delay > 0 {
+                            // Use the same condition as IRQ/input delivery: a
+                            // wake cannot be lost between checking and sleeping.
+                            _ = condition.wait(until: Date(timeIntervalSinceNow:
+                                Double(delay) / 1_000_000_000))
+                        }
                     }
                     condition.unlock()
                 } catch {
@@ -260,6 +288,7 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
                     state = vm.externalVirtualCPUStateSnapshot()
                     state.lifecycle = .halted
                     condition.unlock()
+                    failureWakeHandler()
                 }
             }
         }
@@ -272,6 +301,12 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
     private let stopLock = NSLock()
     private var stopped = false
     private var hostWakeHandler: (@Sendable () -> Void)?
+
+    public var secondaryHotPCProfile: [[String: String]] {
+        condition.lock()
+        defer { condition.unlock() }
+        return workers.flatMap(\.hotPCProfile)
+    }
 
     init(primary: VirtualMachine) {
         precondition(primary.virtualCPUCount > 1)
@@ -297,7 +332,9 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
             vm.disableInstructionTrace()
             vm.enableMMIOTrace(capacity: 0)
             vm.configureExternalParallelExecution(vcpuID: id, clock: clock)
-            return SecondaryWorker(id: id, vm: vm, condition: condition)
+            return SecondaryWorker(id: id, vm: vm, condition: condition) { [weak self] in
+                self?.signal()
+            }
         }
 
         primary.configureExternalParallelExecution(
@@ -346,6 +383,14 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         workers.reduce(UInt64(0)) { $0 &+ $1.diagnostics.steps }
     }
 
+    public func checkForFailure() throws {
+        for worker in workers {
+            if let failure = worker.diagnostics.failure {
+                throw VMError.deviceError("vCPU \(worker.id) failed: \(failure)")
+            }
+        }
+    }
+
     public var secondaryExecutionTotals: (
         nativeSteps: UInt64,
         fallbackSteps: UInt64
@@ -360,6 +405,8 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
 
     public func signal() {
         condition.lock()
+        let now = DispatchTime.now().uptimeNanoseconds
+        for worker in workers { worker.latestHostWakeNanoseconds = now }
         let wakeHandler = hostWakeHandler
         condition.broadcast()
         condition.unlock()
@@ -407,6 +454,17 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
             worker.runStepBudget = max(1, secondaryRunStepBudget)
         }
         condition.broadcast()
+        condition.unlock()
+    }
+
+    public func setContinuousExecutionPacing(enabled: Bool) {
+        condition.lock()
+        var changed = false
+        for worker in workers where worker.continuousExecutionPacing != enabled {
+            worker.continuousExecutionPacing = enabled
+            changed = true
+        }
+        if changed { condition.broadcast() }
         condition.unlock()
     }
 

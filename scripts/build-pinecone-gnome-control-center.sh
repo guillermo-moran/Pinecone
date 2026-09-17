@@ -6,7 +6,7 @@ PATCH="${ROOT_DIR}/scripts/patches/gnome-control-center-pinecone-prewarm.patch"
 OUTPUT_DIR="${ROOT_DIR}/artifacts/alpine-packages/pinecone-gnome-control-center/aarch64"
 INSTANCE="${PINECONE_SETTINGS_LIMA_INSTANCE:-pinecone-builder}"
 APORTS_COMMIT="${PINECONE_SETTINGS_APORTS_COMMIT:-811833d5f62f82be50bf103ff8325c70970d03b6}"
-PACKAGE_VERSION="50.4-r1"
+PACKAGE_VERSION="50.4-r2"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -50,7 +50,7 @@ limactl copy "${PATCH}" \
 
 limactl shell "${INSTANCE}" grep -qx 'pkgver=50.4' "${GUEST_BUILD}/APKBUILD"
 limactl shell "${INSTANCE}" grep -qx 'pkgrel=0' "${GUEST_BUILD}/APKBUILD"
-limactl shell "${INSTANCE}" sed -i 's/^pkgrel=0$/pkgrel=1/' "${GUEST_BUILD}/APKBUILD"
+limactl shell "${INSTANCE}" sed -i 's/^pkgrel=0$/pkgrel=2/' "${GUEST_BUILD}/APKBUILD"
 limactl shell "${INSTANCE}" sh -c \
   "awk '{ print; if (\$0 ~ /^source=\"/) print \"\\tgnome-control-center-pinecone-prewarm.patch\" }' \
     '${GUEST_BUILD}/APKBUILD' > '${GUEST_BUILD}/APKBUILD.pinecone'"

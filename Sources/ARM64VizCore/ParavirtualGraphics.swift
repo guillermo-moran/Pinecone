@@ -233,6 +233,8 @@ public struct PineconeGraphicsWorkItem {
 /// native C implementation for this host graphics operation; it never invokes
 /// the ARM64 instruction fallback interpreter.
 public protocol PineconeGraphicsAccelerator: AnyObject {
+    /// Cheap eligibility check; must not allocate buffers or touch image data.
+    func acceptsBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool
     func execute(
         _ command: PineconeGraphicsCommand,
         source: PineconeGraphicsSurface?,
@@ -258,6 +260,7 @@ public protocol PineconeGraphicsAccelerator: AnyObject {
 }
 
 public extension PineconeGraphicsAccelerator {
+    func acceptsBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool { true }
     func executeBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool {
         guard workItems.count == 1, let item = workItems.first else {
             return workItems.isEmpty

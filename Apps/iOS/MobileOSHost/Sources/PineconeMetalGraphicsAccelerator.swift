@@ -3,7 +3,7 @@ import Foundation
 import Metal
 
 final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
-#if targetEnvironment(simulator)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
     private static let defaultMinimumMetalPixelCount = 8_192
 #else
     // A synchronous Metal submission has a fixed scheduling cost. Keep small
@@ -44,7 +44,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     }
 
     private struct DirtyDestination {
-        var rectangle: PineconeGraphicsRectangle
+        var rectangles: [PineconeGraphicsRectangle]
         let surface: PineconeGraphicsSurface
         let packedA8: Bool
     }
@@ -56,6 +56,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     private let enabledOperatorMask: UInt64
     private let enabledCapabilities: PineconeGraphicsCapabilities
     private let cacheLock = NSLock()
+    private let pendingWrites = DispatchGroup()
     private let diagnosticsLock = NSLock()
     private var cachedBuffers: [UInt32: CachedBuffer] = [:]
     private var completedCommandCount: UInt64 = 0
@@ -63,6 +64,14 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     private var completedPixelCount: UInt64 = 0
     private var commandNanoseconds: [UInt64] = []
     private var gpuWaitNanoseconds: [UInt64] = []
+    private var initializationNanoseconds: UInt64 = 0
+    private var prewarmBufferCreationNanoseconds: UInt64 = 0
+    private var prewarmEncodingNanoseconds: UInt64 = 0
+    private var prewarmCompletionNanoseconds: UInt64 = 0
+    private var prewarmSucceeded = false
+    private var firstGuestSubmissionClaimed = false
+    private var firstGuestPreparationNanoseconds: UInt64 = 0
+    private var firstGuestCompletionNanoseconds: UInt64 = 0
 
     var diagnosticsSummary: String {
         diagnosticsLock.lock()
@@ -78,7 +87,37 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             "\(String(format: "%.2f", waitP95))ms"
     }
 
+    var performanceCounters: [String: Double] {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return [
+            "completedCommands": Double(completedCommandCount),
+            "completedBatches": Double(completedBatchCount),
+            "completedPixels": Double(completedPixelCount),
+            "commandP95Milliseconds": Self.percentileMilliseconds(commandNanoseconds),
+            "synchronousWaitP95Milliseconds": Self.percentileMilliseconds(
+                gpuWaitNanoseconds
+            ),
+            "initializationMilliseconds": Self.milliseconds(initializationNanoseconds),
+            "prewarmBufferCreationMilliseconds": Self.milliseconds(
+                prewarmBufferCreationNanoseconds
+            ),
+            "prewarmEncodingMilliseconds": Self.milliseconds(prewarmEncodingNanoseconds),
+            "prewarmCompletionMilliseconds": Self.milliseconds(
+                prewarmCompletionNanoseconds
+            ),
+            "prewarmSucceeded": prewarmSucceeded ? 1 : 0,
+            "firstGuestPreparationMilliseconds": Self.milliseconds(
+                firstGuestPreparationNanoseconds
+            ),
+            "firstGuestCompletionMilliseconds": Self.milliseconds(
+                firstGuestCompletionNanoseconds
+            ),
+        ]
+    }
+
     init?(device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+        let initializationStarted = DispatchTime.now().uptimeNanoseconds
         guard let device,
               let commandQueue = device.makeCommandQueue(),
               let library = try? device.makeLibrary(source: Self.shaderSource, options: nil),
@@ -121,6 +160,9 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             capabilities.remove(.orderedBatch)
         }
         self.enabledCapabilities = capabilities
+        initializationNanoseconds = DispatchTime.now().uptimeNanoseconds &-
+            initializationStarted
+        prewarm()
     }
 
     func execute(
@@ -148,6 +190,42 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         executeBatch(workItems, completion: completion)
     }
 
+    func acceptsBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool {
+        guard !workItems.isEmpty,
+              workItems.count <= PineconeGraphicsProtocol.maximumBatchCommandCount,
+              workItems.count == 1 || enabledCapabilities.contains(.orderedBatch) else {
+            return false
+        }
+        var pixels = 0
+        var packedFormats: [UInt32: Bool] = [:]
+        func acceptFormat(_ surface: PineconeGraphicsSurface?, packed: Bool) -> Bool {
+            guard let surface else { return true }
+            if let previous = packedFormats[surface.resourceID], previous != packed { return false }
+            packedFormats[surface.resourceID] = packed
+            return true
+        }
+        for item in workItems {
+            let command = item.command
+            let rectangle = command.destinationRectangle
+            let count = rectangle.width.multipliedReportingOverflow(by: rectangle.height)
+            guard rectangle.width > 0, rectangle.height > 0, !count.overflow,
+                  pixels <= Int.max - count.partialValue,
+                  enabledOperatorMask & (1 << UInt64(command.blendOperator.rawValue)) != 0,
+                  !command.componentAlphaMask || enabledCapabilities.contains(.componentAlphaMask),
+                  !command.sourceIsPackedA8 || enabledCapabilities.contains(.packedA8Source),
+                  !command.maskIsPackedA8 || enabledCapabilities.contains(.packedA8Mask),
+                  !command.destinationIsPackedA8 || enabledCapabilities.contains(.packedA8Destination),
+                  !command.usesBilinearFiltering || enabledCapabilities.contains(.bilinearScaling),
+                  acceptFormat(item.destination, packed: command.destinationIsPackedA8),
+                  acceptFormat(command.sourceIsSolid ? nil : item.source, packed: command.sourceIsPackedA8),
+                  acceptFormat(item.mask, packed: command.maskIsPackedA8) else {
+                return false
+            }
+            pixels += count.partialValue
+        }
+        return pixels >= minimumMetalPixelCount
+    }
+
     private func executeBatch(
         _ workItems: [PineconeGraphicsWorkItem],
         completion: (@Sendable (Bool) -> Void)?
@@ -157,6 +235,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             return workItems.isEmpty
         }
         let commandStarted = DispatchTime.now().uptimeNanoseconds
+        guard acceptsBatch(workItems) else { return false }
 
         var totalPixelCount = 0
         if workItems.count > 1 &&
@@ -217,15 +296,19 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                   totalPixelCount <= Int.max - pixels.partialValue else { return false }
             totalPixelCount += pixels.partialValue
         }
-        guard totalPixelCount >= minimumMetalPixelCount,
-              let commandBuffer = commandQueue.makeCommandBuffer(),
+        guard totalPixelCount >= minimumMetalPixelCount else {
+            return false
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             return false
         }
+        let isFirstGuestSubmission = claimFirstGuestSubmission()
 
         var gpuWrittenResources = Set<UInt32>()
-#if targetEnvironment(simulator)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
         var dirtyDestinations: [UInt32: DirtyDestination] = [:]
+        var synchronizedInputs: [UInt32: [PineconeGraphicsRectangle]] = [:]
 #endif
 
         encoder.setComputePipelineState(pipeline)
@@ -246,33 +329,33 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                 return false
             }
 
-#if targetEnvironment(simulator)
-            if let source,
-               !command.sourceIsSolid,
-               !gpuWrittenResources.contains(source.resourceID) {
-                synchronize(
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+            if let source, !command.sourceIsSolid {
+                synchronizeMissing(
                     source, to: sourceBuffer,
                     x: command.sourceX, y: command.sourceY,
                     width: command.sourceWidth, height: command.sourceHeight,
-                    packedA8: command.sourceIsPackedA8
+                    packedA8: command.sourceIsPackedA8,
+                    synchronized: &synchronizedInputs
                 )
             }
             if command.blendOperator != .clear &&
-                command.blendOperator != .source,
-               !gpuWrittenResources.contains(destination.resourceID) {
-                synchronize(
+                command.blendOperator != .source {
+                synchronizeMissing(
                     destination, to: destinationBuffer,
                     x: rectangle.x, y: rectangle.y,
                     width: rectangle.width, height: rectangle.height,
-                    packedA8: command.destinationIsPackedA8
+                    packedA8: command.destinationIsPackedA8,
+                    synchronized: &synchronizedInputs
                 )
             }
-            if let mask, !gpuWrittenResources.contains(mask.resourceID) {
-                synchronize(
+            if let mask {
+                synchronizeMissing(
                     mask, to: maskBuffer,
                     x: 0, y: 0,
                     width: rectangle.width, height: rectangle.height,
-                    packedA8: command.maskIsPackedA8
+                    packedA8: command.maskIsPackedA8,
+                    synchronized: &synchronizedInputs
                 )
             }
 #endif
@@ -330,29 +413,22 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                 threadsPerThreadgroup: geometry.threadsPerThreadgroup
             )
             gpuWrittenResources.insert(destination.resourceID)
-#if targetEnvironment(simulator)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+            // A GPU write initializes precisely these pixels. Later commands may
+            // still need guest pixels from other parts of the same resource.
+            var initialized = synchronizedInputs[destination.resourceID] ?? []
+            Self.appendDamage(rectangle, to: &initialized)
+            synchronizedInputs[destination.resourceID] = initialized
             if var existing = dirtyDestinations[destination.resourceID] {
                 guard existing.packedA8 == command.destinationIsPackedA8 else {
                     encoder.endEncoding()
                     return false
                 }
-                let left = min(existing.rectangle.x, rectangle.x)
-                let top = min(existing.rectangle.y, rectangle.y)
-                let right = max(
-                    existing.rectangle.x + existing.rectangle.width,
-                    rectangle.x + rectangle.width
-                )
-                let bottom = max(
-                    existing.rectangle.y + existing.rectangle.height,
-                    rectangle.y + rectangle.height
-                )
-                existing.rectangle = PineconeGraphicsRectangle(
-                    x: left, y: top, width: right - left, height: bottom - top
-                )
+                Self.appendDamage(rectangle, to: &existing.rectangles)
                 dirtyDestinations[destination.resourceID] = existing
             } else {
                 dirtyDestinations[destination.resourceID] = DirtyDestination(
-                    rectangle: rectangle,
+                    rectangles: [rectangle],
                     surface: destination,
                     packedA8: command.destinationIsPackedA8
                 )
@@ -361,11 +437,12 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         }
         encoder.endEncoding()
         if let completion {
+            pendingWrites.enter()
             let commandCount = workItems.count
             commandBuffer.addCompletedHandler { [self] completedBuffer in
                 let completedAt = DispatchTime.now().uptimeNanoseconds
                 var succeeded = completedBuffer.status == .completed
-#if targetEnvironment(simulator)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
                 if succeeded {
                     succeeded = synchronizeDestinationsToGuest(
                         dirtyDestinations
@@ -377,11 +454,27 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                 completedCommandCount &+= UInt64(commandCount)
                 completedBatchCount &+= 1
                 completedPixelCount &+= UInt64(totalPixelCount)
+                if isFirstGuestSubmission {
+                    firstGuestCompletionNanoseconds = completedAt &- commandStarted
+                }
                 diagnosticsLock.unlock()
+                // Reset may hold the device lock while draining GPU writes.
+                // Leave before its callback tries to acquire that same lock.
+                pendingWrites.leave()
                 completion(succeeded)
+            }
+            if isFirstGuestSubmission {
+                recordFirstGuestPreparation(
+                    DispatchTime.now().uptimeNanoseconds &- commandStarted
+                )
             }
             commandBuffer.commit()
             return true
+        }
+        if isFirstGuestSubmission {
+            recordFirstGuestPreparation(
+                DispatchTime.now().uptimeNanoseconds &- commandStarted
+            )
         }
         commandBuffer.commit()
         let waitStarted = DispatchTime.now().uptimeNanoseconds
@@ -393,10 +486,13 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         completedCommandCount &+= UInt64(workItems.count)
         completedBatchCount &+= 1
         completedPixelCount &+= UInt64(totalPixelCount)
+        if isFirstGuestSubmission {
+            firstGuestCompletionNanoseconds = completedAt &- commandStarted
+        }
         diagnosticsLock.unlock()
         guard commandBuffer.status == .completed else { return false }
 
-#if targetEnvironment(simulator)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
         guard synchronizeDestinationsToGuest(
             dirtyDestinations
         ) else { return false }
@@ -411,6 +507,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     }
 
     func reset() {
+        pendingWrites.wait()
         cacheLock.lock()
         cachedBuffers.removeAll(keepingCapacity: true)
         cacheLock.unlock()
@@ -452,6 +549,95 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             Int((Double(sorted.count - 1) * 0.95).rounded(.up))
         )
         return Double(sorted[index]) / 1_000_000
+    }
+
+    private static func milliseconds(_ nanoseconds: UInt64) -> Double {
+        Double(nanoseconds) / 1_000_000
+    }
+
+    private func claimFirstGuestSubmission() -> Bool {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        guard !firstGuestSubmissionClaimed else { return false }
+        firstGuestSubmissionClaimed = true
+        return true
+    }
+
+    private func recordFirstGuestPreparation(_ nanoseconds: UInt64) {
+        diagnosticsLock.lock()
+        firstGuestPreparationNanoseconds = nanoseconds
+        diagnosticsLock.unlock()
+    }
+
+    /// Force Metal's lazy device, queue, pipeline, and first-dispatch work to
+    /// complete before the guest can submit a user-visible Phosh frame.
+    private func prewarm() {
+        guard ProcessInfo.processInfo.environment["PINECONE_METAL_PREWARM"] != "0" else {
+            return
+        }
+
+        let bufferCreationStarted = DispatchTime.now().uptimeNanoseconds
+        guard let source = device.makeBuffer(length: 4, options: .storageModeShared),
+              let destination = device.makeBuffer(length: 4, options: .storageModeShared),
+              let mask = device.makeBuffer(length: 4, options: .storageModeShared) else {
+            prewarmBufferCreationNanoseconds = DispatchTime.now().uptimeNanoseconds &-
+                bufferCreationStarted
+            return
+        }
+        prewarmBufferCreationNanoseconds = DispatchTime.now().uptimeNanoseconds &-
+            bufferCreationStarted
+
+        var parameters = Parameters(
+            operation: UInt32(PineconeGraphicsBlendOperator.clear.rawValue),
+            sourceStridePixels: 1,
+            destinationStridePixels: 1,
+            sourceX: 0,
+            sourceY: 0,
+            sourceWidth: 1,
+            sourceHeight: 1,
+            destinationX: 0,
+            destinationY: 0,
+            width: 1,
+            height: 1,
+            color: 0,
+            sourceOpaque: 0,
+            destinationOpaque: 0,
+            bilinearFiltering: 0,
+            maskStridePixels: 1,
+            maskAlpha: UInt32(UInt8.max),
+            hasImageMask: 0,
+            sourceIsSolid: 1,
+            componentAlphaMask: 0,
+            maskIsPackedA8: 0,
+            sourceIsPackedA8: 0,
+            destinationIsPackedA8: 0
+        )
+        let encodingStarted = DispatchTime.now().uptimeNanoseconds
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            prewarmEncodingNanoseconds = DispatchTime.now().uptimeNanoseconds &-
+                encodingStarted
+            return
+        }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(source, offset: 0, index: 0)
+        encoder.setBuffer(destination, offset: 0, index: 1)
+        encoder.setBuffer(mask, offset: 0, index: 2)
+        encoder.setBytes(&parameters, length: MemoryLayout<Parameters>.stride, index: 3)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        prewarmEncodingNanoseconds = DispatchTime.now().uptimeNanoseconds &-
+            encodingStarted
+
+        let completionStarted = DispatchTime.now().uptimeNanoseconds
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        prewarmCompletionNanoseconds = DispatchTime.now().uptimeNanoseconds &-
+            completionStarted
+        prewarmSucceeded = commandBuffer.status == .completed
     }
 
     private func dispatchGeometry(
@@ -501,7 +687,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
               surface.allocationByteCount >= surface.bytes.count else {
             return nil
         }
-#if targetEnvironment(simulator)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
         let address = UInt(bitPattern: baseAddress)
         cacheLock.lock()
         defer { cacheLock.unlock() }
@@ -548,7 +734,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
 #endif
     }
 
-#if targetEnvironment(simulator)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
     /// Simulator Metal buffers cannot alias the package's guest-memory
     /// allocation. Copy only GPU-written rectangles back before completing the
     /// virtio fence; physical devices use bytesNoCopy and skip this path.
@@ -557,34 +743,140 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     ) -> Bool {
         for (resourceID, dirty) in dirtyDestinations {
             let destination = dirty.surface
-            let rectangle = dirty.rectangle
             guard destination.resourceID == resourceID,
                   let destinationBuffer = buffer(for: destination),
                   let destinationBytes = destination.bytes.baseAddress else {
                 return false
             }
             let bytesPerPixel = dirty.packedA8 ? 1 : 4
-            let rowBytes = rectangle.width * bytesPerPixel
-            if rectangle.x == 0 && rowBytes == destination.stride {
-                let offset = rectangle.y * destination.stride
-                memcpy(
-                    destinationBytes.advanced(by: offset),
-                    destinationBuffer.contents().advanced(by: offset),
-                    rectangle.height * destination.stride
-                )
-                continue
-            }
-            for row in 0..<rectangle.height {
-                let offset = (rectangle.y + row) * destination.stride +
-                    rectangle.x * bytesPerPixel
-                memcpy(
-                    destinationBytes.advanced(by: offset),
-                    destinationBuffer.contents().advanced(by: offset),
-                    rowBytes
-                )
+            for rectangle in dirty.rectangles {
+                let rowBytes = rectangle.width * bytesPerPixel
+                if rectangle.x == 0 && rowBytes == destination.stride {
+                    let offset = rectangle.y * destination.stride
+                    memcpy(
+                        destinationBytes.advanced(by: offset),
+                        destinationBuffer.contents().advanced(by: offset),
+                        rectangle.height * destination.stride
+                    )
+                    continue
+                }
+                for row in 0..<rectangle.height {
+                    let offset = (rectangle.y + row) * destination.stride +
+                        rectangle.x * bytesPerPixel
+                    memcpy(
+                        destinationBytes.advanced(by: offset),
+                        destinationBuffer.contents().advanced(by: offset),
+                        rowBytes
+                    )
+                }
             }
         }
         return true
+    }
+
+    private func synchronizeMissing(
+        _ surface: PineconeGraphicsSurface,
+        to buffer: MTLBuffer,
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        packedA8: Bool,
+        synchronized: inout [UInt32: [PineconeGraphicsRectangle]]
+    ) {
+        let requested = PineconeGraphicsRectangle(x: x, y: y, width: width, height: height)
+        let existing = synchronized[surface.resourceID] ?? []
+        let missing = existing.reduce([requested]) { rectangles, covered in
+            rectangles.flatMap { Self.subtract($0, covered) }
+        }
+        for rectangle in missing {
+            synchronize(
+                surface,
+                to: buffer,
+                x: rectangle.x,
+                y: rectangle.y,
+                width: rectangle.width,
+                height: rectangle.height,
+                packedA8: packedA8
+            )
+        }
+        var updated = existing
+        Self.appendDamage(requested, to: &updated)
+        synchronized[surface.resourceID] = updated
+    }
+
+    private static func appendDamage(
+        _ rectangle: PineconeGraphicsRectangle,
+        to rectangles: inout [PineconeGraphicsRectangle]
+    ) {
+        var candidate = rectangle
+        var index = 0
+        while index < rectangles.count {
+            let existing = rectangles[index]
+            let horizontal = existing.y == candidate.y &&
+                existing.height == candidate.height &&
+                existing.x <= candidate.x + candidate.width &&
+                candidate.x <= existing.x + existing.width
+            let vertical = existing.x == candidate.x &&
+                existing.width == candidate.width &&
+                existing.y <= candidate.y + candidate.height &&
+                candidate.y <= existing.y + existing.height
+            // Only merge when the union is itself a rectangle. Bounding an
+            // arbitrary overlap invents damage and copies uninitialized pixels.
+            if horizontal || vertical {
+                let left = min(existing.x, candidate.x)
+                let top = min(existing.y, candidate.y)
+                let right = max(existing.x + existing.width, candidate.x + candidate.width)
+                let bottom = max(existing.y + existing.height, candidate.y + candidate.height)
+                candidate = PineconeGraphicsRectangle(
+                    x: left, y: top, width: right - left, height: bottom - top
+                )
+                rectangles.remove(at: index)
+                index = 0
+            } else {
+                index += 1
+            }
+        }
+        rectangles.append(candidate)
+    }
+
+    private static func subtract(
+        _ rectangle: PineconeGraphicsRectangle,
+        _ covered: PineconeGraphicsRectangle
+    ) -> [PineconeGraphicsRectangle] {
+        let left = max(rectangle.x, covered.x)
+        let top = max(rectangle.y, covered.y)
+        let right = min(rectangle.x + rectangle.width, covered.x + covered.width)
+        let bottom = min(rectangle.y + rectangle.height, covered.y + covered.height)
+        guard left < right, top < bottom else { return [rectangle] }
+        var output: [PineconeGraphicsRectangle] = []
+        if rectangle.y < top {
+            output.append(PineconeGraphicsRectangle(
+                x: rectangle.x, y: rectangle.y,
+                width: rectangle.width, height: top - rectangle.y
+            ))
+        }
+        if bottom < rectangle.y + rectangle.height {
+            output.append(PineconeGraphicsRectangle(
+                x: rectangle.x, y: bottom,
+                width: rectangle.width,
+                height: rectangle.y + rectangle.height - bottom
+            ))
+        }
+        if rectangle.x < left {
+            output.append(PineconeGraphicsRectangle(
+                x: rectangle.x, y: top,
+                width: left - rectangle.x, height: bottom - top
+            ))
+        }
+        if right < rectangle.x + rectangle.width {
+            output.append(PineconeGraphicsRectangle(
+                x: right, y: top,
+                width: rectangle.x + rectangle.width - right,
+                height: bottom - top
+            ))
+        }
+        return output
     }
 
     private func synchronize(

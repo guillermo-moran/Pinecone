@@ -310,6 +310,55 @@ func runOrderedBatch(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
         ? nil : "ordered Metal batch violated a read-after-write dependency"
 }
 
+func runPartialBatch(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
+    // Intersecting L-shapes leave a hole inside their bounding box. Read the
+    // entire intermediate afterwards to exercise both upload and copyback.
+    let rectangles = [
+        PineconeGraphicsRectangle(x: 0, y: 0, width: 3, height: 1),
+        PineconeGraphicsRectangle(x: 0, y: 0, width: 1, height: 3),
+        PineconeGraphicsRectangle(x: 3, y: 3, width: 1, height: 1)
+    ]
+    let a = Allocation(byteCount: 64)
+    let b = Allocation(byteCount: 64)
+    for y in 0..<4 {
+        for x in 0..<4 {
+            write(0xff112233, format: .argb, x: x, y: y, stride: 16, to: a.pointer)
+            write(0xff445566, format: .argb, x: x, y: y, stride: 16, to: b.pointer)
+        }
+    }
+    let source = a.surface(id: 930_001, width: 4, height: 4, stride: 16, format: .argb)
+    let destination = b.surface(id: 930_002, width: 4, height: 4, stride: 16, format: .argb)
+    var items = rectangles.map { rect in
+        PineconeGraphicsWorkItem(command: PineconeGraphicsCommand(
+            operation: .fill, sourceResourceID: 0, destinationResourceID: source.resourceID,
+            sourceX: 0, sourceY: 0, sourceWidth: 0, sourceHeight: 0,
+            destinationRectangle: rect, color: 0xff778899,
+            blendOperator: .source, sourceIsSolid: true), source: nil, mask: nil, destination: source)
+    }
+    items.append(PineconeGraphicsWorkItem(command: PineconeGraphicsCommand(
+        operation: .source, sourceResourceID: source.resourceID,
+        destinationResourceID: destination.resourceID,
+        sourceX: 0, sourceY: 0, sourceWidth: 4, sourceHeight: 4,
+        destinationRectangle: PineconeGraphicsRectangle(x: 0, y: 0, width: 4, height: 4),
+        sourceContainsAlpha: true, blendOperator: .source),
+        source: source, mask: nil, destination: destination))
+    guard accelerator.executeBatch(items) else { return "partial batch rejected" }
+    for y in 0..<4 {
+        for x in 0..<4 {
+            let written = rectangles.contains { x >= $0.x && x < $0.x + $0.width &&
+                                                y >= $0.y && y < $0.y + $0.height }
+            let expected: UInt32 = written ? 0xff778899 : 0xff112233
+            for allocation in [a, b] {
+                if read(format: .argb, x: x, y: y, stride: 16,
+                        from: allocation.pointer) != expected {
+                    return "partial batch corrupted pixel (\(x), \(y))"
+                }
+            }
+        }
+    }
+    return nil
+}
+
 func runScaling(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
     let sourceStride = 16
     let destinationStride = 16
@@ -380,6 +429,10 @@ if let failure = runOrderedBatch(accelerator: accelerator) {
     failures += 1
 }
 if let failure = runScaling(accelerator: accelerator) {
+    fputs(failure + "\n", stderr)
+    failures += 1
+}
+if let failure = runPartialBatch(accelerator: accelerator) {
     fputs(failure + "\n", stderr)
     failures += 1
 }

@@ -17,18 +17,7 @@ mount_fs() {
 }
 
 configure_network() {
-	"$BB" ifconfig lo 127.0.0.1 up 2>/dev/null || true
-	for _ in 1 2 3 4 5; do
-		[ -e /sys/class/net/eth0 ] && break
-		"$BB" sleep 1
-	done
-	if [ -e /sys/class/net/eth0 ]; then
-		"$BB" ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null || true
-		"$BB" route add default gw 10.0.2.2 eth0 2>/dev/null || true
-		echo "arm64viz rootfs: eth0 configured as 10.0.2.15 via 10.0.2.2" >"$TTY"
-	else
-		echo "arm64viz rootfs: eth0 not present yet; networking disabled" >"$TTY"
-	fi
+	/usr/local/bin/pinecone-network early >"$TTY" 2>&1 || true
 }
 
 initialize_clock() {
@@ -45,10 +34,6 @@ initialize_clock() {
 
 write_network_config() {
 	"$BB" mkdir -p /etc /etc/apk 2>/dev/null || true
-	cat >/etc/resolv.conf <<'EOF'
-nameserver 10.0.2.3
-options timeout:1 attempts:3
-EOF
 	cat >/etc/hosts <<'EOF'
 127.0.0.1 localhost
 127.0.1.1 arm64viz.local arm64viz

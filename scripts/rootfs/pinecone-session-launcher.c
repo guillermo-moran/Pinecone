@@ -241,6 +241,42 @@ static void prepare_system_bus(void)
     fatal("wait for system D-Bus");
 }
 
+static void start_network_manager(void)
+{
+    static const char helper[] = "/usr/local/bin/pinecone-network";
+    if (access(helper, X_OK) != 0)
+        return;
+    pid_t child = fork();
+    if (child < 0)
+        return;
+    if (child == 0) {
+        /* Reap only the intermediate child. Neither NM readiness nor daemon
+         * lifetime is part of the graphical session's startup/shutdown. */
+        pid_t daemon = fork();
+        if (daemon < 0)
+            _exit(1);
+        if (daemon != 0)
+            _exit(0);
+        if (setsid() < 0)
+            _exit(1);
+        int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        int output = open("/var/log/pinecone/network.log",
+            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (input < 0 || output < 0)
+            _exit(1);
+        if (dup2(input, STDIN_FILENO) < 0 ||
+            dup2(output, STDOUT_FILENO) < 0 ||
+            dup2(output, STDERR_FILENO) < 0)
+            _exit(1);
+        close(input);
+        close(output);
+        unsetenv("LD_PRELOAD");
+        execl(helper, "pinecone-network", "start", (char *)NULL);
+        _exit(127);
+    }
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+}
+
 static void configure_environment(void)
 {
     make_directory("/run/user", 0755);
@@ -320,6 +356,7 @@ static int run_session(void)
     configure_environment();
     prepare_system_bus();
     prepare_input();
+    start_network_manager();
     (void)setpriority(PRIO_PROCESS, 0, -5);
 
     const char *configuration = access("/etc/phosh/phoc.ini", R_OK) == 0
@@ -360,6 +397,19 @@ static pid_t start_osk(void)
     pid_t child = fork();
     if (child != 0)
         return child;
+    /* Remove Phosh's inherited nice=-5 boost before OSK initialization.
+     * Keep nice=0 for the keyboard's lifetime: permanently lowering its
+     * priority could penalize touch/typing latency under foreground load.
+     * Use an absolute priority, not a relative increment. */
+    if (setpriority(PRIO_PROCESS, 0, 0) != 0) {
+        static const char warning[] =
+            "pinecone-session: cannot normalize Squeekboard priority: ";
+        const char *description = strerror(errno);
+        (void)write_fully(STDERR_FILENO, warning, sizeof(warning) - 1);
+        (void)write_fully(STDERR_FILENO, description, strlen(description));
+        (void)write_fully(STDERR_FILENO, "\n", 1);
+        /* Scheduling restrictions must not leave the session without an OSK. */
+    }
     unsigned long delay = 10;
     const char *configured_delay =
         getenv("PINECONE_OSK_POST_READY_DELAY_SECONDS");
@@ -384,7 +434,7 @@ static void sleep_milliseconds(unsigned long milliseconds)
 static pid_t start_settings_prewarm(void)
 {
     const char *enabled = getenv("PINECONE_SETTINGS_PREWARM");
-    if ((enabled != NULL && strcmp(enabled, "0") == 0) ||
+    if (enabled == NULL || strcmp(enabled, "1") != 0 ||
         access("/usr/bin/gnome-control-center", X_OK) != 0) {
         return -1;
     }
@@ -394,7 +444,7 @@ static pid_t start_settings_prewarm(void)
     if (child != 0)
         return child;
 
-    unsigned long delay = 250;
+    unsigned long delay = 2500;
     const char *configured_delay =
         getenv("PINECONE_SETTINGS_PREWARM_DELAY_MS");
     if (configured_delay != NULL) {
@@ -404,8 +454,6 @@ static pid_t start_settings_prewarm(void)
             delay = parsed;
     }
     sleep_milliseconds(delay);
-    (void)setpriority(PRIO_PROCESS, 0, 10);
-
     int log_fd = open(
         settings_log,
         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,

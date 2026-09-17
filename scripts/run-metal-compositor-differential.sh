@@ -20,7 +20,12 @@ printf '\n' >> "${WORK}/main.swift"
 cat "${ROOT}/scripts/metal-compositor-differential-main.swift" \
   >> "${WORK}/main.swift"
 
-xcrun swiftc -O \
+for mode in direct simulator-copy; do
+flags=(-D PINECONE_TEST_DIRECT)
+if [[ "$mode" == simulator-copy ]]; then
+  flags=(-D PINECONE_TEST_SIMULATOR_COPY)
+fi
+xcrun swiftc -O "${flags[@]}" \
   "${ROOT}/Sources/ARM64VizCore/ParavirtualGraphics.swift" \
   "${WORK}/main.swift" \
   -framework Metal \
@@ -28,3 +33,4 @@ xcrun swiftc -O \
 
 PINECONE_METAL_MIN_PIXELS=0 \
   "${WORK}/metal-compositor-differential" "${WORK}/golden.txt"
+done

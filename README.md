@@ -213,6 +213,8 @@ Scripts/fetch-alpine-aarch64.sh
 Scripts/build-arm64-shell-kernel.sh
 
 # Build the persistent Alpine edge rootfs. The graphical profile defaults to Phosh.
+# The guest now requires the tested Pinecone GLib MIME-search package.
+bash scripts/build-pinecone-glib.sh
 Scripts/build-arm64-rootfs-image.sh
 ```
 
@@ -344,7 +346,7 @@ validation. Run `swift run arm64viz --help` for the current command list.
 
 ## Networking
 
-The guest uses a static link-local-style configuration:
+The guest uses a private IPv4 network:
 
 ```text
 guest:   10.0.2.15
@@ -358,6 +360,32 @@ primary supported path. This implementation is independent of QEMU slirp and
 is still under optimization; `apk update` can be noticeably slower than on a
 native Linux machine, and ICMP behavior should not be treated as a complete
 measure of Internet connectivity.
+
+Early boot configures this address without waiting for desktop services.
+When Phosh starts, NetworkManager adopts the matching `Pinecone Internet`
+profile and becomes the network configuration owner. It exposes virtual
+Ethernet in Settings; it does not control the host's Wi-Fi or cellular radios.
+`pinecone-network status` reports the guest connection. A connected interface
+is not itself proof of Internet reachability.
+
+Public hostnames resolve through the host resolver. The optional package
+proxy remains explicitly available at `http://10.0.2.2/alpine/`; public Alpine
+hostnames are not redirected to that HTTP-only endpoint.
+
+### Web Browser
+
+The Phosh image includes NetSurf GTK3, accessible from the app grid and
+favorites. Its default page is `https://example.com/`. From a terminal inside
+the Phosh session, run `pinecone-launch-browser https://example.com/`.
+The browser uses the guest CA bundle and retains its profile on the persistent
+root filesystem. No on-device package installation is needed.
+
+This is a basic HTML/CSS browser, not a Chromium/WebKit replacement. JavaScript
+is disabled in the initial profile and many modern web apps will not work.
+NetSurf has no renderer sandbox, and the current demo desktop runs as root:
+use trusted test pages only, without sensitive credentials. Browser isolation
+and modern web-app compatibility remain separate work; TLS validation is not
+disabled to obtain connectivity.
 
 ## Debugging and Performance
 

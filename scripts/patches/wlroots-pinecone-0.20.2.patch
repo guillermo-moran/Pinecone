@@ -76,27 +76,43 @@ diff --git a/types/buffer/buffer.c b/types/buffer/buffer.c
 index 48a10d9..625e054 100644
 --- a/types/buffer/buffer.c
 +++ b/types/buffer/buffer.c
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,11 @@
  #include <assert.h>
  #include <drm_fourcc.h>
  #include <string.h>
++#include <stdint.h>
 +extern void pinecone_pixman_begin_cpu_access(void) __attribute__((weak));
 +extern void pinecone_pixman_end_cpu_access(void) __attribute__((weak));
++extern void pinecone_pixman_begin_cpu_access_flags(uint32_t) __attribute__((weak));
++extern int pinecone_pixman_access_buffer(void *, size_t) __attribute__((weak));
  #include <wlr/interfaces/wlr_buffer.h>
  #include "render/pixel_format.h"
  #include "types/wlr_buffer.h"
-@@ -86,6 +88,10 @@ bool wlr_buffer_begin_data_ptr_access(struct wlr_buffer *buffer, uint32_t flags,
+@@ -86,9 +91,23 @@ bool wlr_buffer_begin_data_ptr_access(struct wlr_buffer *buffer, uint32_t flags,
  	if (!buffer->impl->begin_data_ptr_access) {
  		return false;
  	}
-+	if (pinecone_pixman_begin_cpu_access)
++	if (pinecone_pixman_begin_cpu_access_flags)
++		pinecone_pixman_begin_cpu_access_flags(flags);
++	else if (pinecone_pixman_begin_cpu_access)
 +		pinecone_pixman_begin_cpu_access();
  	if (!buffer->impl->begin_data_ptr_access(buffer, flags, data, format, stride)) {
 +		if (pinecone_pixman_end_cpu_access)
 +			pinecone_pixman_end_cpu_access();
  		return false;
  	}
-@@ -97,6 +103,8 @@ void wlr_buffer_end_data_ptr_access(struct wlr_buffer *buffer) {
++	if (pinecone_pixman_access_buffer &&
++			(buffer->height <= 0 || *stride > SIZE_MAX / (size_t)buffer->height ||
++			!pinecone_pixman_access_buffer(*data, *stride * (size_t)buffer->height))) {
++		buffer->impl->end_data_ptr_access(buffer);
++		if (pinecone_pixman_end_cpu_access)
++			pinecone_pixman_end_cpu_access();
++		return false;
++	}
+ 	buffer->accessing_data_ptr = true;
+ 	return true;
+ }
+@@ -97,6 +116,8 @@ void wlr_buffer_end_data_ptr_access(struct wlr_buffer *buffer) {
  	assert(buffer->accessing_data_ptr);
  	buffer->impl->end_data_ptr_access(buffer);
  	buffer->accessing_data_ptr = false;

@@ -112,6 +112,23 @@ if [[ "${ARM64VIZ_GRAPHICAL_ROOTFS:-1}" == "1" ]]; then
   fi
   install -m 0755 "${OUT_DIR}/libpixman-1.so.0.46.4" \
     "${ROOTFS_DIR}/usr/lib/libpixman-1.so.0.46.4"
+  CAIRO_OVERLAY="${OUT_DIR}/pinecone-cairo"
+  if [[ "${PINECONE_REUSE_CAIRO_LIBRARY:-0}" != "1" ]]; then
+    bash "${ROOT_DIR}/scripts/build-pinecone-cairo.sh" "${CAIRO_OVERLAY}"
+  fi
+  python3 "${ROOT_DIR}/scripts/cairo-runtime-manifest.py" verify "${CAIRO_OVERLAY}"
+  for library in cairo cairo-gobject cairo-script-interpreter; do
+    filename="lib${library}.so.2.11804.4"
+    if [[ ! -s "${CAIRO_OVERLAY}/${filename}" ]]; then
+      echo "Missing patched Cairo library: ${CAIRO_OVERLAY}/${filename}" >&2
+      exit 1
+    fi
+    install -m 0755 "${CAIRO_OVERLAY}/${filename}" "${ROOTFS_DIR}/usr/lib/${filename}"
+    ln -sfn "${filename}" "${ROOTFS_DIR}/usr/lib/lib${library}.so.2"
+  done
+  install -d "${ROOTFS_DIR}/usr/share/pinecone"
+  install -m 0644 "${CAIRO_OVERLAY}/manifest.json" \
+    "${ROOTFS_DIR}/usr/share/pinecone/cairo-runtime-manifest.json"
   OPTIONAL_DBUS_SERVICES="${ROOTFS_DIR}/usr/share/pinecone/dbus-system-services"
   mkdir -p "${OPTIONAL_DBUS_SERVICES}"
   for service in org.freedesktop.UPower.service; do
@@ -171,6 +188,7 @@ org.gnome.Calendar.desktop
 org.gnome.clocks.desktop
 org.gnome.TextEditor.desktop
 org.gnome.Settings.desktop
+netsurf.desktop
 EOF
   SCHEMA_DIR="${ROOTFS_DIR}/usr/share/glib-2.0/schemas"
   if [[ -d "${SCHEMA_DIR}" ]]; then
@@ -202,8 +220,8 @@ toolkit-accessibility=false
 require-unlock=false
 
 [sm.puri.phosh]
-favorites=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.TextEditor.desktop']
-force-adaptive=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.Calendar.desktop', 'org.gnome.clocks.desktop', 'org.gnome.TextEditor.desktop']
+favorites=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.TextEditor.desktop', 'netsurf.desktop']
+force-adaptive=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.Calendar.desktop', 'org.gnome.clocks.desktop', 'org.gnome.TextEditor.desktop', 'netsurf.desktop']
 EOF
     if ! command -v glib-compile-schemas >/dev/null 2>&1; then
       echo "glib-compile-schemas is required for graphical rootfs profiles" >&2
@@ -303,19 +321,6 @@ EOF
   cat > "${ROOTFS_DIR}/etc/udev/rules.d/70-pinecone-input.rules" <<'EOF'
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pinecone Touchscreen", ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHSCREEN}="1", ENV{ID_SEAT}="seat0"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pinecone Keyboard", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEYBOARD}="1", ENV{ID_SEAT}="seat0"
-EOF
-
-  # The guest owns eth0 directly through its lightweight static setup. Keep
-  # NetworkManager from replacing that configuration while still exposing the
-  # system D-Bus API expected by Phosh and GNOME Settings.
-  mkdir -p "${ROOTFS_DIR}/etc/NetworkManager/conf.d"
-  cat > "${ROOTFS_DIR}/etc/NetworkManager/conf.d/10-pinecone.conf" <<'EOF'
-[main]
-plugins=keyfile
-no-auto-default=*
-
-[keyfile]
-unmanaged-devices=interface-name:eth0
 EOF
 
   # This compact session does not run gnome-settings-daemon, so changing
@@ -465,13 +470,7 @@ if [ -x /sbin/udevd ] && [ -x /sbin/udevadm ]; then
   /sbin/udevd --daemon 2>/dev/null || true
   /sbin/udevadm trigger --subsystem-match=input --action=add >/dev/null 2>&1 &
 fi
-/bin/ifconfig lo 127.0.0.1 up 2>/dev/null || true
-for _ in 1 2 3 4 5; do
-  [ -e /sys/class/net/eth0 ] && break
-  /bin/sleep 1
-done
-[ -e /sys/class/net/eth0 ] && /bin/ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null || true
-[ -e /sys/class/net/eth0 ] && /bin/route add default gw 10.0.2.2 eth0 2>/dev/null || true
+/usr/local/bin/pinecone-network early || true
 EOF
 chmod 0755 "${ROOTFS_DIR}/etc/init.d/rcS"
 cat > "${ROOTFS_DIR}/etc/hostname" <<EOF
@@ -785,12 +784,7 @@ EOF
 cat > "${ROOTFS_DIR}/etc/network/interfaces" <<'EOF'
 auto lo
 iface lo inet loopback
-
-auto eth0
-iface eth0 inet static
-	address 10.0.2.15
-	netmask 255.255.255.0
-	gateway 10.0.2.2
+# eth0 belongs to pinecone-network bootstrap, then NetworkManager.
 EOF
 cat > "${ROOTFS_DIR}/etc/apk/repositories" <<'EOF'
 http://dl-cdn.alpinelinux.org/alpine/edge/main
@@ -815,6 +809,9 @@ This is the first persistent arm64viz Linux root filesystem.
 The initramfs mounts this image from /dev/vda and switch_roots into /sbin/init.
 Files written here are backed by the virtual block device.
 EOF
+
+# Apply network ownership configuration after all generated startup files.
+sh "${ROOT_DIR}/scripts/rootfs/pinecone-network-install" "${ROOTFS_DIR}"
 
 mkdir -p "$(dirname "${IMAGE}")"
 STAGED_KIB="$(du -sk "${ROOTFS_DIR}" | awk '{print $1}')"

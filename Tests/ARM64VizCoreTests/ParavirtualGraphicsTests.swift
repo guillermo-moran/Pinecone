@@ -2,6 +2,17 @@ import XCTest
 @testable import ARM64VizCore
 
 final class ParavirtualGraphicsTests: XCTestCase {
+    func testGPUResourceDependenciesIncludeReadsWritesAndLifecycleCommands() {
+        XCTAssertNil(VirtIOGPUDevice.resourceDependencies([]))
+        XCTAssertEqual(VirtIOGPUDevice.resourceDependencies(
+            gpuRequest(type: 0x0100, words: [])), [])
+        XCTAssertEqual(VirtIOGPUDevice.resourceDependencies(
+            gpuRequest(type: 0x0107, words: [7])), [7])
+        XCTAssertEqual(VirtIOGPUDevice.resourceDependencies(
+            gpuRequest(type: 0x0104, words: [0, 0, 2, 2, 7, 0])), [7])
+        XCTAssertEqual(VirtIOGPUDevice.resourceDependencies(
+            gpuRequest(type: 0x0105, words: [0, 0, 2, 2, 0, 0, 7, 0])), [7])
+    }
     func testDeferredParavirtualCompletionPublishesOnlyAfterAcceleratorFence() throws {
         let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
         let backing: GuestAddress = 0x4001_0000
@@ -35,7 +46,7 @@ final class ParavirtualGraphicsTests: XCTestCase {
             request: command,
             memory: memory,
             completion: { response.store($0) }
-        ))
+        ).isDeferred)
         XCTAssertNil(response.value)
         XCTAssertEqual(
             try memory.readBytes(at: backing, count: 16),
@@ -387,7 +398,9 @@ final class ParavirtualGraphicsTests: XCTestCase {
             try memory.readBytes(at: destinationBacking, count: 4),
             [70, 80, 80, 192]
         )
-        XCTAssertTrue(gpu.diagnosticsSummary().contains("pv2d=1/0:1"))
+        let diagnostics = gpu.diagnosticsSummary()
+        XCTAssertTrue(diagnostics.contains("pv2d=1/0:1"), diagnostics)
+        XCTAssertTrue(diagnostics.contains("/n1:4"), diagnostics)
     }
 
     func testNativeFallbackAppliesImageMaskToSourceOver() throws {
@@ -582,6 +595,30 @@ final class ParavirtualGraphicsTests: XCTestCase {
             try memory.readBytes(at: destinationBacking, count: 16),
             [64, 128, 7, 7, 7, 7, 7, 7, 192, 128, 7, 7, 7, 7, 7, 7]
         )
+    }
+
+    func testPackedA8OnXRGBResourcePreservesAlphaAndPadding() throws {
+        let memory = PhysicalMemory(base: 0x4000_0000, size: 0x20_000)
+        let backing: GuestAddress = 0x4001_0000
+        let gpu = VirtIOGPUDevice(width: 8, height: 1)
+        try createResource(id: 1, backing: backing,
+                           pixels: [UInt8](repeating: 7, count: 32),
+                           width: 8, height: 1, format: 2, gpu: gpu, memory: memory)
+        for operation in [PineconeGraphicsBlendOperator.source, .clear] {
+            let request = paravirtualRequest(
+                version: PineconeGraphicsProtocol.exactCompositeVersion,
+                operation: operation.rawValue,
+                flags: (operation == .clear ? 0 : PineconeGraphicsProtocol.solidSourceFlag) |
+                    PineconeGraphicsProtocol.packedA8DestinationFlag,
+                sourceResourceID: 0, destinationResourceID: 1,
+                sourceX: 0, sourceY: 0, destinationX: 0, destinationY: 0,
+                width: 8, height: 1, color: 0x8000_0000)
+            XCTAssertEqual(responseType(gpu.process(request: request, memory: memory)), 0x1100)
+            let alpha: UInt8 = operation == .clear ? 0 : 128
+            XCTAssertEqual(try memory.readBytes(at: backing, count: 32),
+                           [UInt8](repeating: alpha, count: 8) +
+                           [UInt8](repeating: 7, count: 24))
+        }
     }
 
     func testPackedA8ExactCompositeIsValidInsideBatchEnvelope() throws {
@@ -962,12 +999,13 @@ final class ParavirtualGraphicsTests: XCTestCase {
         pixels: [UInt8],
         width: UInt32 = 1,
         height: UInt32 = 1,
+        format: UInt32 = 1,
         gpu: VirtIOGPUDevice,
         memory: PhysicalMemory
     ) throws {
         try memory.writeBytes(pixels, at: backing)
         XCTAssertEqual(responseType(gpu.process(
-            request: gpuRequest(type: 0x0101, words: [id, 1, width, height]),
+            request: gpuRequest(type: 0x0101, words: [id, format, width, height]),
             memory: memory
         )), 0x1100)
         var attach = gpuRequest(type: 0x0106, words: [id, 1])

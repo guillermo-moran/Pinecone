@@ -39,33 +39,37 @@ command -v limactl >/dev/null 2>&1 || {
 }
 limactl start "${INSTANCE}" >/dev/null
 
+lima_shell() {
+  limactl shell --shell /bin/sh "${INSTANCE}" "$@"
+}
+
 # Existing Lima instances can expose the workspace read-only. Stage one tar
 # archive on Lima's writable disk, run the exact binaries that will ship in
 # the image, and copy back only the generated caches.
 HOST_ROOTFS_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/pinecone-rootfs-cache.tar.XXXXXX")"
 HOST_CACHE_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/pinecone-generated-cache.tar.XXXXXX")"
-GUEST_WORK="$(limactl shell "${INSTANCE}" mktemp -d /tmp/pinecone-rootfs-cache.XXXXXX)"
+GUEST_WORK="$(lima_shell mktemp -d /tmp/pinecone-rootfs-cache.XXXXXX)"
 GUEST_ROOT="${GUEST_WORK}/root"
 GUEST_ROOTFS_ARCHIVE="${GUEST_WORK}/rootfs.tar"
 GUEST_CACHE_ARCHIVE="${GUEST_WORK}/generated-cache.tar"
 cleanup() {
   rm -f "${HOST_ROOTFS_ARCHIVE}" "${HOST_CACHE_ARCHIVE}"
-  limactl shell "${INSTANCE}" sudo rm -rf "${GUEST_WORK}" >/dev/null 2>&1 || true
+  lima_shell sudo rm -rf "${GUEST_WORK}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
 COPYFILE_DISABLE=1 bsdtar --no-xattrs -cf "${HOST_ROOTFS_ARCHIVE}" \
   -C "${ROOTFS}" .
 limactl copy "${HOST_ROOTFS_ARCHIVE}" "${INSTANCE}:${GUEST_ROOTFS_ARCHIVE}"
-limactl shell "${INSTANCE}" sudo mkdir -p "${GUEST_ROOT}"
-limactl shell "${INSTANCE}" sudo tar -xf "${GUEST_ROOTFS_ARCHIVE}" -C "${GUEST_ROOT}"
-limactl shell "${INSTANCE}" sudo chroot "${GUEST_ROOT}" \
+lima_shell sudo mkdir -p "${GUEST_ROOT}"
+lima_shell sudo tar -xf "${GUEST_ROOTFS_ARCHIVE}" -C "${GUEST_ROOT}"
+lima_shell sudo chroot "${GUEST_ROOT}" \
   /usr/bin/fc-cache --system-only --really-force
-limactl shell "${INSTANCE}" sudo mkdir -p \
+lima_shell sudo mkdir -p \
   "${GUEST_ROOT}/usr/lib/gdk-pixbuf-2.0/2.10.0"
-limactl shell "${INSTANCE}" sudo sh -c \
+lima_shell sudo sh -c \
   "chroot '$GUEST_ROOT' /usr/bin/gdk-pixbuf-query-loaders > '$GUEST_ROOT/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache'"
-limactl shell "${INSTANCE}" sudo tar -cf "${GUEST_CACHE_ARCHIVE}" \
+lima_shell sudo tar -cf "${GUEST_CACHE_ARCHIVE}" \
   -C "${GUEST_ROOT}" var/cache/fontconfig \
   usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache
 limactl copy "${INSTANCE}:${GUEST_CACHE_ARCHIVE}" "${HOST_CACHE_ARCHIVE}"

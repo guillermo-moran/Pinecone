@@ -488,12 +488,6 @@ public final class LinkLocalVirtIONetworkBackend: VirtIONetworkBackend {
     public static let hostIPv4: [UInt8] = [10, 0, 2, 2]
     public static let dnsIPv4: [UInt8] = [10, 0, 2, 3]
     public static let alpineProxyBaseURL = "https://dl-cdn.alpinelinux.org"
-    private static let localProxyHostnames: Set<String> = {
-        guard let host = URL(string: alpineProxyBaseURL)?.host?.lowercased() else {
-            return []
-        }
-        return [host]
-    }()
     private static let maxTCPPayloadPerFrame = 1460
     private static let maxTCPBurstBytes = 64 * 1024
 
@@ -899,29 +893,33 @@ public final class LinkLocalVirtIONetworkBackend: VirtIONetworkBackend {
             return nil
         }
 
+        var answers: [(DNSQuestion, [UInt8])] = []
+        var resolutionFailed = false
+        for question in answeredQuestions where question.queryType == 1 {
+            let name = dnsQuestionName(from: query, offset: question.nameOffset)
+            if let address = resolver?(name), address.count == 4 {
+                answers.append((question, address))
+            } else {
+                resolutionFailed = true
+            }
+        }
+        // getaddrinfo cannot distinguish authoritative NXDOMAIN from a temporary
+        // resolver failure here. Return SERVFAIL, never a fabricated gateway A RR.
+        if resolutionFailed { answers.removeAll() }
         var response: [UInt8] = []
         response += query[0..<2]
         let requestFlags = read16(query, at: 2)
-        let responseFlags = UInt16(0x8080) | (requestFlags & 0x0100)
+        let responseFlags = UInt16(0x8080) | (requestFlags & 0x0100) | (resolutionFailed ? 2 : 0)
         append16(responseFlags, to: &response)
         append16(UInt16(questions.count), to: &response)
-        let answerCount = answeredQuestions.filter { $0.queryType == 1 }.count
-        append16(UInt16(answerCount), to: &response)
+        append16(UInt16(answers.count), to: &response)
         append16(0, to: &response)
         append16(0, to: &response)
         for question in questions {
             response += question.bytes
         }
 
-        for question in answeredQuestions {
-            guard question.queryType == 1 else {
-                continue
-            }
-            let name = dnsQuestionName(from: query, offset: question.nameOffset)
-            let resolvedIPv4 = resolvedIPv4Address(for: name, resolver: resolver)
-            guard resolvedIPv4.count == 4 else {
-                continue
-            }
+        for (question, resolvedIPv4) in answers {
             guard question.nameOffset <= 0x3fff else {
                 return nil
             }
@@ -933,17 +931,6 @@ public final class LinkLocalVirtIONetworkBackend: VirtIONetworkBackend {
             response += resolvedIPv4
         }
         return response
-    }
-
-    private static func resolvedIPv4Address(
-        for hostname: String,
-        resolver: ((String) -> [UInt8]?)?
-    ) -> [UInt8] {
-        let normalizedHostname = hostname.lowercased()
-        if localProxyHostnames.contains(normalizedHostname) {
-            return hostIPv4
-        }
-        return resolver?(hostname) ?? hostIPv4
     }
 
     private static func dnsQuestionName(from query: [UInt8], offset: Int) -> String {
@@ -1001,6 +988,14 @@ public final class LinkLocalVirtIONetworkBackend: VirtIONetworkBackend {
             destinationPort: destinationPort
         )
         let isLocalHTTPProxy = destinationIP == Self.hostIPv4 && destinationPort == 80
+
+        if (flags & 0x04) != 0 {
+            // A canceled browser request must not retain its host socket or
+            // keep the vCPU network-polling path active indefinitely.
+            let transport = tcpConnections.removeValue(forKey: key)?.transport
+            transport?.cancel()
+            return []
+        }
 
         if (flags & 0x02) != 0 {
             let serverSequence = Self.serverInitialSequence(for: key)
@@ -1876,6 +1871,8 @@ public final class VirtualVirtIODevice: MMIODevice {
     private var nextTouchTrackingID: Int32 = 0
     private let gpu: VirtIOGPUDevice?
     private var pendingGPUQueueCounts: [UInt32: Int] = [:]
+    private var pendingGPUResources: [UInt64: Set<UInt32>] = [:]
+    private var nextGPUCommandToken: UInt64 = 0
 
     private static let maximumInFlightGPUCommands = 3
 
@@ -1889,6 +1886,7 @@ public final class VirtualVirtIODevice: MMIODevice {
     public private(set) var inputFramesGenerated: Int = 0
     public private(set) var inputEventsDelivered: Int = 0
     public private(set) var inputFramesDelivered: Int = 0
+    private var inputDeliveryTimes = [(frame: Int, timestamp: UInt64)?](repeating: nil, count: 128)
     public private(set) var inputQueueStarvations: Int = 0
     public var onDisplayFrameCommitted: (@Sendable (UInt64) -> Void)?
 
@@ -1898,6 +1896,15 @@ public final class VirtualVirtIODevice: MMIODevice {
 
     public var deliveredInputFrameCount: Int {
         withDeviceLock { inputFramesDelivered }
+    }
+
+    public func inputFrameDeliveryTimestamp(for frame: Int) -> UInt64? {
+        withDeviceLock {
+            guard frame > 0,
+                  let sample = inputDeliveryTimes[frame % inputDeliveryTimes.count],
+                  sample.frame == frame else { return nil }
+            return sample.timestamp
+        }
     }
 
     public var generatedInputFrameCount: Int {
@@ -2163,6 +2170,11 @@ public final class VirtualVirtIODevice: MMIODevice {
         return gpu?.diagnosticsSummary() ?? ""
     }
 
+    public var displayPerformanceCounters: [String: Double] {
+        guard kind == .gpu else { return [:] }
+        return gpu?.performanceCounters() ?? [:]
+    }
+
     public var blockRequestTypeCounts: [VirtIOBlockRequestTypeCount] {
         withDeviceLock {
             completedBlockRequestTypes
@@ -2359,11 +2371,13 @@ public final class VirtualVirtIODevice: MMIODevice {
         inputConfigSelect = 0
         inputConfigSubselect = 0
         pendingInputEvents.removeAll(keepingCapacity: true)
+        inputDeliveryTimes = .init(repeating: nil, count: inputDeliveryTimes.count)
         pendingInputReadIndex = 0
         pendingTouchMoveStart = nil
         touchContactActive = false
         nextTouchTrackingID = 0
         pendingGPUQueueCounts.removeAll(keepingCapacity: true)
+        pendingGPUResources.removeAll(keepingCapacity: true)
         gpu?.reset()
         updateInterruptLine()
     }
@@ -2431,38 +2445,46 @@ public final class VirtualVirtIODevice: MMIODevice {
                 return total + length
             }
             var request = Array(repeating: UInt8(0), count: requestLength)
-            var requestOffset = 0
-            for descriptor in requestDescriptors {
-                let count = Int(descriptor.length)
-                try memory.copyOwnedDeviceBytes(
-                    from: descriptor.address,
-                    count: count,
-                    to: &request,
-                    destinationOffset: requestOffset
-                )
-                requestOffset += count
+            try memory.copyOwnedDeviceBytes(
+                from: requestDescriptors.map {
+                    (address: $0.address, count: Int($0.length))
+                },
+                to: &request
+            )
+            let dependencies = VirtIOGPUDevice.resourceDependencies(request)
+            if !pendingGPUResources.isEmpty && (dependencies == nil ||
+                pendingGPUResources.values.contains(where: { !$0.isDisjoint(with: dependencies!) })) {
+                break
             }
+            var synchronousResponse: [UInt8]?
             if queue == VirtIOGPUDevice.controlQueue {
                 let synchronousState = state
                 state.lastAvailableIndex &+= 1
                 let deferredQueueState = state
                 queues[queue] = state
                 pendingGPUQueueCounts[queue, default: 0] += 1
-                if gpu.processDeferred(
+                nextGPUCommandToken &+= 1
+                let commandToken = nextGPUCommandToken
+                pendingGPUResources[commandToken] = dependencies ?? []
+                let dispatch = gpu.processDeferred(
                     request: request,
                     memory: memory,
                     completion: { [weak self] response in
                         self?.completeDeferredGPUCommand(
                             queue: queue,
+                            commandToken: commandToken,
                             descriptorIndex: descriptorIndex,
                             responseDescriptors: responseDescriptors,
                             queueState: deferredQueueState,
                             response: response
                         )
                     }
-                ) {
+                )
+                if case .deferred = dispatch {
                     continue
                 }
+                if case let .completed(response) = dispatch { synchronousResponse = response }
+                pendingGPUResources.removeValue(forKey: commandToken)
                 let pendingCount = pendingGPUQueueCounts[queue, default: 0]
                 if pendingCount <= 1 {
                     pendingGPUQueueCounts.removeValue(forKey: queue)
@@ -2473,7 +2495,7 @@ public final class VirtualVirtIODevice: MMIODevice {
                 state = synchronousState
             }
 
-            let response = gpu.process(request: request, memory: memory)
+            let response = synchronousResponse ?? gpu.process(request: request, memory: memory)
             var usedLength: UInt32 = 0
             if queue == VirtIOGPUDevice.controlQueue {
                 let responseCapacity = responseDescriptors.reduce(0) { $0 + Int($1.length) }
@@ -2512,13 +2534,15 @@ public final class VirtualVirtIODevice: MMIODevice {
 
     private func completeDeferredGPUCommand(
         queue: UInt32,
+        commandToken: UInt64,
         descriptorIndex: UInt16,
         responseDescriptors: [VirtIODescriptor],
         queueState: VirtIOQueueState,
         response: [UInt8]
     ) {
         withDeviceLock {
-            guard let pendingCount = pendingGPUQueueCounts[queue],
+            guard pendingGPUResources.removeValue(forKey: commandToken) != nil,
+                  let pendingCount = pendingGPUQueueCounts[queue],
                   pendingCount > 0, let memory else {
                 return
             }
@@ -2558,6 +2582,7 @@ public final class VirtualVirtIODevice: MMIODevice {
                 )
                 interruptStatus |= Self.usedBufferInterrupt
                 _ = try processGPUQueue(queue)
+                _ = try processGPUQueue(VirtIOGPUDevice.cursorQueue)
                 updateInterruptLine()
             } catch {
                 interruptStatus |= Self.usedBufferInterrupt
@@ -2622,6 +2647,9 @@ public final class VirtualVirtIODevice: MMIODevice {
             inputEventsDelivered += 1
             if event.type == 0, event.code == 0 {
                 inputFramesDelivered += 1
+                inputDeliveryTimes[inputFramesDelivered % inputDeliveryTimes.count] = (
+                    inputFramesDelivered, DispatchTime.now().uptimeNanoseconds
+                )
             }
         }
         queues[0] = state

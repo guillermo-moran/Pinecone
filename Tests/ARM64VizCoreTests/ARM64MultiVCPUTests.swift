@@ -2,6 +2,188 @@ import XCTest
 @testable import ARM64VizCore
 
 final class ARM64MultiVCPUTests: XCTestCase {
+    func testSecondaryFailureWakesHostAndIsReported() throws {
+        let machine = try MachineFactory.makeResearchMachine(
+            virtualCPUCount: 2, parallelVCPUExecution: true)
+        let cluster = try XCTUnwrap(machine.parallelVCPUCluster)
+        defer { cluster.stop() }
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        try machine.vm.loadBinary(littleEndianWords([0xffff_ffff]), at: entry)
+        machine.vm.reset(entryPoint: entry)
+        let wake = DispatchSemaphore(value: 0)
+        cluster.setHostWakeHandler { wake.signal() }
+        XCTAssertNoThrow(try cluster.checkForFailure())
+        XCTAssertTrue(machine.vm.startVirtualCPU(id: 1, entryPoint: entry, context: 0))
+        XCTAssertEqual(wake.wait(timeout: .now() + 2), .success)
+        XCTAssertThrowsError(try cluster.checkForFailure()) { error in
+            XCTAssertTrue(String(describing: error).contains("vCPU 1 failed"))
+            XCTAssertTrue(String(describing: error).contains("0xffffffff"))
+        }
+        XCTAssertEqual(cluster.secondaryExecutionTotals.fallbackSteps, 0)
+    }
+
+    func testPendingInterruptPreventsHostSleepWithoutArmedTimer() throws {
+        let machine = try MachineFactory.makeResearchMachine(virtualCPUCount: 2)
+        XCTAssertNil(machine.vm.hostTimerWaitNanoseconds)
+        machine.vm.interruptController.raise(line: 5, targetVCPU: 1)
+        XCTAssertNil(machine.vm.hostTimerWaitNanoseconds, "Another CPU's SGI must not force polling")
+        machine.vm.interruptController.raise(line: 5, targetVCPU: 0)
+        XCTAssertEqual(machine.vm.hostTimerWaitNanoseconds, 0,
+                       "An IRQ raised before the condition wait must not be lost")
+        machine.vm.interruptController.clear(line: 5, targetVCPU: 0)
+        XCTAssertNil(machine.vm.hostTimerWaitNanoseconds)
+    }
+
+    func testInterruptWakeCallbackDoesNotHoldControllerLock() {
+        for targeted in [false, true] {
+            let controller = SimpleInterruptController()
+            let readCompleted = DispatchSemaphore(value: 0)
+            controller.setWakeHandler {
+                DispatchQueue.global().async {
+                    _ = controller.peekPending(targetVCPU: targeted ? 1 : 0)
+                    readCompleted.signal()
+                }
+                XCTAssertEqual(readCompleted.wait(timeout: .now() + 1), .success,
+                               "A scheduler callback must not run under the GIC lock")
+            }
+            if targeted { controller.raise(line: 5, targetVCPU: 1) }
+            else { controller.raise(line: 5) }
+            controller.setWakeHandler(nil)
+        }
+    }
+
+    func testEnablingOrRetargetingPendingInterruptWakesScheduler() {
+        let controller = SimpleInterruptController()
+        controller.raise(line: 40)
+        XCTAssertNil(controller.peekPending(targetVCPU: 0))
+        var wakes = 0
+        controller.setWakeHandler { wakes += 1 }
+        controller.setEnabled(line: 40, enabled: true)
+        XCTAssertEqual(wakes, 1)
+        XCTAssertEqual(controller.peekPending(targetVCPU: 0), 40)
+        controller.setTargetMask(line: 40, mask: 2)
+        XCTAssertEqual(wakes, 2)
+        XCTAssertNil(controller.peekPending(targetVCPU: 0))
+        XCTAssertEqual(controller.peekPending(targetVCPU: 1), 40)
+        controller.raise(line: 20, targetVCPU: 1)
+        let beforeEnable = wakes
+        controller.setEnabled(line: 20, enabled: true, targetVCPU: 1)
+        XCTAssertEqual(wakes, beforeEnable + 1)
+        XCTAssertEqual(controller.peekPending(targetVCPU: 1), 20)
+        controller.raise(line: 21, targetVCPU: 1)
+        let beforeGlobalEnable = wakes
+        controller.setEnabled(line: 21, enabled: true)
+        XCTAssertEqual(wakes, beforeGlobalEnable + 1)
+    }
+
+    func testCompletingActiveInterruptWakesPendingReassertion() {
+        for targeted in [false, true] {
+            let controller = SimpleInterruptController()
+            if targeted { controller.raise(line: 5, targetVCPU: 1) }
+            else { controller.raise(line: 5) }
+            XCTAssertEqual(controller.acknowledge(targetVCPU: targeted ? 1 : 0), 5)
+            if targeted { controller.raise(line: 5, targetVCPU: 1) }
+            else { controller.raise(line: 5) }
+            XCTAssertNil(controller.peekPending(targetVCPU: targeted ? 1 : 0))
+            let readCompleted = DispatchSemaphore(value: 0)
+            controller.setWakeHandler {
+                DispatchQueue.global().async {
+                    XCTAssertEqual(controller.peekPending(targetVCPU: targeted ? 1 : 0), 5)
+                    readCompleted.signal()
+                }
+                XCTAssertEqual(readCompleted.wait(timeout: .now() + 1), .success)
+            }
+            controller.complete(line: 5, targetVCPU: targeted ? 1 : 0)
+            controller.setWakeHandler(nil)
+        }
+    }
+
+    func testGuestTraceDecoderHandlesSplitAndMalformedLines() {
+        var decoder = GuestGraphicsTraceDecoder()
+        XCTAssertTrue(decoder.append(Array("PINECONE_TRA".utf8)).isEmpty)
+        let events = decoder.append(Array("CE {\"event\":\"present\",\"guestUs\":42,\"apps\":[\"org.gnome.Settings\"]}\r\n".utf8))
+        XCTAssertEqual(events.first?.guestUs, 42)
+        XCTAssertEqual(events.first?.apps, ["org.gnome.Settings"])
+        XCTAssertTrue(decoder.append(Array("PINECONE_TRACE not json\n".utf8)).isEmpty)
+        XCTAssertTrue(decoder.append([UInt8](repeating: 65, count: 4096) + [10]).isEmpty)
+        XCTAssertEqual(decoder.append(Array("PINECONE_TRACE {\"event\":\"touch\",\"guestUs\":50}\n".utf8)).count, 1)
+    }
+
+    func testGuestApplicationMarkerWaitsForCompleteCRLFLine() {
+        var decoder = GuestGraphicsTraceDecoder()
+        XCTAssertTrue(decoder.appendRecords(Array("console\r\nPinecone app launch requested: sett".utf8)).isEmpty)
+        XCTAssertEqual(decoder.appendRecords(Array("ings\r\nnext\n".utf8)), [.applicationLaunch("settings")])
+        XCTAssertTrue(decoder.appendRecords([]).isEmpty)
+    }
+
+    func testHistoricalPerformanceReportDecodesWithoutNewTraceFields() throws {
+        let snapshot = VMPerformanceTimeline(startNanoseconds: 0).snapshot()
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(snapshot)) as? [String: Any])
+        json.removeValue(forKey: "interactions")
+        json.removeValue(forKey: "guestGraphics")
+        let decoded = try JSONDecoder().decode(VMPerformanceTimelineSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertTrue(decoded.interactions.isEmpty)
+        XCTAssertTrue(decoded.guestGraphics.isEmpty)
+        XCTAssertEqual(decoded.touchSampleCount, 0)
+    }
+
+    func testGuestLaunchAndPresentationPreserveUARTOrder() {
+        var decoder = GuestGraphicsTraceDecoder()
+        let frame = "PINECONE_TRACE {\"event\":\"present\",\"guestUs\":42,\"apps\":[\"org.gnome.Settings\"]}\r\n"
+        let records = decoder.appendRecords(Array((frame +
+            "Pinecone app launch requested: settings\r\n" + frame).utf8))
+        XCTAssertEqual(records.count, 3)
+        guard case .graphics = records[0], case .applicationLaunch("settings") = records[1],
+              case .graphics = records[2] else {
+            return XCTFail("Launch must not move ahead of an earlier presentation")
+        }
+    }
+
+    func testInteractionTraceIncludesPresentationAndRejectsStaleFrames() {
+        let timeline = VMPerformanceTimeline(startNanoseconds: 0) { 0 }
+        timeline.recordTouchFrame(generation: 1, queued: 1_000_000, delivered: 3_000_000)
+        timeline.recordFramePublished(generation: 1, committedAtNanoseconds: 13_000_000,
+            publishedAtNanoseconds: 14_000_000, damagedByteCount: 4)
+        XCTAssertTrue(timeline.recordFramePresented(generation: 1,
+            presentedAtNanoseconds: 20_000_000, uploadedByteCount: 4))
+        let sample = timeline.snapshot().interactions.first
+        XCTAssertEqual(sample?.queueToDeviceMilliseconds, 2)
+        XCTAssertEqual(sample?.deviceToCommitMilliseconds, 10)
+        XCTAssertEqual(sample?.commitToPublishMilliseconds, 1)
+        XCTAssertEqual(sample?.publishToPresentMilliseconds, 6)
+        XCTAssertEqual(sample?.totalMilliseconds, 19)
+        timeline.recordTouchFrame(generation: 2, queued: 21_000_000, delivered: 23_000_000)
+        timeline.recordFramePublished(generation: 2, committedAtNanoseconds: 22_000_000,
+            publishedAtNanoseconds: 24_000_000, damagedByteCount: 4)
+        XCTAssertFalse(timeline.recordFramePresented(generation: 2,
+            presentedAtNanoseconds: 25_000_000, uploadedByteCount: 4))
+        XCTAssertEqual(timeline.snapshot().interactions.count, 1)
+    }
+
+    func testPerformanceTimelineIncludesInteractionStallsButNotPreInputIdle() {
+        let timeline = VMPerformanceTimeline(startNanoseconds: 0) { 0 }
+        timeline.recordFramePresented(generation: 1, presentedAtNanoseconds: 100_000_000,
+                                      uploadedByteCount: 0)
+        timeline.recordInteractionStarted(atNanoseconds: 2_000_000_000)
+        timeline.recordFramePublished(generation: 2, committedAtNanoseconds: 5_000_000_000,
+                                      publishedAtNanoseconds: 5_000_000_000, damagedByteCount: 4)
+        timeline.recordFramePresented(generation: 2, presentedAtNanoseconds: 5_100_000_000,
+                                      uploadedByteCount: 4)
+        XCTAssertEqual(timeline.snapshot().framePipeline.presentationIntervalP95Milliseconds, 3100)
+    }
+
+    func testInteractionTraceRetainsResponsesLongerThanSchedulingBoost() {
+        let timeline = VMPerformanceTimeline(startNanoseconds: 0) { 0 }
+        timeline.recordTouchFrame(generation: 1, queued: 1_000_000, delivered: 3_000_000)
+        timeline.recordFramePublished(generation: 1, committedAtNanoseconds: 8_003_000_000,
+            publishedAtNanoseconds: 8_004_000_000, damagedByteCount: 4)
+        XCTAssertTrue(timeline.recordFramePresented(generation: 1,
+            presentedAtNanoseconds: 8_020_000_000, uploadedByteCount: 4))
+        XCTAssertEqual(timeline.snapshot().interactions.first?.deviceToCommitMilliseconds, 8000)
+        XCTAssertEqual(timeline.snapshot().interactions.first?.totalMilliseconds, 8019)
+    }
     func testPerformanceTimelineRecordsStableBootAndTouchMetrics() throws {
         let clock = TestClock(now: 1_000_000_000)
         let timeline = VMPerformanceTimeline(startNanoseconds: clock.now) { clock.now }

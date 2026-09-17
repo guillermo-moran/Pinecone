@@ -1,0 +1,78 @@
+#!/bin/sh
+# Offline image integration: run after packages and generated rcS/config files.
+set -eu
+ROOT=${1:?Usage: pinecone-network-install ROOTFS_DIR}
+[ "$ROOT" != / ] && [ -d "$ROOT/etc" ] || { echo 'Expected a staged rootfs, not /' >&2; exit 1; }
+SOURCE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+mkdir -p "$ROOT/usr/local/bin" "$ROOT/etc/NetworkManager/conf.d" \
+    "$ROOT/etc/NetworkManager/system-connections"
+install -m 0755 "$SOURCE/pinecone-network" "$ROOT/usr/local/bin/pinecone-network"
+cat >"$ROOT/etc/NetworkManager/conf.d/10-pinecone.conf" <<'EOF'
+[main]
+plugins=keyfile
+no-auto-default=*
+dns=default
+rc-manager=file
+systemd-resolved=false
+hostname-mode=none
+
+[keyfile]
+unmanaged-devices=
+
+[device-pinecone]
+match-device=interface-name:eth0
+managed=1
+keep-configuration=yes
+
+[connectivity]
+enabled=false
+EOF
+# keep-configuration adopts the matching profile without dropping early TCP
+# connections; route-metric=0 matches the bootstrap route, not NM's default.
+# IPv6 is left untouched because the virtual uplink currently provides IPv4.
+PROFILE=$ROOT/etc/NetworkManager/system-connections/pinecone-eth0.nmconnection
+(umask 077; cat >"$PROFILE" <<'EOF'
+[connection]
+id=Pinecone Internet
+uuid=8b6d0314-a69d-4f40-b1d7-dbdfe24eb671
+type=ethernet
+interface-name=eth0
+autoconnect=true
+autoconnect-priority=100
+
+[ethernet]
+
+[ipv4]
+method=manual
+address1=10.0.2.15/24
+gateway=10.0.2.2
+route-metric=0
+dns=10.0.2.3;
+dns-options=timeout:1;attempts:3;
+ignore-auto-dns=true
+may-fail=false
+
+[ipv6]
+method=ignore
+EOF
+)
+chmod 0600 "$PROFILE"
+# This machine is not an EC2/Azure/GCP guest; cloud metadata discovery is not
+# part of its static virtual Ethernet connection.
+for hook in \
+    "$ROOT/usr/lib/NetworkManager/dispatcher.d/90-nm-cloud-setup.sh" \
+    "$ROOT/usr/lib/NetworkManager/dispatcher.d/no-wait.d/90-nm-cloud-setup.sh" \
+    "$ROOT/usr/lib/NetworkManager/dispatcher.d/pre-up.d/90-nm-cloud-setup.sh"; do
+    rm -f "$hook"
+done
+# Route D-Bus activation through the same ownership lock as session startup.
+# The compact guest uses neither systemd nor an OpenRC NM service.
+if [ -x "$ROOT/usr/sbin/NetworkManager" ]; then
+    mkdir -p "$ROOT/usr/share/dbus-1/system-services"
+    cat >"$ROOT/usr/share/dbus-1/system-services/org.freedesktop.NetworkManager.service" <<'EOF'
+[D-BUS Service]
+Name=org.freedesktop.NetworkManager
+Exec=/usr/local/bin/pinecone-network daemon
+User=root
+EOF
+fi

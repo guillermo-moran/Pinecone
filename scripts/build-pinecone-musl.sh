@@ -3,10 +3,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCH="${ROOT_DIR}/scripts/patches/musl-pinecone-startup-symbol-cache.patch"
-OUTPUT_DIR="${ROOT_DIR}/artifacts/alpine-packages/pinecone-musl/aarch64"
+STATS="${PINECONE_MUSL_STARTUP_STATS_BUILD:-0}"
+case "${STATS}" in
+  0|1) ;;
+  *) echo "PINECONE_MUSL_STARTUP_STATS_BUILD must be 0 or 1" >&2; exit 2 ;;
+esac
+VARIANT="pinecone-musl"
+[[ "${STATS}" == 0 ]] || VARIANT="pinecone-musl-stats"
+OUTPUT_DIR="${PINECONE_MUSL_OUTPUT_DIR:-${ROOT_DIR}/artifacts/alpine-packages/${VARIANT}/aarch64}"
 INSTANCE="${PINECONE_MUSL_LIMA_INSTANCE:-pinecone-builder}"
 APORTS_COMMIT="${PINECONE_APORTS_COMMIT:-11bd4e3a5442ee6c0156c1a9fd290fb49b2f561a}"
-PACKAGE_VERSION="1.2.6-r6"
+PACKAGE_VERSION="1.2.6-r8"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -34,7 +41,7 @@ limactl shell "${INSTANCE}" sudo apk add --no-cache alpine-sdk bash git
 GUEST_USER="$(limactl shell "${INSTANCE}" id -un)"
 GUEST_HOME="$(limactl shell "${INSTANCE}" sh -lc 'printf %s "$HOME"')"
 GUEST_APORTS="${GUEST_HOME}/pinecone-aports"
-GUEST_BUILD="${GUEST_HOME}/pinecone-musl-build"
+GUEST_BUILD="${GUEST_HOME}/${VARIANT}-build"
 
 limactl shell "${INSTANCE}" sudo addgroup "${GUEST_USER}" abuild 2>/dev/null || true
 limactl shell "${INSTANCE}" sh -lc \
@@ -54,23 +61,32 @@ limactl shell "${INSTANCE}" rm -rf "${GUEST_BUILD}"
 limactl shell "${INSTANCE}" cp -R "${GUEST_APORTS}/main/musl" "${GUEST_BUILD}"
 limactl copy "${PATCH}" "${INSTANCE}:${GUEST_BUILD}/pinecone-startup-symbol-cache.patch"
 
-limactl shell "${INSTANCE}" sed -i 's/^pkgrel=2$/pkgrel=6/' "${GUEST_BUILD}/APKBUILD"
+limactl shell "${INSTANCE}" sed -i 's/^pkgrel=2$/pkgrel=8/' "${GUEST_BUILD}/APKBUILD"
 limactl shell "${INSTANCE}" sed -i \
   's#https://musl.libc.org/releases/#https://distfiles.alpinelinux.org/distfiles/edge/#' \
   "${GUEST_BUILD}/APKBUILD"
 limactl shell "${INSTANCE}" sed -i \
   '/CVE-2026-40200.patch/a pinecone-startup-symbol-cache.patch' \
   "${GUEST_BUILD}/APKBUILD"
+# Instrumentation is compiled out of normal packages. Enable reports separately
+# with PINECONE_MUSL_STARTUP_STATS=1 in the guest (ignored in secure execution).
+if [[ "${STATS}" == 1 ]]; then
+  limactl shell "${INSTANCE}" sed -i \
+    '/^build() {/a\
+  CFLAGS="$CFLAGS -DPINECONE_MUSL_STARTUP_STATS=1"' "${GUEST_BUILD}/APKBUILD"
+fi
 limactl shell "${INSTANCE}" sudo -u "${GUEST_USER}" -g abuild sh -lc \
-  "cd '${GUEST_BUILD}' && abuild checksum && abuild -r"
+  "cd '${GUEST_BUILD}' && abuild checksum && abuild -P '${GUEST_BUILD}/packages' -r"
 
 GUEST_PACKAGE="$(limactl shell "${INSTANCE}" sh -lc \
-  "find ~/packages -path '*/aarch64/musl-${PACKAGE_VERSION}.apk' -print -quit")"
+  "find '${GUEST_BUILD}/packages' -path '*/aarch64/musl-${PACKAGE_VERSION}.apk' -print -quit")"
 [[ -n "${GUEST_PACKAGE}" ]] || {
   echo "Pinecone musl runtime package was not produced" >&2
   exit 1
 }
+limactl shell "${INSTANCE}" apk verify "${GUEST_PACKAGE}"
 limactl copy "${INSTANCE}:${GUEST_PACKAGE}" "${OUTPUT_DIR}/"
+limactl copy "${INSTANCE}:${GUEST_PUBLIC_KEY}" "${OUTPUT_DIR}/"
 
 PACKAGE="${OUTPUT_DIR}/musl-${PACKAGE_VERSION}.apk"
 INFO="$(bsdtar -xOf "${PACKAGE}" .PKGINFO)"

@@ -1,0 +1,323 @@
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -23,6 +23,7 @@
+ )
+ 
+ sources = files(
++  'pinecone-trace.c',
+   'bling.c',
+   'bling.h',
+   'cairo-texture.c',
+--- a/src/render.h
++++ b/src/render.h
+@@ -23,6 +23,7 @@
+   PhocOutput                 *output;
+   pixman_region32_t          *damage;
+   float                       alpha;
++  const char                 *trace_app_id;
+   struct wlr_render_pass     *render_pass;
+   enum wlr_scale_filter_mode  tex_filter;
+ } PhocRenderContext;
+--- a/src/render.c
++++ b/src/render.c
+@@ -19,6 +19,7 @@
+ #include "input.h"
+ #include "layer-surface.h"
+ #include "render-private.h"
++#include "pinecone-trace.h"
+ #include "render.h"
+ #include "seat.h"
+ #include "server.h"
+@@ -218,6 +219,8 @@
+   if (!phoc_utils_is_damaged (&proj_box, ctx->damage, clip_box, &damage))
+     goto buffer_damage_finish;
+ 
++  pinecone_trace_app(output, ctx->trace_app_id);
++
+   transform = wlr_output_transform_compose (wlr_output_transform_invert (surface_transform),
+                                             output->wlr_output->transform);
+ 
+@@ -315,7 +318,11 @@
+   if (!phoc_view_is_fullscreen (view))
+     render_blings (output, view, ctx);
+ 
++  ctx->trace_app_id =
++    phoc_input_view_has_focus(phoc_server_get_input(phoc_server_get_default()), view)
++      ? phoc_view_get_app_id(view) : NULL;
+   phoc_output_view_for_each_surface (output, view, render_surface_iterator, ctx);
++  ctx->trace_app_id = NULL;
+ }
+ 
+ 
+--- a/src/cursor.c
++++ b/src/cursor.c
+@@ -10,6 +10,7 @@
+ #include "phoc-config.h"
+ #include "color-rect.h"
+ #include "cursor.h"
++#include "pinecone-trace.h"
+ #include "desktop.h"
+ #include "gesture-drag.h"
+ #include "gesture-swipe.h"
+@@ -1552,6 +1553,7 @@
+ phoc_cursor_handle_touch_down (PhocCursor                  *self,
+                                struct wlr_touch_down_event *event)
+ {
++  pinecone_trace_touch();
+   PhocServer *server = phoc_server_get_default ();
+   PhocDesktop *desktop = phoc_server_get_desktop (server);
+   PhocCursorPrivate *priv = phoc_cursor_get_instance_private (self);
+@@ -1600,6 +1602,7 @@
+ phoc_cursor_handle_touch_up (PhocCursor                *self,
+                              struct wlr_touch_up_event *event)
+ {
++  pinecone_trace_touch();
+   struct wlr_touch_point *point = wlr_seat_touch_get_point (self->seat->seat, event->touch_id);
+   PhocTouchPoint *touch_point;
+   PhocCursorPrivate *priv = phoc_cursor_get_instance_private (self);
+@@ -1638,6 +1641,7 @@
+ phoc_cursor_handle_touch_motion (PhocCursor                    *self,
+                                  struct wlr_touch_motion_event *event)
+ {
++  pinecone_trace_touch();
+   PhocDesktop *desktop = phoc_server_get_desktop (phoc_server_get_default ());
+   PhocCursorPrivate *priv = phoc_cursor_get_instance_private (self);
+   struct wlr_touch_point *point;
+--- a/src/output.c
++++ b/src/output.c
+@@ -7,6 +7,7 @@
+ #include "bling.h"
+ #include "cursor.h"
+ #include "input-method-relay.h"
++#include "input.h"
+ #include "layer-shell-effects.h"
+ #include "layer-shell.h"
+ #include "layout-transaction.h"
+@@ -14,6 +15,7 @@
+ #include "output-shield.h"
+ #include "output.h"
+ #include "render-private.h"
++#include "pinecone-trace.h"
+ #include "render.h"
+ #include "seat.h"
+ #include "server.h"
+@@ -64,6 +66,7 @@
+ 
+   struct wl_listener    damage;
+   struct wl_listener    frame;
++  struct wl_listener    trace_present;
+   struct wl_listener    needs_frame;
+   struct wl_listener    request_state;
+ 
+@@ -294,6 +297,7 @@
+ 
+   wl_list_init (&priv->damage.link);
+   wl_list_init (&priv->frame.link);
++  wl_list_init (&priv->trace_present.link);
+   wl_list_init (&priv->needs_frame.link);
+   wl_list_init (&priv->request_state.link);
+   wl_list_init (&self->commit.link);
+@@ -351,6 +355,7 @@
+   wl_list_remove (&priv->request_state.link);
+   wl_list_remove (&priv->damage.link);
+   wl_list_remove (&priv->frame.link);
++  wl_list_remove (&priv->trace_present.link);
+   wl_list_remove (&priv->needs_frame.link);
+   wl_list_remove (&self->commit.link);
+   wl_list_remove (&self->output_destroy.link);
+@@ -485,6 +490,10 @@
+ 
+   wlr_presentation_surface_scanned_out_on_output (wlr_surface, wlr_output);
+ 
++  if (phoc_input_view_has_focus(phoc_server_get_input(phoc_server_get_default()), view))
++    pinecone_trace_app(self, phoc_view_get_app_id(view));
++  pinecone_trace_submit(self);
++  pinecone_trace_commit(self);
+   return wlr_output_commit_state (wlr_output, pending);
+ }
+ 
+@@ -576,6 +586,8 @@
+ 
+   if (!needs_frame)
+     return;
++
++  pinecone_trace_begin(self, wlr_output->commit_seq + 1);
+ 
+   if (G_UNLIKELY (priv->gamma_lut_changed))
+     phoc_output_set_gamma_lut (self, &pending);
+@@ -616,6 +628,7 @@
+ 
+   pixman_region32_fini (&buffer_damage);
+ 
++  pinecone_trace_submit(self);
+   if (!wlr_render_pass_submit (render_pass)) {
+     /* Rerender in case of failure */
+     wlr_damage_ring_add_whole (&priv->damage_ring);
+@@ -626,6 +639,7 @@
+   wlr_output_state_set_buffer (&pending, buffer);
+   wlr_buffer_unlock (buffer);
+ 
++  pinecone_trace_commit(self);
+   if (!wlr_output_commit_state (wlr_output, &pending))
+     goto out;
+ 
+@@ -637,6 +651,14 @@
+     phoc_output_damage_whole (self);
+ }
+ 
++
++static void
++phoc_output_trace_present (struct wl_listener *listener, void *data)
++{
++  PhocOutputPrivate *priv = wl_container_of(listener, priv, trace_present);
++  struct wlr_output_event_present *event = data;
++  pinecone_trace_present(PHOC_OUTPUT_SELF(priv), event->commit_seq, event->presented);
++}
+ 
+ static void
+ phoc_output_handle_frame (struct wl_listener *listener, void *data)
+@@ -1042,6 +1064,8 @@
+   wl_signal_add (&self->wlr_output->events.destroy, &self->output_destroy);
+ 
+   self->commit.notify = phoc_output_handle_commit;
++  priv->trace_present.notify = phoc_output_trace_present;
++  wl_signal_add (&self->wlr_output->events.present, &priv->trace_present);
+   wl_signal_add (&self->wlr_output->events.commit, &self->commit);
+ 
+   priv->damage.notify = phoc_output_handle_damage;
+--- a/src/pinecone-trace.h
++++ b/src/pinecone-trace.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <stdint.h>
++#include <stdbool.h>
++bool pinecone_trace_enabled(void);
++void pinecone_trace_touch(void);
++void pinecone_trace_begin(void *output, uint32_t sequence);
++void pinecone_trace_app(void *output, const char *app_id);
++void pinecone_trace_submit(void *output);
++void pinecone_trace_commit(void *output);
++void pinecone_trace_present(void *output, uint32_t sequence, int presented);
+--- a/src/pinecone-trace.c
++++ b/src/pinecone-trace.c
+@@ -0,0 +1,119 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "pinecone-trace.h"
++#include <glib.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++/* Called only from Phoc's main loop. Diagnostics are bounded and opt-in.
++ * App presentation is scheduling control, independent of the trace budget.
++ * A full ring loses a sample, never attaches an old app to a new frame. */
++struct trace_frame {
++  void *output;
++  uint32_t sequence;
++  gint64 input, render, submit, commit;
++  unsigned count;
++  char apps[8][96];
++};
++static struct trace_frame frames[32];
++static struct trace_frame *active;
++static gint64 last_input;
++static int trace_fd = -1;
++static int control_fd = -1;
++static gsize initialized;
++static unsigned records;
++static gint64 last_control;
++static void *last_control_output;
++static char last_control_apps[8][96];
++
++bool pinecone_trace_enabled(void) {
++  if (g_once_init_enter(&initialized)) {
++    control_fd = open("/dev/ttyAMA0", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++    if (g_strcmp0(g_getenv("PINECONE_INTERACTION_TRACE"), "1") == 0)
++      trace_fd = open("/dev/ttyAMA0", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++    g_once_init_leave(&initialized, 1);
++  }
++  return trace_fd >= 0 && records < 8192;
++}
++
++static void emit(const char *line, size_t length) {
++  ++records;
++  /* Partial writes are deliberately not retried; the receiver rejects them. */
++  (void)write(trace_fd, line, length);
++}
++
++void pinecone_trace_touch(void) {
++  if (!pinecone_trace_enabled()) return;
++  last_input = g_get_monotonic_time();
++  char line[128];
++  int n = snprintf(line, sizeof(line), "PINECONE_TRACE {\"event\":\"touch\",\"guestUs\":%" G_GINT64_FORMAT "}\n", last_input);
++  if (n > 0 && (size_t)n < sizeof(line)) emit(line, (size_t)n);
++}
++
++void pinecone_trace_begin(void *output, uint32_t sequence) {
++  (void)pinecone_trace_enabled();
++  active = &frames[sequence % G_N_ELEMENTS(frames)];
++  *active = (struct trace_frame){ .output = output, .sequence = sequence,
++    .input = last_input, .render = g_get_monotonic_time() };
++  last_input = 0;
++}
++
++void pinecone_trace_app(void *output, const char *app_id) {
++  if (!active || active->output != output || !app_id || !*app_id) return;
++  size_t length = strlen(app_id);
++  if (length >= sizeof(active->apps[0])) return;
++  for (size_t i = 0; i < length; ++i)
++    if (!g_ascii_isalnum(app_id[i]) && !strchr("._-", app_id[i])) return;
++  for (unsigned i = 0; i < active->count; ++i)
++    if (strcmp(active->apps[i], app_id) == 0) return;
++  if (active->count < G_N_ELEMENTS(active->apps))
++    g_strlcpy(active->apps[active->count++], app_id, sizeof(active->apps[0]));
++}
++
++void pinecone_trace_submit(void *output) {
++  if (pinecone_trace_enabled() && active && active->output == output) active->submit = g_get_monotonic_time();
++}
++
++void pinecone_trace_commit(void *output) {
++  if (pinecone_trace_enabled() && active && active->output == output) active->commit = g_get_monotonic_time();
++}
++
++void pinecone_trace_present(void *output, uint32_t sequence, int presented) {
++  struct trace_frame *frame = &frames[sequence % G_N_ELEMENTS(frames)];
++  if (frame->output != output || frame->sequence != sequence) return;
++  gint64 now = g_get_monotonic_time();
++  if (presented && control_fd >= 0 && frame->count &&
++      (last_control_output != output || now - last_control >= G_USEC_PER_SEC ||
++       memcmp(last_control_apps, frame->apps, sizeof(frame->apps)) != 0)) {
++    bool complete = true;
++    for (unsigned i = 0; i < frame->count; ++i) {
++      char line[128];
++      int n = snprintf(line, sizeof(line), "\036PINECONE_APP_PRESENTED %s\n", frame->apps[i]);
++      if (n > 0 && (size_t)n < sizeof(line))
++        complete &= write(control_fd, line, (size_t)n) == n;
++    }
++    if (complete) {
++      last_control = now;
++      last_control_output = output;
++      memcpy(last_control_apps, frame->apps, sizeof(frame->apps));
++    }
++  }
++  if (pinecone_trace_enabled() && presented && frame->render && frame->submit && frame->commit) {
++    char line[1536];
++    int n = snprintf(line, sizeof(line),
++      "PINECONE_TRACE {\"event\":\"present\",\"guestUs\":%" G_GINT64_FORMAT
++      ",\"inputUs\":%" G_GINT64_FORMAT ",\"renderUs\":%" G_GINT64_FORMAT
++      ",\"submitUs\":%" G_GINT64_FORMAT ",\"commitUs\":%" G_GINT64_FORMAT
++      ",\"sequence\":%u,\"apps\":[", g_get_monotonic_time(), frame->input,
++      frame->render, frame->submit, frame->commit, sequence);
++    for (unsigned i = 0; n > 0 && (size_t)n < sizeof(line) && i < frame->count; ++i)
++      n += snprintf(line + n, sizeof(line) - (size_t)n, "%s\"%s\"", i ? "," : "", frame->apps[i]);
++    if (n > 0 && (size_t)n + 4 < sizeof(line)) {
++      memcpy(line + n, "]}\n", 3);
++      emit(line, (size_t)n + 3);
++    }
++  }
++  if (active == frame) active = NULL;
++  memset(frame, 0, sizeof(*frame));
++}

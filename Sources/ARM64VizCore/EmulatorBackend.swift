@@ -103,6 +103,13 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         session.memoryContext.invalidateTranslatedPages()
     }
 
+    public func invalidateTranslations(for vm: VirtualMachine, matching invalidation: AVZNativeTLBI) {
+        guard let session = nativeMemorySession, session.vm === vm else {
+            return
+        }
+        session.memoryContext.invalidateTranslatedPages(matching: invalidation)
+    }
+
     public func performanceSnapshot(
         unsupportedLimit: Int = 16,
         fallbackLimit: Int = 16,
@@ -1002,6 +1009,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             pstate: UInt64
         ) -> UInt64 {
             pstateBox.value = pstate
+            memoryContext.synchronizeSharedTranslations()
             let executedSteps = Int(clamping: executionSteps)
             let executedBlocks = Int(clamping: executionBlocks)
             let fault = memoryContext.translationFault
@@ -1304,6 +1312,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         var translationFault: ARM64TranslationFault?
         var blockedPinnedDeviceAccess = false
         var translationContextChanged = false
+        private var observedSharedTranslationEpoch: UInt64 = 0
         private static let outputAddressMask: UInt64 = 0x0000_ffff_ffff_f000
         private static let accessFlagBit: UInt64 = 1 << 10
         private static let readOnlyAPBit: UInt64 = 1 << 7
@@ -1329,6 +1338,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
 
         func resetTransientState() {
+            synchronizeSharedTranslations()
             translationFault = nil
             blockedPinnedDeviceAccess = false
             translationContextChanged = false
@@ -1339,6 +1349,21 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             translatedPageCache.removeAll()
             syncNativeTranslationState()
             avz_native_memory_fast_path_invalidate_translation(fastPath)
+        }
+
+        func invalidateTranslatedPages(matching invalidation: AVZNativeTLBI) {
+            translatedPageCache.removeAll()
+            syncNativeTranslationState()
+            avz_native_memory_fast_path_apply_tlbi(fastPath, invalidation)
+        }
+
+        func synchronizeSharedTranslations() {
+            let epoch = vm.memory.sharedTranslationEpoch
+            if epoch != observedSharedTranslationEpoch {
+                translatedPageCache.removeAll()
+                avz_native_memory_fast_path_synchronize_translations(fastPath)
+                observedSharedTranslationEpoch = epoch
+            }
         }
 
         @inline(__always)
@@ -1767,6 +1792,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             width: MMIOWidth,
             access: GuestMemoryAccessKind
         ) throws -> GuestAddress? {
+            synchronizeSharedTranslations()
             guard !crossesPageBoundary(virtualAddress, width: width) else {
                 return nil
             }
@@ -2779,6 +2805,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         memoryContext.resetTransientState()
         memoryContext.syncNativeTranslationState()
         let fastMemoryContext = memorySession.fastPath
+        if var clock = vm.nativeCounterClock {
+            avz_native_memory_fast_path_set_counter_clock(fastMemoryContext, &clock)
+        } else {
+            avz_native_memory_fast_path_set_counter_clock(fastMemoryContext, nil)
+        }
         var threadRegisters = AVZNativeThreadRegisterState(
             tpidr_el0: vm.systemRegisters.rawValue(for: ARM64SystemRegister.tpidrEL0),
             tpidrro_el0: vm.systemRegisters.rawValue(for: ARM64SystemRegister.tpidrroEL0),
@@ -3823,6 +3854,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
         let nativeContext = Unmanaged<NativeMemoryContext>.fromOpaque(context).takeUnretainedValue()
         let key = ARM64SystemRegisterKey(instruction: instruction)
+        nativeContext.vm.synchronizeExternalCounter()
         value.pointee = nativeContext.vm.systemRegisters.read(
             key,
             sp: sp,
@@ -3918,7 +3950,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             }
         }
 
-        nativeContext.vm.executeSystemMaintenanceInstruction(instruction)
+        nativeContext.vm.executeSystemMaintenanceInstruction(instruction, operand: operand)
         return 1
     }
 
@@ -6565,6 +6597,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         let pc = vm.cpu.pc
         let rt = Int(instruction & 0x1f)
         let key = ARM64SystemRegisterKey(instruction: instruction)
+        vm.synchronizeExternalCounter()
         let value = vm.systemRegisters.read(key, cpu: vm.cpu)
 
         writeRegister(vm, rt, value)
@@ -6599,7 +6632,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             return
         }
 
-        vm.executeSystemMaintenanceInstruction(instruction)
+        let rt = Int(instruction & 0x1f)
+        vm.executeSystemMaintenanceInstruction(
+            instruction, operand: rt == 31 ? 0 : vm.cpu.x[rt]
+        )
         vm.cpu.pc = pc + 4
     }
 

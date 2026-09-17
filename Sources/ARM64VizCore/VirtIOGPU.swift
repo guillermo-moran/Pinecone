@@ -177,6 +177,7 @@ final class VirtIOGPUDevice {
         let pixels: NativeFramebufferStorage
         var hasCompleteHostContents = false
         var pendingTransfers: [Rectangle] = []
+        var pendingExactTransfers: [Rectangle] = []
         var pendingGuestWrites: [KnownGuestWrite] = []
         var lastBackingDirtyEpoch: UInt64?
 
@@ -190,6 +191,8 @@ final class VirtIOGPUDevice {
         var stride: Int { width * 4 }
         var byteCount: Int { pixels.byteCount }
     }
+
+    private var resetEpoch: UInt64 = 0
 
     private final class NativeFramebufferStorage {
         let byteCount: Int
@@ -315,6 +318,8 @@ final class VirtIOGPUDevice {
     private var cursor: Cursor?
     private var frameSlots: [PublishedFrameSlot]
     private var committedFrame: PublishedFrameSlot
+    private var cursorFrame: PublishedFrameSlot?
+    private var cursorFrameGeneration: UInt64?
     private var committedPixels: NativeFramebufferStorage {
         committedFrame.pixels
     }
@@ -347,6 +352,8 @@ final class VirtIOGPUDevice {
     private var paravirtualAcceleratedCount: UInt64 = 0
     private var paravirtualPixelCount: UInt64 = 0
     private var acceleratedDirtyRangeCount: UInt64 = 0
+    private var nativeDirectGuestWriteCount: UInt64 = 0
+    private var nativeDirectGuestWriteByteCount: UInt64 = 0
     private var paravirtualPrepareFailureCount: UInt64 = 0
     private var paravirtualSyncFailureCount: UInt64 = 0
     private var paravirtualNativeFailureCount: UInt64 = 0
@@ -386,11 +393,14 @@ final class VirtIOGPUDevice {
 
     func reset() {
         lock.lock()
+        resetEpoch &+= 1
         resources.removeAll(keepingCapacity: true)
         graphicsAccelerator?.reset()
         scanout = nil
         committedScanout = nil
         cursor = nil
+        cursorFrame = nil
+        cursorFrameGeneration = nil
         prepareCommittedFrameForWrite()
         committedPixels.clear()
         committedGeneration &+= 1
@@ -422,6 +432,8 @@ final class VirtIOGPUDevice {
         paravirtualAcceleratedCount = 0
         paravirtualPixelCount = 0
         acceleratedDirtyRangeCount = 0
+        nativeDirectGuestWriteCount = 0
+        nativeDirectGuestWriteByteCount = 0
         paravirtualPrepareFailureCount = 0
         paravirtualSyncFailureCount = 0
         paravirtualNativeFailureCount = 0
@@ -457,11 +469,49 @@ final class VirtIOGPUDevice {
             " pv2d=\(paravirtualCommandCount)/\(paravirtualAcceleratedCount)" +
             ":\(paravirtualPixelCount)/b\(paravirtualBatchCount)" +
             "/m\(acceleratedDirtyRangeCount)" +
+            "/n\(nativeDirectGuestWriteCount):\(nativeDirectGuestWriteByteCount)" +
             " err=\(paravirtualPrepareFailureCount)/" +
             "\(paravirtualSyncFailureCount)/" +
             "\(paravirtualNativeFailureCount)/" +
             "\(paravirtualFinishFailureCount):\(lastParavirtualFailure)" +
             " tr=\(lastTransferSummary) fl=\(lastFlushSummary)"
+    }
+
+    func performanceCounters() -> [String: Double] {
+        lock.lock()
+        defer { lock.unlock() }
+        return [
+            "transferCommands": Double(transferCommandCount),
+            "flushCommands": Double(flushCommandCount),
+            "transferredBytes": Double(transferredByteCount),
+            "committedBytes": Double(committedByteCount),
+            "frameCopyOnWriteCount": Double(frameCopyOnWriteCount),
+            "frameCopyOnWriteBytes": Double(frameCopyOnWriteByteCount),
+            "snapshotCopies": Double(snapshotCopyCount),
+            "commandLockWaitP95Milliseconds": Self.percentileMilliseconds(
+                commandLockWaitNanoseconds
+            ),
+            "commandLockHoldP95Milliseconds": Self.percentileMilliseconds(
+                commandLockHoldNanoseconds
+            ),
+            "dirtyTileScans": Double(dirtyTileScanCount),
+            "unchangedFlushes": Double(unchangedFlushCount),
+            "dirtyTileChangedBytes": Double(dirtyTileChangedByteCount),
+            "backingCopiedBytes": Double(backingCopiedByteCount),
+            "cleanBackingSkippedBytes": Double(cleanBackingSkippedByteCount),
+            "exactGuestWrites": Double(exactGuestWriteCount),
+            "exactGuestWriteBytes": Double(exactGuestWriteByteCount),
+            "paravirtualCommands": Double(paravirtualCommandCount),
+            "paravirtualBatches": Double(paravirtualBatchCount),
+            "paravirtualAcceleratedCommands": Double(paravirtualAcceleratedCount),
+            "paravirtualPixels": Double(paravirtualPixelCount),
+            "nativeDirectGuestWrites": Double(nativeDirectGuestWriteCount),
+            "nativeDirectGuestWriteBytes": Double(nativeDirectGuestWriteByteCount),
+            "paravirtualPrepareFailures": Double(paravirtualPrepareFailureCount),
+            "paravirtualSynchronizationFailures": Double(paravirtualSyncFailureCount),
+            "paravirtualNativeFailures": Double(paravirtualNativeFailureCount),
+            "paravirtualFinishFailures": Double(paravirtualFinishFailureCount),
+        ]
     }
 
     func metadata(afterGeneration previousGeneration: UInt64?) -> VirtualFramebufferFrameMetadata? {
@@ -512,17 +562,8 @@ final class VirtIOGPUDevice {
             return lease
         }
 
-        let composited = compositedPixels()
-        let storage = NativeFramebufferStorage(byteCount: width * height * 4)
-        storage.withUnsafeMutableBytes { destination in
-            composited.withUnsafeBytes { source in
-                destination.baseAddress?.copyMemory(
-                    from: source.baseAddress!,
-                    byteCount: composited.count
-                )
-            }
-        }
-        snapshotCopyCount &+= 1
+        let slot = prepareCursorFrame()
+        slot.leaseCount += 1
         let leasedMetadata = VirtualFramebufferFrameMetadata(
             width: metadata.width,
             height: metadata.height,
@@ -531,13 +572,22 @@ final class VirtIOGPUDevice {
             generation: metadata.generation,
             commitTimestampNanoseconds: metadata.commitTimestampNanoseconds,
             damage: metadata.damage,
-            hasStableStorage: true
+            // The cursor surface is incrementally rewritten on the next frame.
+            // Consumers must copy damaged regions during the lease callback.
+            hasStableStorage: false
         )
         let lease = VirtualFramebufferFrameLease(
             metadata: leasedMetadata,
-            storageOwner: storage,
-            baseAddress: storage.unsafeBaseAddress,
-            byteCount: storage.allocationByteCount
+            storageOwner: slot.pixels,
+            baseAddress: slot.pixels.unsafeBaseAddress,
+            byteCount: slot.pixels.allocationByteCount,
+            releaseHandler: { [weak self, weak slot] in
+                guard let self, let slot else { return }
+                self.lock.lock()
+                precondition(slot.leaseCount > 0)
+                slot.leaseCount -= 1
+                self.lock.unlock()
+            }
         )
         lock.unlock()
         return lease
@@ -636,6 +686,109 @@ final class VirtIOGPUDevice {
         frameCopyOnWriteCount &+= 1
         frameCopyOnWriteByteCount &+= UInt64(committedFrame.pixels.byteCount)
         committedFrame = nextFrame
+    }
+
+    private func prepareCursorFrame() -> PublishedFrameSlot {
+        let fullFrame = Rectangle(x: 0, y: 0, width: width, height: height)
+        let previousFrame = cursorFrame
+        let frame: PublishedFrameSlot
+        if let previousFrame, previousFrame.leaseCount == 0 {
+            frame = previousFrame
+        } else {
+            frame = PublishedFrameSlot(byteCount: width * height * 4)
+            if let previousFrame {
+                frame.pixels.copyContents(from: previousFrame.pixels)
+                frameCopyOnWriteCount &+= 1
+                frameCopyOnWriteByteCount &+= UInt64(frame.pixels.byteCount)
+            }
+            cursorFrame = frame
+        }
+
+        let damage: [Rectangle]
+        if cursorFrameGeneration == nil {
+            damage = [fullFrame]
+        } else if cursorFrameGeneration == committedGeneration {
+            return frame
+        } else if let metadata = frameMetadata(afterGeneration: cursorFrameGeneration) {
+            damage = metadata.damage.map {
+                Rectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            }
+        } else {
+            damage = [fullFrame]
+        }
+
+        for rectangle in damage {
+            copyFramebufferRectangle(
+                rectangle,
+                from: committedPixels,
+                into: frame.pixels
+            )
+        }
+        compositeCursor(into: frame.pixels, damage: damage)
+        cursorFrameGeneration = committedGeneration
+        return frame
+    }
+
+    private func copyFramebufferRectangle(
+        _ rectangle: Rectangle,
+        from source: NativeFramebufferStorage,
+        into destination: NativeFramebufferStorage
+    ) {
+        guard !rectangle.isEmpty else { return }
+        source.withUnsafeBytes { sourceBytes in
+            destination.withUnsafeMutableBytes { destinationBytes in
+                let copied = avz_framebuffer_copy_bgra8(
+                    sourceBytes.baseAddress,
+                    width * 4,
+                    rectangle.x,
+                    rectangle.y,
+                    destinationBytes.baseAddress,
+                    width * 4,
+                    rectangle.x,
+                    rectangle.y,
+                    rectangle.width,
+                    rectangle.height
+                )
+                precondition(copied != 0, "invalid native framebuffer copy")
+            }
+        }
+    }
+
+    private func compositeCursor(
+        into destination: NativeFramebufferStorage,
+        damage: [Rectangle]
+    ) {
+        guard let cursor, let resource = resources[cursor.resourceID] else { return }
+        let originX = cursor.x - cursor.hotX
+        let originY = cursor.y - cursor.hotY
+        let cursorBounds = Rectangle(
+            x: originX,
+            y: originY,
+            width: resource.width,
+            height: resource.height
+        )
+        for rectangle in damage {
+            guard let visible = rectangle.intersection(cursorBounds)?.intersection(
+                Rectangle(x: 0, y: 0, width: width, height: height)
+            ) else { continue }
+            let blended = resource.pixels.withUnsafeBytes { sourceBytes in
+                destination.withUnsafeMutableBytes { destinationBytes in
+                    avz_framebuffer_source_over_bgra8(
+                        sourceBytes.baseAddress,
+                        resource.stride,
+                        visible.x - originX,
+                        visible.y - originY,
+                        destinationBytes.baseAddress,
+                        width * 4,
+                        visible.x,
+                        visible.y,
+                        visible.width,
+                        visible.height
+                    )
+                }
+            }
+            precondition(blended != 0, "invalid native cursor composition")
+        }
     }
 
     private static func compactDamageRectangles(
@@ -809,14 +962,65 @@ final class VirtIOGPUDevice {
     /// until the host GPU completes. The completion response is delivered only
     /// after Metal writes are CPU-visible, so the virtqueue used-ring entry is
     /// also the guest-visible fence.
+    // Nil is a conservative device-wide dependency for unknown/malformed commands.
+    static func resourceDependencies(_ request: [UInt8]) -> Set<UInt32>? {
+        guard request.count >= Header.byteCount,
+              let command = Command(rawValue: readLE32(request, at: 0)) else { return nil }
+        let offset: Int
+        switch command {
+        case .getDisplayInfo: return []
+        case .resourceCreate2D, .resourceUnref, .resourceAttachBacking, .resourceDetachBacking:
+            offset = 24
+        case .resourceFlush: offset = 40
+        case .transferToHost2D: offset = 48
+        case .setScanout: offset = 44
+        case .updateCursor, .moveCursor: return nil
+        case .submit3D:
+            guard request.count >= 48,
+                  readLE32(request, at: 32) == PineconeGraphicsProtocol.magic else { return nil }
+            let version = readLE16(request, at: 36)
+            var offsets = [32]
+            if version == PineconeGraphicsProtocol.batchVersion {
+                let count = Int(readLE16(request, at: 38))
+                guard count > 0, count <= PineconeGraphicsProtocol.maximumBatchCommandCount,
+                      Int(readLE16(request, at: 40)) == PineconeGraphicsProtocol.batchRecordByteCount
+                else { return nil }
+                offsets = (0..<count).map { 48 + $0 * PineconeGraphicsProtocol.batchRecordByteCount }
+            } else if version != PineconeGraphicsProtocol.version &&
+                        version != PineconeGraphicsProtocol.exactCompositeVersion { return nil }
+            var resources = Set<UInt32>()
+            for start in offsets {
+                guard request.count >= start + PineconeGraphicsProtocol.payloadByteCount else { return nil }
+                for field in [12, 16, 56] {
+                    let id = readLE32(request, at: start + field)
+                    if id != 0 { resources.insert(id) }
+                }
+            }
+            return resources
+        }
+        guard request.count >= offset + 4 else { return nil }
+        return [readLE32(request, at: offset)]
+    }
+
+    enum DispatchResult {
+        case unhandled
+        case completed([UInt8])
+        case deferred
+
+        var isDeferred: Bool {
+            if case .deferred = self { return true }
+            return false
+        }
+    }
+
     func processDeferred(
         request: [UInt8],
         memory: PhysicalMemory,
         completion: @escaping @Sendable ([UInt8]) -> Void
-    ) -> Bool {
+    ) -> DispatchResult {
         guard request.count >= Header.byteCount,
               Command(rawValue: Self.readLE32(request, at: 0)) == .submit3D else {
-            return false
+            return .unhandled
         }
         let header = Header(
             flags: Self.readLE32(request, at: 4),
@@ -828,6 +1032,7 @@ final class VirtIOGPUDevice {
         let initialLockWaitStarted = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         let initialLockAcquired = DispatchTime.now().uptimeNanoseconds
+        let submissionEpoch = resetEpoch
         Self.appendTiming(
             initialLockAcquired &- initialLockWaitStarted,
             to: &commandLockWaitNanoseconds
@@ -840,15 +1045,23 @@ final class VirtIOGPUDevice {
                 recordParavirtualFailure(.prepare, prepared: nil)
                 throw error
             }
+            let workItems = paravirtual2DWorkItems(prepared)
+            guard let graphicsAccelerator, graphicsAccelerator.acceptsBatch(workItems) else {
+                let response = try executeParavirtual2D(
+                    prepared, header: header, memory: memory, allowAccelerator: false
+                )
+                Self.appendTiming(DispatchTime.now().uptimeNanoseconds &- initialLockAcquired,
+                                  to: &commandLockHoldNanoseconds)
+                lock.unlock()
+                return .completed(response)
+            }
             do {
                 try synchronizeParavirtual2DInputs(prepared, memory: memory)
             } catch {
                 recordParavirtualFailure(.synchronize, prepared: prepared)
                 throw error
             }
-            let workItems = paravirtual2DWorkItems(prepared)
-            guard let graphicsAccelerator,
-                  graphicsAccelerator.executeBatchAsync(
+            guard graphicsAccelerator.executeBatchAsync(
                     workItems,
                     completion: { [weak self] succeeded in
                         guard let self else {
@@ -857,6 +1070,11 @@ final class VirtIOGPUDevice {
                         }
                         let completionLockWaitStarted = DispatchTime.now().uptimeNanoseconds
                         self.lock.lock()
+                        guard self.resetEpoch == submissionEpoch else {
+                            self.lock.unlock()
+                            completion([])
+                            return
+                        }
                         let completionLockAcquired = DispatchTime.now().uptimeNanoseconds
                         Self.appendTiming(
                             completionLockAcquired &- completionLockWaitStarted,
@@ -907,26 +1125,33 @@ final class VirtIOGPUDevice {
                         completion(response)
                     }
                   ) else {
+                let response = try executeParavirtual2D(
+                    prepared, header: header, memory: memory, allowAccelerator: false,
+                    inputsAlreadySynchronized: true
+                )
                 Self.appendTiming(
                     DispatchTime.now().uptimeNanoseconds &- initialLockAcquired,
                     to: &commandLockHoldNanoseconds
                 )
                 lock.unlock()
-                return false
+                return .completed(response)
             }
             Self.appendTiming(
                 DispatchTime.now().uptimeNanoseconds &- initialLockAcquired,
                 to: &commandLockHoldNanoseconds
             )
             lock.unlock()
-            return true
+            return .deferred
         } catch {
             Self.appendTiming(
                 DispatchTime.now().uptimeNanoseconds &- initialLockAcquired,
                 to: &commandLockHoldNanoseconds
             )
             lock.unlock()
-            return false
+            let response = responseHeader(
+                (error as? GPUError)?.response ?? .errorUnspecified, requestHeader: header
+            )
+            return .completed(response)
         }
     }
 
@@ -1042,6 +1267,7 @@ final class VirtIOGPUDevice {
         resource.backing = entries
         resource.hasCompleteHostContents = false
         resource.pendingTransfers.removeAll(keepingCapacity: true)
+        resource.pendingExactTransfers.removeAll(keepingCapacity: true)
         resource.pendingGuestWrites.removeAll(keepingCapacity: true)
         resource.lastBackingDirtyEpoch = nil
         return responseHeader(.okNoData, requestHeader: header)
@@ -1056,6 +1282,7 @@ final class VirtIOGPUDevice {
         resource.backing.removeAll(keepingCapacity: true)
         resource.hasCompleteHostContents = false
         resource.pendingTransfers.removeAll(keepingCapacity: true)
+        resource.pendingExactTransfers.removeAll(keepingCapacity: true)
         resource.pendingGuestWrites.removeAll(keepingCapacity: true)
         resource.lastBackingDirtyEpoch = nil
         return responseHeader(.okNoData, requestHeader: header)
@@ -1166,6 +1393,9 @@ final class VirtIOGPUDevice {
                 dirtyPageTransferCount &+= 1
                 exactGuestWriteCount &+= UInt64(knownWrites.count)
                 exactGuestWriteByteCount &+= UInt64(knownByteCount)
+                resource.pendingExactTransfers.append(
+                    contentsOf: knownWrites.map(\.rectangle)
+                )
                 cleanBackingSkippedByteCount &+= UInt64(
                     max(0, nominalByteCount - copiedByteCount)
                 )
@@ -1631,19 +1861,26 @@ final class VirtIOGPUDevice {
     private func executeParavirtual2D(
         _ prepared: [PreparedParavirtual2D],
         header: Header,
-        memory: PhysicalMemory
+        memory: PhysicalMemory,
+        allowAccelerator: Bool = true,
+        inputsAlreadySynchronized: Bool = false
     ) throws -> [UInt8] {
-        do {
-            try synchronizeParavirtual2DInputs(prepared, memory: memory)
-        } catch {
-            recordParavirtualFailure(.synchronize, prepared: prepared)
-            throw error
-        }
         let workItems = paravirtual2DWorkItems(prepared)
-        let accelerated = graphicsAccelerator?.executeBatch(workItems) ?? false
+        var accelerated = false
+        var inputsReady = inputsAlreadySynchronized
+        if allowAccelerator, let graphicsAccelerator,
+           graphicsAccelerator.acceptsBatch(workItems) {
+            try synchronizeParavirtual2DInputs(prepared, memory: memory)
+            inputsReady = true
+            accelerated = graphicsAccelerator.executeBatch(workItems)
+        }
 
         if !accelerated {
             for item in prepared {
+                // Native operations complete in order, so later reads see earlier writes.
+                if !inputsReady {
+                    try synchronizeParavirtual2DInputs([item], memory: memory)
+                }
                 if let source = item.source,
                    let rectangle = item.sourceRectangle,
                    item.sourceSurface?.isGuestMemory == true {
@@ -1653,14 +1890,6 @@ final class VirtIOGPUDevice {
                         from: memory,
                         preserveAlpha: item.sourceContainsAlpha,
                         packedA8: item.command.sourceIsPackedA8
-                    )
-                }
-                if item.destinationSurface.isGuestMemory {
-                    try synchronizeResource(
-                        item.destination,
-                        rectangle: item.destinationRectangle,
-                        from: memory,
-                        packedA8: item.command.destinationIsPackedA8
                     )
                 }
                 if let mask = item.mask,
@@ -1675,12 +1904,7 @@ final class VirtIOGPUDevice {
                     )
                 }
                 do {
-                    try executeParavirtual2DInNativeCore(
-                        item.command,
-                        source: item.source,
-                        mask: item.mask,
-                        destination: item.destination
-                    )
+                    try executeParavirtual2DInNativeCore(item)
                 } catch {
                     recordParavirtualFailure(.native, prepared: [item])
                     throw error
@@ -1712,36 +1936,41 @@ final class VirtIOGPUDevice {
         _ prepared: [PreparedParavirtual2D],
         memory: PhysicalMemory
     ) throws {
+        // This cache is deliberately submission-local: guest writes between
+        // commands require a fresh read, without guessing at their generation.
+        var synchronized: [ObjectIdentifier: (alpha: Bool, a8: Bool, regions: [Rectangle])] = [:]
+        func synchronizeOnce(_ resource: Resource, _ rectangle: Rectangle,
+                             alpha: Bool = false, a8: Bool = false) throws {
+            let key = ObjectIdentifier(resource)
+            let previous = synchronized[key]
+            let covered = previous?.alpha == alpha && previous?.a8 == a8
+                ? previous!.regions : []
+            let missing = covered.reduce([rectangle]) { regions, cover in
+                regions.flatMap { $0.subtracting(cover) }
+            }
+            for region in missing {
+                try synchronizeResource(resource, rectangle: region, from: memory,
+                                        preserveAlpha: alpha, packedA8: a8)
+            }
+            synchronized[key] = (alpha, a8, covered + missing)
+        }
         for item in prepared {
             if let source = item.source,
                let rectangle = item.sourceRectangle,
                item.sourceSurface?.isGuestMemory == false {
-                try synchronizeResource(
-                    source,
-                    rectangle: rectangle,
-                    from: memory,
-                    preserveAlpha: item.sourceContainsAlpha,
-                    packedA8: item.command.sourceIsPackedA8
-                )
+                try synchronizeOnce(source, rectangle, alpha: item.sourceContainsAlpha,
+                                    a8: item.command.sourceIsPackedA8)
             }
-            if !item.destinationSurface.isGuestMemory {
-                try synchronizeResource(
-                    item.destination,
-                    rectangle: item.destinationRectangle,
-                    from: memory,
-                    packedA8: item.command.destinationIsPackedA8
-                )
+            if !item.destinationSurface.isGuestMemory,
+               item.command.blendOperator != .source,
+               item.command.blendOperator != .clear {
+                try synchronizeOnce(item.destination, item.destinationRectangle,
+                                    a8: item.command.destinationIsPackedA8)
             }
             if let mask = item.mask,
                let rectangle = item.maskRectangle,
                item.maskSurface?.isGuestMemory == false {
-                try synchronizeResource(
-                    mask,
-                    rectangle: rectangle,
-                    from: memory,
-                    preserveAlpha: true,
-                    packedA8: item.command.maskIsPackedA8
-                )
+                try synchronizeOnce(mask, rectangle, alpha: true, a8: item.command.maskIsPackedA8)
             }
         }
     }
@@ -1765,8 +1994,7 @@ final class VirtIOGPUDevice {
         memory: PhysicalMemory
     ) throws {
         let destinationWasComplete = item.destination.hasCompleteHostContents
-        let directlyUpdatedGuestMemory = accelerated &&
-            item.destinationSurface.isGuestMemory
+        let directlyUpdatedGuestMemory = item.destinationSurface.isGuestMemory
         if directlyUpdatedGuestMemory {
             noteDirectGuestWrite(
                 item.destination,
@@ -1774,7 +2002,16 @@ final class VirtIOGPUDevice {
                 packedA8: item.command.destinationIsPackedA8,
                 memory: memory
             )
-            acceleratedDirtyRangeCount &+= 1
+            if accelerated {
+                acceleratedDirtyRangeCount &+= 1
+            } else {
+                nativeDirectGuestWriteCount &+= 1
+                nativeDirectGuestWriteByteCount &+= UInt64(
+                    item.destinationRectangle.width *
+                    item.destinationRectangle.height *
+                    (item.command.destinationIsPackedA8 ? 1 : 4)
+                )
+            }
         } else {
             try copyResourceBytesToBacking(
                 item.destination,
@@ -1864,257 +2101,168 @@ final class VirtIOGPUDevice {
     }
 
     private func executeParavirtual2DInNativeCore(
-        _ command: PineconeGraphicsCommand,
-        source: Resource?,
-        mask: Resource?,
-        destination: Resource
+        _ item: PreparedParavirtual2D
     ) throws {
+        let command = item.command
         let rectangle = command.destinationRectangle
+        let sourceSurface = item.source.map {
+            $0.pixels.acceleratorSurface(
+                resourceID: command.sourceResourceID,
+                width: $0.width,
+                height: $0.height,
+                pixelFormat: Self.paravirtualPixelFormat($0.format)!
+            )
+        }
+        let maskSurface = item.mask.map {
+            $0.pixels.acceleratorSurface(
+                resourceID: command.maskResourceID,
+                width: $0.width,
+                height: $0.height,
+                pixelFormat: Self.paravirtualPixelFormat($0.format)!
+            )
+        }
+        let destinationSurface = item.destinationSurface.surface
+        let sourceBytes = sourceSurface?.bytes.baseAddress
+        let maskBytes = maskSurface?.bytes.baseAddress
+        let destinationBytes = destinationSurface.bytes.baseAddress
         let result: Int32
         if command.componentAlphaMask || command.maskIsPackedA8 ||
             command.sourceIsPackedA8 || command.destinationIsPackedA8 ||
             (command.blendOperator != .sourceOver &&
              command.blendOperator != .source) {
-            func executeGeneric(
-                sourceBytes: UnsafeRawBufferPointer?,
-                maskBytes: UnsafeRawBufferPointer?
-            ) -> Int32 {
-                destination.pixels.withUnsafeMutableBytes { destinationBytes in
-                    avz_framebuffer_composite_bgra8(
-                        sourceBytes?.baseAddress,
-                        source?.stride ?? 0,
-                        command.sourceX,
-                        command.sourceY,
-                        command.sourceWidth,
-                        command.sourceHeight,
-                        maskBytes?.baseAddress,
-                        mask?.stride ?? 0,
-                        command.maskAlpha ?? UInt8.max,
-                        destinationBytes.baseAddress,
-                        destination.stride,
-                        rectangle.x,
-                        rectangle.y,
-                        rectangle.width,
-                        rectangle.height,
-                        command.color,
-                        UInt32(command.blendOperator.rawValue),
-                        command.sourceIsSolid ? 1 : 0,
-                        command.usesBilinearFiltering ? 1 : 0,
-                        command.componentAlphaMask ? 1 : 0,
-                        command.maskIsPackedA8 ? 1 : 0,
-                        command.sourceIsPackedA8 ? 1 : 0,
-                        command.destinationIsPackedA8 ? 1 : 0
-                    )
-                }
-            }
-            func executeWithMask(
-                sourceBytes: UnsafeRawBufferPointer?
-            ) -> Int32 {
-                if let mask {
-                    return mask.pixels.withUnsafeBytes {
-                        executeGeneric(sourceBytes: sourceBytes, maskBytes: $0)
-                    }
-                }
-                return executeGeneric(sourceBytes: sourceBytes, maskBytes: nil)
-            }
-            if let source {
-                result = source.pixels.withUnsafeBytes {
-                    executeWithMask(sourceBytes: $0)
-                }
-            } else {
-                result = executeWithMask(sourceBytes: nil)
-            }
-        } else if mask != nil || command.maskAlpha != nil {
-            func executeMasked(
-                sourceBytes: UnsafeRawBufferPointer?,
-                maskBytes: UnsafeRawBufferPointer?
-            ) -> Int32 {
-                destination.pixels.withUnsafeMutableBytes { destinationBytes in
-                    avz_framebuffer_masked_composite_bgra8(
-                        sourceBytes?.baseAddress,
-                        source?.stride ?? 0,
-                        command.sourceX,
-                        command.sourceY,
-                        command.sourceWidth,
-                        command.sourceHeight,
-                        maskBytes?.baseAddress,
-                        mask?.stride ?? 0,
-                        command.maskAlpha ?? UInt8.max,
-                        destinationBytes.baseAddress,
-                        destination.stride,
-                        rectangle.x,
-                        rectangle.y,
-                        rectangle.width,
-                        rectangle.height,
-                        command.color,
-                        UInt32(command.operation.rawValue),
-                        command.usesBilinearFiltering ? 1 : 0
-                    )
-                }
-            }
-            func executeWithMask(
-                sourceBytes: UnsafeRawBufferPointer?
-            ) -> Int32 {
-                if let mask {
-                    return mask.pixels.withUnsafeBytes {
-                        executeMasked(sourceBytes: sourceBytes, maskBytes: $0)
-                    }
-                }
-                return executeMasked(sourceBytes: sourceBytes, maskBytes: nil)
-            }
-            if let source {
-                result = source.pixels.withUnsafeBytes {
-                    executeWithMask(sourceBytes: $0)
-                }
-            } else {
-                result = executeWithMask(sourceBytes: nil)
-            }
+            result = avz_framebuffer_composite_bgra8(
+                sourceBytes,
+                sourceSurface?.stride ?? 0,
+                command.sourceX,
+                command.sourceY,
+                command.sourceWidth,
+                command.sourceHeight,
+                maskBytes,
+                maskSurface?.stride ?? 0,
+                command.maskAlpha ?? UInt8.max,
+                destinationBytes,
+                destinationSurface.stride,
+                rectangle.x,
+                rectangle.y,
+                rectangle.width,
+                rectangle.height,
+                command.color,
+                UInt32(command.blendOperator.rawValue),
+                command.sourceIsSolid ? 1 : 0,
+                command.usesBilinearFiltering ? 1 : 0,
+                command.componentAlphaMask ? 1 : 0,
+                command.maskIsPackedA8 ? 1 : 0,
+                command.sourceIsPackedA8 ? 1 : 0,
+                command.destinationIsPackedA8 ? 1 : 0
+            )
+        } else if maskSurface != nil || command.maskAlpha != nil {
+            result = avz_framebuffer_masked_composite_bgra8(
+                sourceBytes,
+                sourceSurface?.stride ?? 0,
+                command.sourceX,
+                command.sourceY,
+                command.sourceWidth,
+                command.sourceHeight,
+                maskBytes,
+                maskSurface?.stride ?? 0,
+                command.maskAlpha ?? UInt8.max,
+                destinationBytes,
+                destinationSurface.stride,
+                rectangle.x,
+                rectangle.y,
+                rectangle.width,
+                rectangle.height,
+                command.color,
+                UInt32(command.operation.rawValue),
+                command.usesBilinearFiltering ? 1 : 0
+            )
         } else { switch command.operation {
         case .source:
-            guard let source else {
+            guard let sourceSurface, let sourceBytes else {
                 throw GPUError.response(.errorInvalidParameter)
             }
-            result = source.pixels.withUnsafeBytes { sourceBytes in
-                destination.pixels.withUnsafeMutableBytes { destinationBytes in
-                    if command.usesBilinearFiltering {
-                        avz_framebuffer_bilinear_scale_copy_bgra8(
-                            sourceBytes.baseAddress,
-                            source.stride,
-                            command.sourceX,
-                            command.sourceY,
-                            command.sourceWidth,
-                            command.sourceHeight,
-                            destinationBytes.baseAddress,
-                            destination.stride,
-                            rectangle.x,
-                            rectangle.y,
-                            rectangle.width,
-                            rectangle.height
-                        )
-                    } else if command.sourceWidth == rectangle.width,
-                       command.sourceHeight == rectangle.height {
-                        avz_framebuffer_copy_bgra8(
-                            sourceBytes.baseAddress,
-                            source.stride,
-                            command.sourceX,
-                            command.sourceY,
-                            destinationBytes.baseAddress,
-                            destination.stride,
-                            rectangle.x,
-                            rectangle.y,
-                            rectangle.width,
-                            rectangle.height
-                        )
-                    } else {
-                        avz_framebuffer_scale_copy_bgra8(
-                            sourceBytes.baseAddress,
-                            source.stride,
-                            command.sourceX,
-                            command.sourceY,
-                            command.sourceWidth,
-                            command.sourceHeight,
-                            destinationBytes.baseAddress,
-                            destination.stride,
-                            rectangle.x,
-                            rectangle.y,
-                            rectangle.width,
-                            rectangle.height
-                        )
-                    }
-                }
+            if command.usesBilinearFiltering {
+                result = avz_framebuffer_bilinear_scale_copy_bgra8(
+                    sourceBytes, sourceSurface.stride,
+                    command.sourceX, command.sourceY,
+                    command.sourceWidth, command.sourceHeight,
+                    destinationBytes, destinationSurface.stride,
+                    rectangle.x, rectangle.y, rectangle.width, rectangle.height
+                )
+            } else if command.sourceWidth == rectangle.width,
+                      command.sourceHeight == rectangle.height {
+                result = avz_framebuffer_copy_bgra8(
+                    sourceBytes, sourceSurface.stride,
+                    command.sourceX, command.sourceY,
+                    destinationBytes, destinationSurface.stride,
+                    rectangle.x, rectangle.y, rectangle.width, rectangle.height
+                )
+            } else {
+                result = avz_framebuffer_scale_copy_bgra8(
+                    sourceBytes, sourceSurface.stride,
+                    command.sourceX, command.sourceY,
+                    command.sourceWidth, command.sourceHeight,
+                    destinationBytes, destinationSurface.stride,
+                    rectangle.x, rectangle.y, rectangle.width, rectangle.height
+                )
             }
         case .sourceOver:
-            guard let source else {
+            guard let sourceSurface, let sourceBytes else {
                 throw GPUError.response(.errorInvalidParameter)
             }
-            result = source.pixels.withUnsafeBytes { sourceBytes in
-                destination.pixels.withUnsafeMutableBytes { destinationBytes in
-                    if command.usesBilinearFiltering {
-                        avz_framebuffer_bilinear_scale_source_over_bgra8(
-                            sourceBytes.baseAddress,
-                            source.stride,
-                            command.sourceX,
-                            command.sourceY,
-                            command.sourceWidth,
-                            command.sourceHeight,
-                            destinationBytes.baseAddress,
-                            destination.stride,
-                            rectangle.x,
-                            rectangle.y,
-                            rectangle.width,
-                            rectangle.height
-                        )
-                    } else if command.sourceWidth == rectangle.width,
-                       command.sourceHeight == rectangle.height {
-                        avz_framebuffer_source_over_bgra8(
-                            sourceBytes.baseAddress,
-                            source.stride,
-                            command.sourceX,
-                            command.sourceY,
-                            destinationBytes.baseAddress,
-                            destination.stride,
-                            rectangle.x,
-                            rectangle.y,
-                            rectangle.width,
-                            rectangle.height
-                        )
-                    } else {
-                        avz_framebuffer_scale_source_over_bgra8(
-                            sourceBytes.baseAddress,
-                            source.stride,
-                            command.sourceX,
-                            command.sourceY,
-                            command.sourceWidth,
-                            command.sourceHeight,
-                            destinationBytes.baseAddress,
-                            destination.stride,
-                            rectangle.x,
-                            rectangle.y,
-                            rectangle.width,
-                            rectangle.height
-                        )
-                    }
-                }
+            if command.usesBilinearFiltering {
+                result = avz_framebuffer_bilinear_scale_source_over_bgra8(
+                    sourceBytes, sourceSurface.stride,
+                    command.sourceX, command.sourceY,
+                    command.sourceWidth, command.sourceHeight,
+                    destinationBytes, destinationSurface.stride,
+                    rectangle.x, rectangle.y, rectangle.width, rectangle.height
+                )
+            } else if command.sourceWidth == rectangle.width,
+                      command.sourceHeight == rectangle.height {
+                result = avz_framebuffer_source_over_bgra8(
+                    sourceBytes, sourceSurface.stride,
+                    command.sourceX, command.sourceY,
+                    destinationBytes, destinationSurface.stride,
+                    rectangle.x, rectangle.y, rectangle.width, rectangle.height
+                )
+            } else {
+                result = avz_framebuffer_scale_source_over_bgra8(
+                    sourceBytes, sourceSurface.stride,
+                    command.sourceX, command.sourceY,
+                    command.sourceWidth, command.sourceHeight,
+                    destinationBytes, destinationSurface.stride,
+                    rectangle.x, rectangle.y, rectangle.width, rectangle.height
+                )
             }
         case .fill:
-            result = destination.pixels.withUnsafeMutableBytes { destinationBytes in
-                avz_framebuffer_fill_bgra8(
-                    destinationBytes.baseAddress,
-                    destination.stride,
-                    rectangle.x,
-                    rectangle.y,
-                    rectangle.width,
-                    rectangle.height,
-                    command.color
-                )
-            }
+            result = avz_framebuffer_fill_bgra8(
+                destinationBytes, destinationSurface.stride,
+                rectangle.x, rectangle.y, rectangle.width, rectangle.height,
+                command.color
+            )
         case .fillOver:
-            result = destination.pixels.withUnsafeMutableBytes { destinationBytes in
-                avz_framebuffer_fill_over_bgra8(
-                    destinationBytes.baseAddress,
-                    destination.stride,
-                    rectangle.x,
-                    rectangle.y,
-                    rectangle.width,
-                    rectangle.height,
-                    command.color
-                )
-            }
+            result = avz_framebuffer_fill_over_bgra8(
+                destinationBytes, destinationSurface.stride,
+                rectangle.x, rectangle.y, rectangle.width, rectangle.height,
+                command.color
+            )
         } }
         guard result != 0 else {
             throw GPUError.response(.errorInvalidParameter)
         }
-        if destination.format == .b8g8r8x8UNorm {
+        // Packed alpha surfaces share XRGB DRM storage, but every byte is alpha.
+        if !command.destinationIsPackedA8 && item.destination.format == .b8g8r8x8UNorm {
             normalizePixels(
-                in: destination.pixels,
+                in: destinationSurface.bytes,
                 rectangle: Rectangle(
                     x: rectangle.x,
                     y: rectangle.y,
                     width: rectangle.width,
                     height: rectangle.height
                 ),
-                stride: destination.stride,
-                format: destination.format
+                stride: destinationSurface.stride,
+                format: item.destination.format
             )
         }
     }
@@ -2127,16 +2275,20 @@ final class VirtIOGPUDevice {
         packedA8: Bool = false
     ) throws {
         let bytesPerPixel = packedA8 ? 1 : 4
-        for row in 0..<rectangle.height {
-            let offset = (rectangle.y + row) * resource.stride +
-                rectangle.x * bytesPerPixel
-            try copyBackingBytes(
-                resource.backing,
+        let offset = rectangle.y * resource.stride +
+            rectangle.x * bytesPerPixel
+        let ranges = resource.backing.map {
+            (address: $0.address, count: $0.length)
+        }
+        try resource.pixels.withUnsafeMutableBytes { destinationBytes in
+            try memory.copyOwnedDeviceRectangle(
+                from: ranges,
                 logicalOffset: offset,
-                count: rectangle.width * bytesPerPixel,
-                memory: memory,
-                destination: resource.pixels,
-                destinationOffset: offset
+                rowByteCount: rectangle.width * bytesPerPixel,
+                rowStride: resource.stride,
+                rowCount: rectangle.height,
+                to: destinationBytes.baseAddress!,
+                destinationByteCount: destinationBytes.count
             )
         }
         if !preserveAlpha && !packedA8 {
@@ -2156,18 +2308,21 @@ final class VirtIOGPUDevice {
         memory: PhysicalMemory
     ) throws {
         let bytesPerPixel = packedA8 ? 1 : 4
+        let offset = rectangle.y * resource.stride +
+            rectangle.x * bytesPerPixel
+        let ranges = resource.backing.map {
+            (address: $0.address, count: $0.length)
+        }
         try resource.pixels.withUnsafeBytes { sourceBytes in
-            for row in 0..<rectangle.height {
-                let offset = (rectangle.y + row) * resource.stride +
-                    rectangle.x * bytesPerPixel
-                try copyBytesToBacking(
-                    resource.backing,
-                    logicalOffset: offset,
-                    count: rectangle.width * bytesPerPixel,
-                    memory: memory,
-                    source: sourceBytes.baseAddress!.advanced(by: offset)
-                )
-            }
+            try memory.copyOwnedDeviceRectangle(
+                from: sourceBytes.baseAddress!,
+                sourceByteCount: sourceBytes.count,
+                logicalOffset: offset,
+                rowByteCount: rectangle.width * bytesPerPixel,
+                rowStride: resource.stride,
+                rowCount: rectangle.height,
+                to: ranges
+            )
         }
     }
 
@@ -2349,6 +2504,27 @@ final class VirtIOGPUDevice {
         precondition(normalized != 0, "unsupported framebuffer normalization")
     }
 
+    private func normalizePixels(
+        in bytes: UnsafeMutableRawBufferPointer,
+        rectangle: Rectangle,
+        stride: Int,
+        format: PixelFormat
+    ) {
+        guard !rectangle.isEmpty else { return }
+        let offset = rectangle.y * stride + rectangle.x * 4
+        let requiredByteCount = offset + (rectangle.height - 1) * stride +
+            rectangle.width * 4
+        precondition(offset >= 0 && requiredByteCount <= bytes.count)
+        let normalized = avz_framebuffer_normalize_bgra8(
+            bytes.baseAddress!.advanced(by: offset),
+            stride,
+            rectangle.width,
+            rectangle.height,
+            format.rawValue
+        )
+        precondition(normalized != 0, "unsupported framebuffer normalization")
+    }
+
     private func normalizePixelBytes(
         in pixels: NativeFramebufferStorage,
         offset: Int,
@@ -2402,6 +2578,11 @@ final class VirtIOGPUDevice {
                 $0.intersection(flushRectangle)?.intersection(scanout.rectangle)
             }
         )
+        let exactTransferredVisible = Self.compactDamageRectangles(
+            resource.pendingExactTransfers.compactMap {
+                $0.intersection(flushRectangle)?.intersection(scanout.rectangle)
+            }
+        )
 
         prepareCommittedFrameForWrite()
         let outputDamage: [Rectangle]
@@ -2417,8 +2598,22 @@ final class VirtIOGPUDevice {
             outputDamage = [Rectangle(x: 0, y: 0, width: width, height: height)]
             changedByteCount = width * height * 4
         } else {
-            var damage: [Rectangle] = []
-            for candidate in transferredVisible {
+            var damage = exactTransferredVisible
+            for candidate in exactTransferredVisible {
+                copyResourceRectangle(
+                    candidate,
+                    from: resource,
+                    scanout: scanout,
+                    into: committedPixels
+                )
+                changedByteCount += candidate.width * candidate.height * 4
+            }
+            let comparisonCandidates = transferredVisible.flatMap { candidate in
+                exactTransferredVisible.reduce([candidate]) { remaining, exact in
+                    remaining.flatMap { $0.subtracting(exact) }
+                }
+            }
+            for candidate in comparisonCandidates {
                 let result = copyChangedResourceTiles(
                     candidate,
                     from: resource,
@@ -2429,13 +2624,16 @@ final class VirtIOGPUDevice {
                 changedByteCount += result.changedByteCount
             }
             outputDamage = Self.compactDamageRectangles(damage)
-            dirtyTileScanCount &+= UInt64(transferredVisible.count)
+            dirtyTileScanCount &+= UInt64(comparisonCandidates.count)
             dirtyTileChangedByteCount &+= UInt64(changedByteCount)
             if outputDamage.isEmpty {
                 unchangedFlushCount &+= 1
             }
         }
         resource.pendingTransfers = resource.pendingTransfers.flatMap {
+            $0.subtracting(flushRectangle)
+        }
+        resource.pendingExactTransfers = resource.pendingExactTransfers.flatMap {
             $0.subtracting(flushRectangle)
         }
         lastFlushSummary = Self.rectangleSummary(

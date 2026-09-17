@@ -1,0 +1,156 @@
+#!/bin/sh
+# One bootstrap writer, followed by NetworkManager for the rest of this boot.
+PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+LC_ALL=C
+export LC_ALL
+unset LD_PRELOAD
+
+ROOT=${PINECONE_NETWORK_ROOT:-}
+BB=${PINECONE_NETWORK_BUSYBOX:-/bin/busybox}
+STATE=$ROOT/run/pinecone-network
+NM=$ROOT/usr/sbin/NetworkManager
+BUS=$ROOT/usr/bin/dbus-send
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$ROOT/run/dbus/system_bus_socket
+
+bus_owner() {
+    "$BUS" --system --print-reply --reply-timeout=2000 \
+        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.NameHasOwner string:org.freedesktop.NetworkManager
+}
+
+prepare_activation_helper() {
+    # Alpine's helper is a separate package. Offline extraction skips its
+    # root:messagebus ownership setup; mke2fs preserves the host staging UID.
+    helper=$ROOT/usr/libexec/dbus-daemon-launch-helper
+    [ -f "$helper" ] || return 0
+    "$BB" chown 0:101 "$helper" && "$BB" chmod 4750 "$helper"
+}
+
+bootstrap() {
+    [ ! -e "$STATE/nm-started" ] || return 0
+    [ ! -e "$STATE/static-ready" ] || return 0
+    "$BB" ifconfig lo 127.0.0.1 up || return 1
+    # DNS is available even when eth0 arrives late. No subsequent static
+    # writer may replace the resolver after NM has started.
+    printf 'nameserver 10.0.2.3\noptions timeout:1 attempts:3\n' >"$ROOT/etc/resolv.conf" || return 1
+    [ -e "$ROOT/sys/class/net/eth0" ] || return 2
+    "$BB" ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up || return 1
+    "$BB" ip route replace default via 10.0.2.2 dev eth0 metric 0 || return 1
+    : >"$STATE/static-ready"
+    echo 'pinecone-network: static eth0 10.0.2.15/24 via 10.0.2.2; DNS 10.0.2.3'
+}
+
+case "${1:-status}" in
+    start)
+        prepare_activation_helper || exit 1
+        # The minimal boot only coldplugs input. NM correctly refuses links
+        # lacking a udev initialization record, even with a static address.
+        if [ -x "$ROOT/sbin/udevadm" ]; then
+            "$ROOT/sbin/udevadm" trigger --subsystem-match=net --action=add || exit 1
+        fi
+        # Let the bus coalesce explicit startup with Phosh's activation. The
+        # session launcher runs this in a detached child, never on its path
+        # to Phoc. The descriptor's Exec enters the daemon branch below.
+        exec "$BUS" --system --print-reply --reply-timeout=120000 \
+            --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+            org.freedesktop.DBus.StartServiceByName \
+            string:org.freedesktop.NetworkManager uint32:0
+        ;;
+    early|late)
+        prepare_activation_helper || exit 1
+        "$BB" mkdir -p "$STATE" || exit 1
+        exec 9>"$STATE/owner.lock"
+        # Never wait behind NM, including when the user disconnected eth0.
+        "$BB" flock -n 9 || exit 0
+        if [ "$1" = early ]; then
+            bootstrap
+            result=$?
+            if [ "$result" = 2 ]; then
+                # Release our lock before the delayed fallback. The shell is
+                # usable immediately; NM may take ownership in the meantime.
+                "$BB" flock -u 9
+                "$BB" setsid /bin/sh "$0" late </dev/null >/dev/null 2>&1 9>&- &
+                exit 0
+            fi
+            exit "$result"
+        fi
+        # Only the static fallback waits for an absent NIC, never the shell.
+        for attempt in 1 2 3 4 5; do
+            "$BB" flock -u 9
+            "$BB" sleep 1
+            "$BB" flock -n 9 || exit 0
+            bootstrap
+            result=$?
+            [ "$result" = 2 ] || exit "$result"
+        done
+        echo 'pinecone-network: eth0 absent; static fallback unavailable' >&2
+        exit 1
+        ;;
+    daemon)
+        [ -x "$NM" ] || { echo 'pinecone-network: NetworkManager not installed; static configuration retained' >&2; exit 1; }
+        "$BB" mkdir -p "$STATE" "$ROOT/var/log/pinecone" || exit 1
+        exec 9>"$STATE/owner.lock"
+        # Both explicit startup and D-Bus activation enter here. Hold the
+        # lock in this supervisor (not NM, which can close inherited FDs).
+        locked=false
+        for attempt in 1 2 3 4 5; do
+            if "$BB" flock -n 9; then locked=true; break; fi
+            [ ! -e "$STATE/nm-started" ] || exit 0
+            "$BB" sleep 1
+        done
+        "$locked" || { echo 'pinecone-network: bootstrap lock busy; retry daemon startup' >&2; exit 1; }
+        owner=$(bus_owner) || { echo 'pinecone-network: system D-Bus unavailable; static configuration retained' >&2; exit 1; }
+        case "$owner" in
+            *'boolean true'*) : >"$STATE/nm-started"; exit 0 ;;
+        esac
+        # mke2fs -d may preserve a non-root staging UID. NM deliberately
+        # rejects keyfiles not owned by root, even when their mode is 0600.
+        profile=$ROOT/etc/NetworkManager/system-connections/pinecone-eth0.nmconnection
+        if [ ! -f "$profile" ]; then
+            echo 'pinecone-network: static NM profile missing; static configuration retained' >&2
+            exit 1
+        fi
+        "$BB" chown 0:0 "$profile" && "$BB" chmod 0600 "$profile" || exit 1
+        # Also covers activation before rcS and a NIC absent during bootstrap.
+        bootstrap || true
+        : >"$STATE/nm-started"
+        "$NM" --no-daemon --pid-file="$STATE/NetworkManager.pid" \
+            >>"$ROOT/var/log/pinecone/network.log" 2>&1 9>&- &
+        child=$!
+        trap 'kill -TERM "$child" 2>/dev/null; wait "$child"; exit 0' TERM INT HUP
+        wait "$child"
+        result=$?
+        echo "pinecone-network: NetworkManager exited ($result); not reapplying static configuration" >&2
+        exit "$result"
+        ;;
+    status)
+        # This query never activates NM and never equates a route with tested
+        # Internet access. Browser HTTP/TLS validation remains a separate step.
+        owner=$(bus_owner 2>/dev/null) || { echo 'system-dbus: unavailable'; exit 1; }
+        echo 'system-dbus: ready'
+        case "$owner" in
+            *'boolean true'*) echo 'networkmanager: running' ;;
+            *) echo 'networkmanager: unavailable (static networking may still work)'; exit 1 ;;
+        esac
+        if [ -x "$ROOT/usr/bin/nmcli" ]; then
+            exec "$ROOT/usr/bin/nmcli" --wait 3 --fields \
+                GENERAL.STATE,GENERAL.NM-MANAGED,GENERAL.CONNECTION,GENERAL.CON-UUID,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS \
+                device show eth0
+        fi
+        # The CLI is an optional Alpine subpackage. Use NM's supported D-Bus
+        # API when absent instead of introducing an unpinned desktop upgrade.
+        device=$("$BUS" --system --print-reply=literal --reply-timeout=3000 \
+            --dest=org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+            org.freedesktop.NetworkManager.GetDeviceByIpIface string:eth0) || exit 1
+        device=$(printf '%s' "$device" | "$BB" tr -d ' \n\r\t')
+        case "$device" in
+            /org/freedesktop/NetworkManager/Devices/*) ;;
+            *) echo 'networkmanager: eth0 not found' >&2; exit 1 ;;
+        esac
+        "$BUS" --system --print-reply --reply-timeout=3000 \
+            --dest=org.freedesktop.NetworkManager "$device" \
+            org.freedesktop.DBus.Properties.GetAll string:org.freedesktop.NetworkManager.Device
+        ;;
+    *) echo 'Usage: pinecone-network {early|start|daemon|status}' >&2; exit 2 ;;
+esac

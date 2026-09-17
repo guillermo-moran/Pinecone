@@ -103,7 +103,7 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func raise(line: UInt32) {
-        withLock {
+        let wake = withLock {
             increment(&raisedCounts, line: line)
             if active.contains(line) {
                 increment(&activeRaiseDropCounts, line: line)
@@ -113,8 +113,9 @@ public final class SimpleInterruptController: InterruptController {
             if !pending.contains(line) {
                 pending.append(line)
             }
-            wakeHandler?()
+            return wakeHandler
         }
+        wake?()
     }
 
     public func clear(line: UInt32) {
@@ -125,13 +126,16 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func setEnabled(line: UInt32, enabled: Bool) {
-        withLock {
+        let wake = withLock {
             if enabled {
                 self.enabled.insert(line)
             } else {
                 self.enabled.remove(line)
             }
+            return enabled && (pending.contains(line) ||
+                targetedPending.values.contains { $0.contains(line) }) ? wakeHandler : nil
         }
+        wake?()
     }
 
     public func isEnabled(line: UInt32) -> Bool {
@@ -152,10 +156,12 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func complete(line: UInt32) {
-        withLock {
+        let wake = withLock {
             active.removeAll { $0 == line }
             increment(&completedCounts, line: line)
+            return pending.contains(line) ? wakeHandler : nil
         }
+        wake?()
     }
 
     public func activeLine() -> UInt32? {
@@ -163,7 +169,7 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func raise(line: UInt32, targetVCPU: Int) {
-        withLock {
+        let wake = withLock {
             increment(&raisedCounts, line: line)
             if targetedActive[targetVCPU, default: []].contains(line) {
                 increment(&activeRaiseDropCounts, line: line)
@@ -171,8 +177,9 @@ public final class SimpleInterruptController: InterruptController {
             if !targetedPending[targetVCPU, default: []].contains(line) {
                 targetedPending[targetVCPU, default: []].append(line)
             }
-            wakeHandler?()
+            return wakeHandler
         }
+        wake?()
     }
 
     public func clear(line: UInt32, targetVCPU: Int) {
@@ -183,14 +190,17 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func setEnabled(line: UInt32, enabled: Bool, targetVCPU: Int) {
-        withLock {
-            guard line >= 16 else { return }
+        let wake = withLock { () -> (() -> Void)? in
+            guard line >= 16 else { return nil }
             if enabled {
                 targetedEnabled[targetVCPU, default: []].insert(line)
             } else {
                 targetedEnabled[targetVCPU, default: []].remove(line)
             }
+            return enabled && (targetedPending[targetVCPU, default: []].contains(line) ||
+                pending.contains(line)) ? wakeHandler : nil
         }
+        wake?()
     }
 
     public func isEnabled(line: UInt32, targetVCPU: Int) -> Bool {
@@ -216,15 +226,19 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func complete(line: UInt32, targetVCPU: Int) {
-        withLock {
+        let wake = withLock {
             let wasTargeted = targetedActive[targetVCPU]?.contains(line) ?? false
             targetedActive[targetVCPU]?.removeAll { $0 == line }
             if wasTargeted {
                 increment(&completedCounts, line: line)
             } else if active.contains(line) {
-                complete(line: line)
+                active.removeAll { $0 == line }
+                increment(&completedCounts, line: line)
             }
+            return pending.contains(line) ||
+                targetedPending[targetVCPU, default: []].contains(line) ? wakeHandler : nil
         }
+        wake?()
     }
 
     public func activeLine(targetVCPU: Int) -> UInt32? {
@@ -236,10 +250,12 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func setTargetMask(line: UInt32, mask: UInt8) {
-        withLock {
-            guard line >= 32 else { return }
+        let wake = withLock { () -> (() -> Void)? in
+            guard line >= 32 else { return nil }
             sharedTargetMasks[line] = mask
+            return pending.contains(line) ? wakeHandler : nil
         }
+        wake?()
     }
 
     public func targetMask(line: UInt32) -> UInt8 {

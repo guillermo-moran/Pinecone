@@ -1,0 +1,5 @@
+homepage_url:https://example.com/
+ca_bundle:/etc/ssl/certs/ca-certificates.crt
+window_width:480
+window_height:900
+enable_javascript:0

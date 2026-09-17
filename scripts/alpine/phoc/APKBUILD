@@ -3,7 +3,7 @@
 maintainer="team/phosh <newbie13xd@gmail.com>"
 pkgname=phoc
 pkgver=0.57.0
-pkgrel=1
+pkgrel=5
 pkgdesc="wlroots based Phone compositor for the Phosh shell"
 arch="all"
 url="https://gitlab.gnome.org/World/Phosh/phoc"
@@ -49,6 +49,7 @@ options="!check"
 source="
 	https://sources.phosh.mobi/releases/phoc/phoc-$pkgver.tar.xz
 	phoc-pinecone-layout.patch
+	phoc-pinecone-interactions.patch
 	wlroots-pinecone-0.20.2.patch.embed
 	"
 replaces="wlroots-phosh"
@@ -90,5 +91,6 @@ schemas() {
 sha512sums="
 c3dfb5e951422ccedcc1740b788a4c9dbc517ec7c0901967298a77dc5a35b4ca4556fe97b02085868779adddb1b86539224f2c3c6277ff5264315ada54b322a3  phoc-0.57.0.tar.xz
 b493ff6b1be35a659400abeaa90e0870ae1d91d1191fbbfdff21adb47b580406f602bc17a550f30ea15c2ba7d0936d1778d55a3afe41d3e630279f937a98cc5c  phoc-pinecone-layout.patch
-2d1cd36e63a596e18b25554d032e792459b8314c6743486e0e68d998ac1674467b7b4ee448c6a8b70f8bb2994c60cdaee4c94d61e25ba43eb26d2664abceca99  wlroots-pinecone-0.20.2.patch.embed
+bb9af5905b8240760a1330a9da849f22db257f80e2ea855b005029bbbdb0e2165937ddc55fc0355b2728a382bd8765135f4486006c6944c7f7f9611e02f89d16  phoc-pinecone-interactions.patch
+3d6f04c77b8c005e5bd18efc35e323451c3e55c6cbf3be35adb20e1323b2edbec15df44e10da87e06f20e573492b0803dd705b1521e782c1cc3684462db72ef2  wlroots-pinecone-0.20.2.patch.embed
 "

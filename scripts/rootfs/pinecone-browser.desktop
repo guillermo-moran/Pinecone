@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NetSurf
+GenericName=Web Browser
+Comment=Browse the web with NetSurf
+Exec=/usr/local/bin/pinecone-launch-browser %u
+Icon=web-browser-symbolic
+Terminal=false
+DBusActivatable=false
+StartupNotify=true
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;

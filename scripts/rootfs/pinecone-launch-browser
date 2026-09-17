@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+fail() { echo "pinecone-browser: $*" >&2; exit 1; }
+command -v netsurf-gtk3 >/dev/null 2>&1 || fail 'NetSurf GTK3 is not installed'
+[ -n "${WAYLAND_DISPLAY:-}${WAYLAND_SOCKET:-}" ] || fail 'launch from the Phosh Wayland session'
+[ -n "${XDG_RUNTIME_DIR:-}" ] || fail 'XDG_RUNTIME_DIR is missing'
+[ -s /etc/ssl/certs/ca-certificates.crt ] || fail 'Mozilla CA certificate bundle is missing'
+
+# NetSurf has no renderer sandbox or root prohibition. Never describe this as
+# equivalent to sandboxed WebKit. Keep credentials out of the root demo profile.
+if [ "$(id -u)" = 0 ]; then
+  echo 'pinecone-browser: running as root in the demo session; no renderer sandbox. Use trusted test pages only.' >&2
+fi
+export GDK_BACKEND=wayland
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export CURL_CA_BUNDLE="$SSL_CERT_FILE"
+
+umask 077
+# NetSurf prefers its legacy directory if it already exists.
+config="${XDG_CONFIG_HOME:-${HOME:?HOME is required}/.config}/netsurf"
+if [ -d "$HOME/.netsurf" ]; then config="$HOME/.netsurf"; fi
+mkdir -p "$config"
+if [ ! -e "$config/Choices" ]; then
+  cp /usr/share/pinecone/browser/Choices "$config/Choices"
+fi
+if [ "$#" = 0 ]; then set -- https://example.com/; fi
+# Treat desktop input as URLs, not arbitrary NetSurf option overrides.
+for url do
+  case "$url" in
+    http://*|https://*|file://*|about:*) ;;
+    *) fail "expected an HTTP(S), file, or about URL: $url" ;;
+  esac
+done
+exec netsurf-gtk3 --ca_bundle=/etc/ssl/certs/ca-certificates.crt "$@"

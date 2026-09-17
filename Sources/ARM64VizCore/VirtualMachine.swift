@@ -1,4 +1,5 @@
 import Dispatch
+import ARM64VizNative
 
 public enum ARM64ExceptionSource: String, Codable, Equatable {
     case supervisorCall
@@ -314,10 +315,14 @@ public protocol VirtualMachineBackend: AnyObject {
     func run(vm: VirtualMachine, maxSteps: Int) throws -> RunResult
     func invalidateCodeCache(physicalAddress: GuestAddress, byteCount: UInt64)
     func invalidateTranslationCache(for vm: VirtualMachine)
+    func invalidateTranslations(for vm: VirtualMachine, matching invalidation: AVZNativeTLBI)
 }
 
 public extension VirtualMachineBackend {
     func invalidateTranslationCache(for vm: VirtualMachine) {}
+    func invalidateTranslations(for vm: VirtualMachine, matching invalidation: AVZNativeTLBI) {
+        invalidateTranslationCache(for: vm)
+    }
 }
 
 public final class VirtualMachine {
@@ -423,6 +428,11 @@ public final class VirtualMachine {
     private var nextScheduledVCPUID: Int
     private var externallyManagedVCPUID: Int?
     private var externalClock: ParallelVCPUClock?
+    var nativeCounterClock: AVZNativeCounterClock? { externalClock?.nativeConfiguration }
+
+    func synchronizeExternalCounter() {
+        externalClock?.synchronize(&systemRegisters)
+    }
     private var externalCPUStartHandler: ((Int, GuestAddress, UInt64) -> Bool)?
     private var externalResetHandler: ((GuestAddress) -> Void)?
     private var externalStateProvider: (() -> [VirtualCPUArchitecturalState])?
@@ -735,7 +745,7 @@ public final class VirtualMachine {
         }
 
         let result = try backend.run(vm: self, maxSteps: maxSteps)
-        externalClock?.publish(systemRegisters.counterTicks)
+        externalClock?.synchronize(&systemRegisters)
         if result.stopReason == .halted {
             virtualCPUs[id].architecture.lifecycle = .halted
         }
@@ -1246,6 +1256,11 @@ public final class VirtualMachine {
     }
 
     public var hostTimerWaitNanoseconds: UInt64? {
+        // A wake notification can precede the host condition wait. Recheck the
+        // level predicate, including when the guest has no armed timer.
+        if interruptController.peekPending(targetVCPU: activeVCPUID) != nil {
+            return 0
+        }
         guard let deadline = systemRegisters.nextUnmaskedTimerDeadline else {
             return nil
         }
@@ -1274,7 +1289,7 @@ public final class VirtualMachine {
         }
     }
 
-    func executeSystemMaintenanceInstruction(_ instruction: UInt32) {
+    func executeSystemMaintenanceInstruction(_ instruction: UInt32, operand: UInt64 = 0) {
         let crn = (instruction >> 12) & 0xf
         guard crn == 8 else {
             // Guest cache maintenance needs no host action: RAM writes are
@@ -1282,8 +1297,14 @@ public final class VirtualMachine {
             return
         }
 
-        memory.invalidateSharedTranslationCaches()
-        invalidateTranslationCache()
+        let invalidation = avz_native_decode_tlbi(instruction, operand, cachedTCR_EL1)
+        if invalidation.broadcast != 0 {
+            memory.publishTranslationInvalidation(invalidation)
+        }
+        // These auxiliary Swift caches do not carry leaf/global metadata.
+        // Native execution keeps its architecturally tagged TLB entries scoped.
+        translationCache.removeAll(keepingCapacity: true)
+        backend.invalidateTranslations(for: self, matching: invalidation)
     }
 
     public func didWriteSystemRegister(_ key: ARM64SystemRegisterKey) {

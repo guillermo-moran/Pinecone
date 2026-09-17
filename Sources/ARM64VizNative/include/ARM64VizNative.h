@@ -206,6 +206,21 @@ typedef struct {
     uint64_t write_conflicts;
 } AVZGuestExclusiveStatistics;
 typedef struct AVZNativeMemoryFastPath AVZNativeMemoryFastPath;
+
+/* Immutable epoch copied into each vCPU; all CPUs read the same host clock. */
+typedef struct {
+    uint64_t host_anchor;
+    uint64_t counter_anchor;
+    uint32_t frequency;
+    uint32_t numerator;
+    uint32_t denominator;
+} AVZNativeCounterClock;
+
+int avz_native_counter_clock_initialize(AVZNativeCounterClock *clock,
+    uint64_t counter_anchor, uint32_t frequency);
+uint64_t avz_native_counter_clock_read(const AVZNativeCounterClock *clock);
+void avz_native_memory_fast_path_set_counter_clock(AVZNativeMemoryFastPath *fast_path,
+    const AVZNativeCounterClock *clock);
 typedef struct AVZNativeExecutionContext AVZNativeExecutionContext;
 typedef struct AVZFileBlockStorage AVZFileBlockStorage;
 
@@ -347,6 +362,16 @@ void avz_native_block_cache_set_guest_memory(
 void avz_native_block_cache_invalidate_decode_window(
     AVZNativeBlockCache *cache
 );
+typedef int (*AVZNativeInstructionMappingValidateCallback)(
+    void *context, uint64_t virtual_address, uint64_t physical_address
+);
+void avz_native_block_cache_set_mapping_validator(
+    AVZNativeBlockCache *cache,
+    AVZNativeInstructionMappingValidateCallback validate,
+    void *context
+);
+/* Constant-time invalidation of virtual execution mappings, not code bytes. */
+void avz_native_block_cache_invalidate_translation_mappings(AVZNativeBlockCache *cache);
 
 const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
     AVZNativeBlockCache *cache,
@@ -746,11 +771,40 @@ int avz_guest_memory_dma_read_owned(
     void *destination,
     size_t byte_count
 );
+int avz_guest_memory_dma_readv_owned(
+    AVZGuestMemory *memory,
+    const AVZGuestMemorySpan *spans,
+    size_t span_count,
+    void *destination,
+    size_t destination_byte_count
+);
+int avz_guest_memory_dma_read_rect_owned(
+    AVZGuestMemory *memory,
+    const AVZGuestMemorySpan *spans,
+    size_t span_count,
+    size_t logical_offset,
+    size_t row_byte_count,
+    size_t row_stride,
+    size_t row_count,
+    void *destination,
+    size_t destination_byte_count
+);
 int avz_guest_memory_dma_write_owned(
     AVZGuestMemory *memory,
     size_t offset,
     const void *source,
     size_t byte_count
+);
+int avz_guest_memory_dma_write_rect_owned(
+    AVZGuestMemory *memory,
+    const AVZGuestMemorySpan *spans,
+    size_t span_count,
+    size_t logical_offset,
+    size_t row_byte_count,
+    size_t row_stride,
+    size_t row_count,
+    const void *source,
+    size_t source_byte_count
 );
 uint8_t *avz_guest_memory_dma_owned_pointer(
     AVZGuestMemory *memory,
@@ -828,6 +882,30 @@ const uint64_t *avz_guest_memory_code_mutation_epoch_token(
     const AVZGuestMemory *memory
 );
 void avz_guest_memory_invalidate_translations(AVZGuestMemory *memory);
+enum {
+    AVZ_TLBI_ALL = 0,
+    AVZ_TLBI_VA_ASID = 1,
+    AVZ_TLBI_ASID = 2,
+    AVZ_TLBI_VA_ALL_ASIDS = 3
+};
+typedef struct {
+    uint64_t virtual_address;
+    uint16_t asid;
+    uint8_t kind;
+    uint8_t broadcast;
+} AVZNativeTLBI;
+AVZNativeTLBI avz_native_decode_tlbi(
+    uint32_t instruction, uint64_t operand, uint64_t tcr_el1
+);
+void avz_guest_memory_publish_tlbi(
+    AVZGuestMemory *memory, AVZNativeTLBI invalidation
+);
+void avz_native_memory_fast_path_apply_tlbi(
+    AVZNativeMemoryFastPath *fast_path, AVZNativeTLBI invalidation
+);
+void avz_native_memory_fast_path_synchronize_translations(
+    AVZNativeMemoryFastPath *fast_path
+);
 uint64_t avz_guest_memory_translation_epoch(const AVZGuestMemory *memory);
 uint64_t avz_guest_memory_advance_dirty_epoch(AVZGuestMemory *memory);
 size_t avz_guest_memory_dirty_ranges(

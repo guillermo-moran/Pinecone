@@ -8,6 +8,7 @@ public enum VMPerformanceMilestone: String, Codable, CaseIterable, Sendable {
     case firstVisibleFrame
     case applicationLaunchRequested
     case applicationFirstVisibleFrame
+    case applicationSurfacePresented
 }
 
 public struct VMFramePipelineSnapshot: Codable, Equatable, Sendable {
@@ -52,6 +53,21 @@ public struct VMPerformanceTimelineSnapshot: Codable, Equatable, Sendable {
     public let touchLatencyP95Milliseconds: Double?
     public let touchSampleCount: Int
     public let framePipeline: VMFramePipelineSnapshot
+    public var interactions: [VMInteractionSample] = []
+    public var guestGraphics: [GuestGraphicsTraceEvent] = []
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        elapsedMilliseconds = try values.decode([String: Double].self, forKey: .elapsedMilliseconds)
+        executionAtMilestones = try values.decodeIfPresent(
+            [String: VMExecutionMilestoneSnapshot].self, forKey: .executionAtMilestones) ?? [:]
+        touchLatencyP50Milliseconds = try values.decodeIfPresent(Double.self, forKey: .touchLatencyP50Milliseconds)
+        touchLatencyP95Milliseconds = try values.decodeIfPresent(Double.self, forKey: .touchLatencyP95Milliseconds)
+        touchSampleCount = try values.decode(Int.self, forKey: .touchSampleCount)
+        framePipeline = try values.decode(VMFramePipelineSnapshot.self, forKey: .framePipeline)
+        interactions = try values.decodeIfPresent([VMInteractionSample].self, forKey: .interactions) ?? []
+        guestGraphics = try values.decodeIfPresent([GuestGraphicsTraceEvent].self, forKey: .guestGraphics) ?? []
+    }
 
     public init(
         elapsedMilliseconds: [String: Double],
@@ -88,8 +104,28 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
     private var commitToPresentNanoseconds: [UInt64] = []
     private var presentationIntervalsNanoseconds: [UInt64] = []
     private var lastPresentationNanoseconds: UInt64?
+    private var interactionStartedNanoseconds: UInt64?
     private var damagedBytes: UInt64 = 0
     private var uploadedBytes: UInt64 = 0
+    private var interactions: [VMInteractionSample] = []
+    private var guestGraphics: [GuestGraphicsTraceEvent] = []
+    private var pendingInteractions: [UInt64: (queued: UInt64, delivered: UInt64)] = [:]
+
+    public func recordGuestGraphics(_ event: GuestGraphicsTraceEvent) {
+        lock.lock()
+        if guestGraphics.count == Self.maximumTouchSamples { guestGraphics.removeFirst() }
+        guestGraphics.append(event)
+        lock.unlock()
+    }
+
+    public func recordTouchFrame(generation: UInt64, queued: UInt64, delivered: UInt64) {
+        guard delivered >= queued else { return }
+        lock.lock()
+        if pendingInteractions.count >= Self.maximumTouchSamples,
+           let oldest = pendingInteractions.keys.min() { pendingInteractions.removeValue(forKey: oldest) }
+        pendingInteractions[generation] = (queued, delivered)
+        lock.unlock()
+    }
 
     public init(
         startNanoseconds: UInt64? = nil,
@@ -115,6 +151,14 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
             executionAtMilestones[milestone] = execution
         }
         return true
+    }
+
+    public func recordInteractionStarted(atNanoseconds timestamp: UInt64) {
+        lock.lock()
+        if interactionStartedNanoseconds == nil {
+            interactionStartedNanoseconds = timestamp
+        }
+        lock.unlock()
     }
 
     public func recordTouchLatency(nanoseconds: UInt64) {
@@ -148,13 +192,30 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
         lock.unlock()
     }
 
+    @discardableResult
     public func recordFramePresented(
         generation: UInt64,
         presentedAtNanoseconds: UInt64,
         uploadedByteCount: Int
-    ) {
+    ) -> Bool {
         lock.lock()
+        var recordedInteraction = false
+        var presentsInteraction = false
         if let frame = publishedFrames.removeValue(forKey: generation) {
+            if let input = pendingInteractions.removeValue(forKey: generation),
+               frame.commit >= input.delivered, frame.publish >= frame.commit,
+               presentedAtNanoseconds >= frame.publish {
+                if interactions.count == Self.maximumTouchSamples { interactions.removeFirst() }
+                interactions.append(VMInteractionSample(
+                    generation: generation,
+                    queueToDeviceMilliseconds: Double(input.delivered - input.queued) / 1e6,
+                    deviceToCommitMilliseconds: Double(frame.commit - input.delivered) / 1e6,
+                    commitToPublishMilliseconds: Double(frame.publish - frame.commit) / 1e6,
+                    publishToPresentMilliseconds: Double(presentedAtNanoseconds - frame.publish) / 1e6,
+                    totalMilliseconds: Double(presentedAtNanoseconds - input.queued) / 1e6))
+                recordedInteraction = true
+            }
+            presentsInteraction = interactionStartedNanoseconds.map { frame.commit >= $0 } ?? false
             if presentedAtNanoseconds >= frame.publish {
                 Self.append(
                     presentedAtNanoseconds - frame.publish,
@@ -169,18 +230,23 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
             }
         }
         publishedFrames = publishedFrames.filter { $0.key > generation }
+        pendingInteractions = pendingInteractions.filter { $0.key > generation }
         if let previous = lastPresentationNanoseconds,
            presentedAtNanoseconds > previous,
-           presentedAtNanoseconds - previous <=
-            Self.maximumActivePresentationGapNanoseconds {
+           (presentsInteraction || presentedAtNanoseconds - previous <=
+            Self.maximumActivePresentationGapNanoseconds) {
+            let start = presentsInteraction
+                ? max(previous, interactionStartedNanoseconds ?? previous) : previous
             Self.append(
-                presentedAtNanoseconds - previous,
+                presentedAtNanoseconds - start,
                 to: &presentationIntervalsNanoseconds
             )
         }
+        if presentsInteraction { interactionStartedNanoseconds = nil }
         lastPresentationNanoseconds = presentedAtNanoseconds
         uploadedBytes &+= UInt64(max(0, uploadedByteCount))
         lock.unlock()
+        return recordedInteraction
     }
 
     public func snapshot() -> VMPerformanceTimelineSnapshot {
@@ -188,6 +254,8 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
         let milestoneCopy = milestones
         let executionCopy = executionAtMilestones
         let touchCopy = touchLatencyNanoseconds
+        let interactionCopy = interactions
+        let guestCopy = guestGraphics
         let framePipeline = VMFramePipelineSnapshot(
             frameSampleCount: commitToPresentNanoseconds.count,
             commitToPublishP50Milliseconds: Self.percentile(commitToPublishNanoseconds, fraction: 0.50),
@@ -205,7 +273,7 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
         let elapsed = milestoneCopy.reduce(into: [String: Double]()) { result, entry in
             result[entry.key.rawValue] = Double(entry.value &- startNanoseconds) / 1_000_000
         }
-        return VMPerformanceTimelineSnapshot(
+        var result = VMPerformanceTimelineSnapshot(
             elapsedMilliseconds: elapsed,
             executionAtMilestones: executionCopy.reduce(into: [:]) {
                 $0[$1.key.rawValue] = $1.value
@@ -215,6 +283,9 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
             touchSampleCount: touchCopy.count,
             framePipeline: framePipeline
         )
+        result.interactions = interactionCopy
+        result.guestGraphics = guestCopy
+        return result
     }
 
     private func trimPublishedFrames() {

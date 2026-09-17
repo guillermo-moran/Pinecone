@@ -377,7 +377,10 @@ final class MobileOSHostModel: ObservableObject {
         let pendingInputRunSliceSteps = Self.pendingInputRunSliceSteps
         let bootProgressIntervalNanoseconds = Self.bootProgressIntervalNanoseconds
         let interactiveProgressIntervalNanoseconds = Self.interactiveProgressIntervalNanoseconds
-        let detailedPerformanceEnabled = Self.performanceLogURL != nil
+        let environment = ProcessInfo.processInfo.environment
+        let detailedPerformanceEnabled = environment["PINECONE_DUMP_PERFORMANCE"] == "1" ||
+            environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1" ||
+            environment["PINECONE_SIMULATOR_HOT_PC_PROFILE"] == "1"
 
         runTask = Task.detached(priority: .userInitiated) { [weak self, runtime] in
             var totalSteps = 0
@@ -580,6 +583,8 @@ final class MobileOSHostModel: ObservableObject {
         guard runIdentifier == self.runIdentifier else {
             return
         }
+        writeLastStopReport(reason: lastStopReason ?? "backend stopped",
+                            traceTail: runtime?.traceTail())
         displayTask?.cancel()
         displayTask = nil
         runtime = nil
@@ -726,7 +731,9 @@ final class MobileOSHostModel: ObservableObject {
     private static var performanceLogURL: URL? {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PINECONE_DUMP_PERFORMANCE"] == "1" ||
-                environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1",
+                environment["PINECONE_SIMULATOR_DUMP_PERFORMANCE"] == "1" ||
+                environment["PINECONE_WRITE_PERFORMANCE_METRICS"] == "1" ||
+                environment["PINECONE_SIMULATOR_WRITE_PERFORMANCE_METRICS"] == "1",
               let cachesURL = FileManager.default.urls(
                 for: .cachesDirectory,
                 in: .userDomainMask
@@ -747,12 +754,28 @@ final class MobileOSHostModel: ObservableObject {
     }
 
     private func writePerformanceFailure(error: String, traceTail: String?) {
+        writeLastStopReport(reason: error, traceTail: traceTail)
         guard let performanceLogURL = Self.performanceLogURL else { return }
         var snapshot = "runner-failure=\(error)\n"
         if let traceTail, !traceTail.isEmpty {
             snapshot += "trace-tail:\n\(traceTail)\n"
         }
         try? Data(snapshot.utf8).write(to: performanceLogURL, options: .atomic)
+    }
+
+    private func writeLastStopReport(reason: String, traceTail: String?) {
+        guard let caches = FileManager.default.urls(for: .cachesDirectory,
+                                                     in: .userDomainMask).first else { return }
+        let report: [String: String] = [
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "reason": reason,
+            "traceTail": traceTail ?? "",
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: report,
+                                                     options: [.sortedKeys]) else { return }
+        // Failure-only diagnostics remain available without expensive profiling.
+        try? data.write(to: caches.appendingPathComponent("pinecone-last-stop.json"),
+                        options: .atomic)
     }
 
     private func launchPhoshIfNeeded() {
@@ -1041,15 +1064,18 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private static let interactiveChunkRunSliceSteps = 1_000_000
     private static let pendingInputChunkRunSliceSteps = 80_000
     private static let touchDeliveryChunkRunSliceSteps = 131_072
-    private static let touchRenderingChunkRunSliceSteps = 1_048_576
+    private static let touchTrackingChunkRunSliceSteps = 1_048_576
+    private static let touchRenderingChunkRunSliceSteps = 2_097_152
     private static let applicationLaunchChunkRunSliceSteps = 2_000_000
     private static let normalSecondaryRunSliceSteps = 262_144
     private static let touchDeliverySecondaryRunSliceSteps = 524_288
-    private static let touchRenderingSecondaryRunSliceSteps = 1_048_576
+    private static let touchTrackingSecondaryRunSliceSteps = 1_048_576
+    private static let touchRenderingSecondaryRunSliceSteps = 2_097_152
     private static let applicationLaunchSecondaryRunSliceSteps = 1_048_576
     private static let normalWallClockRunBudgetNanoseconds: UInt64 = 20_000_000
     private static let touchDeliveryWallClockRunBudgetNanoseconds: UInt64 = 4_000_000
-    private static let touchRenderingWallClockRunBudgetNanoseconds: UInt64 = 10_000_000
+    private static let touchTrackingWallClockRunBudgetNanoseconds: UInt64 = 10_000_000
+    private static let touchRenderingWallClockRunBudgetNanoseconds: UInt64 = 16_000_000
     private static let applicationLaunchWallClockRunBudgetNanoseconds: UInt64 = 12_000_000
     private static let maximumIdleTimerWaitNanoseconds: UInt64 = 250_000_000
     private static let maximumPendingInputBytes = 64 * 1024
@@ -1068,8 +1094,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
         return configured == "1"
     }
-    private static let touchInteractionWatchdogNanoseconds: UInt64 = 2_000_000_000
-    private static let applicationLaunchBoostNanoseconds: UInt64 = 5_000_000_000
+    private static let applicationLaunchBoostNanoseconds: UInt64 = 120_000_000_000
     private static let touchLatencySampleLimit = 64
 #if targetEnvironment(simulator)
     private static let defaultGuestMemoryMiB = 1024
@@ -1110,10 +1135,12 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private var droppedTouchEventCount = 0
     private var pendingKeyboardEvents: [GuestKeyboardEvent] = []
     private var diskPersistenceCompleted = false
+    private var stopRequested = false
     private var pendingInputTimestamp: UInt64?
     private var lastInputLatencyNanoseconds: UInt64?
     private var lastHostActivityNanoseconds: UInt64?
     private var touchInteractionActive = false
+    private var interactionExecutionPolicy = InteractionExecutionPolicy()
     private var touchAwaitingFrame = false
     private var touchInputFrameInFlight = false
     private var latestTouchQueuedNanoseconds: UInt64?
@@ -1121,10 +1148,12 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private var latestTouchInjectedNanoseconds: UInt64?
     private var latestTouchDeliveredNanoseconds: UInt64?
     private var touchDeliveryTargetFrameCount = 0
+    private var touchSchedulingDeliveryTargetFrameCount = 0
     private var touchBaselineDisplayGeneration: UInt64 = 0
     private enum ExecutionProfile: UInt8 {
         case normal
         case touchDelivery
+        case touchTracking
         case touchRendering
         case applicationLaunch
     }
@@ -1142,7 +1171,11 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private var displayBlankedAfterShell = false
     private var interactiveWorkloadReady = false
     private var applicationLaunchAwaitingFrame = false
-    private var applicationLaunchFrameGeneration: UInt64?
+    private var expectedApplicationIDs: Set<String> = []
+    private var guestTraceDecoder = GuestGraphicsTraceDecoder()
+    private var guestControlConsoleFilter = GuestControlConsoleFilter()
+    private var latestHotPCProfile: [[String: String]] = []
+    private var captureHotPCProfile = false
     private var applicationLaunchBoostDeadlineNanoseconds: UInt64?
     private var uartPromptTail = ""
 #if targetEnvironment(simulator)
@@ -1170,6 +1203,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         let environment = ProcessInfo.processInfo.environment
         let hotPCProfilingEnabled = environment["PINECONE_HOT_PC_PROFILE"] == "1" ||
             environment["PINECONE_SIMULATOR_HOT_PC_PROFILE"] == "1"
+        captureHotPCProfile = hotPCProfilingEnabled
         let detailedMemoryStatisticsEnabled =
             environment["PINECONE_DETAILED_MEMORY_STATS"] == "1"
         if let softwareBackend = machine.vm.backend as? SoftwareARM64Backend {
@@ -1261,6 +1295,9 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     }
 
     func stopExecution() {
+        lock.lock()
+        stopRequested = true
+        lock.unlock()
         machine.parallelVCPUCluster?.stop()
     }
 
@@ -1355,6 +1392,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         queuedTouchEventCount += 1
         lastHostActivityNanoseconds = now
         touchInteractionActive = event.isDown
+        interactionExecutionPolicy.input(at: now, isDown: event.isDown)
         latestTouchQueuedNanoseconds = now
 
         lock.unlock()
@@ -1434,7 +1472,13 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
               let deadline = applicationLaunchBoostDeadlineNanoseconds else {
             return false
         }
-        return now < deadline
+        guard now < deadline else {
+            applicationLaunchAwaitingFrame = false
+            expectedApplicationIDs.removeAll(keepingCapacity: true)
+            applicationLaunchBoostDeadlineNanoseconds = nil
+            return false
+        }
+        return true
     }
 
     var shouldContinueInteractiveBurst: Bool {
@@ -1457,7 +1501,9 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             !isTouchLatencySensitiveLocked(now: now) &&
             !isApplicationLaunchLatencySensitiveLocked(now: now)
         lock.unlock()
-        return shouldPace && !networkBridge.hasPendingAsynchronousTraffic
+        let enabled = shouldPace && !networkBridge.hasPendingAsynchronousTraffic
+        machine.parallelVCPUCluster?.setContinuousExecutionPacing(enabled: enabled)
+        return enabled
     }
 
     func preferredRunSliceSteps(
@@ -1489,11 +1535,13 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     }
 
     func runSlice(maxSteps: Int) throws -> RunResult {
+        try machine.parallelVCPUCluster?.checkForFailure()
         let initialWaitForInterruptCount = machine.vm.waitForInterruptCount
         defer {
             lock.lock()
-            lastRunSliceObservedWFI =
-                machine.vm.waitForInterruptCount != initialWaitForInterruptCount
+            lastRunSliceObservedWFI = machine.vm.virtualCPUCount > 1
+                ? machine.vm.activeVirtualCPUIsWaitingForInterrupt
+                : machine.vm.waitForInterruptCount != initialWaitForInterruptCount
             lock.unlock()
             flushUARTOutput()
         }
@@ -1515,14 +1563,18 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             let injectionTime = DispatchTime.now().uptimeNanoseconds
             let baselineGeneration = machine.virtioDisplay.displayGeneration ?? 0
             lock.lock()
-            touchInputFrameInFlight = true
-            touchAwaitingFrame = true
-            inFlightTouchQueuedNanoseconds = latestTouchQueuedNanoseconds
-            latestTouchInjectedNanoseconds = injectionTime
-            latestTouchDeliveredNanoseconds = nil
-            touchDeliveryTargetFrameCount = Int.max
-            touchBaselineDisplayGeneration = baselineGeneration
+            let beginsLatencySample = !touchInputFrameInFlight
             touchDeliverySlicePending = true
+            touchSchedulingDeliveryTargetFrameCount = Int.max
+            if beginsLatencySample {
+                touchInputFrameInFlight = true
+                touchAwaitingFrame = true
+                inFlightTouchQueuedNanoseconds = latestTouchQueuedNanoseconds
+                latestTouchInjectedNanoseconds = injectionTime
+                latestTouchDeliveredNanoseconds = nil
+                touchDeliveryTargetFrameCount = Int.max
+                touchBaselineDisplayGeneration = baselineGeneration
+            }
             lock.unlock()
             for event in touches {
                 machine.touch.enqueue(event)
@@ -1531,7 +1583,10 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             let deliveryProgress =
                 machine.virtioInput.inputFrameDeliveryProgress
             lock.lock()
-            touchDeliveryTargetFrameCount = deliveryProgress.target
+            touchSchedulingDeliveryTargetFrameCount = deliveryProgress.target
+            if beginsLatencySample {
+                touchDeliveryTargetFrameCount = deliveryProgress.target
+            }
             lock.unlock()
             noteTouchDeliveredIfNeeded()
         }
@@ -1543,6 +1598,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         configureExecutionProfile(
             touchActive: initialLatencySensitive,
             deliveryPending: hasPendingTouchDeliverySlice,
+            touchContactActive: hasActiveTouchContact,
             applicationLaunchActive: initialApplicationLaunch
         )
         if !initialLatencySensitive {
@@ -1576,12 +1632,14 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             configureExecutionProfile(
                 touchActive: latencySensitive,
                 deliveryPending: deliveryPending,
+                touchContactActive: hasActiveTouchContact,
                 applicationLaunchActive: applicationLaunchActive
             )
             if shouldUseFrequentNetworkPumps && !interactiveLatencySensitive {
                 stepBudget = min(stepBudget, Self.networkPumpRunSliceSteps)
             }
             let result = try machine.vm.run(maxSteps: stepBudget)
+            try machine.parallelVCPUCluster?.checkForFailure()
             totalSteps += result.steps
             lastException = result.lastException
             flushUARTOutput()
@@ -1759,15 +1817,24 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         let unsupported = snapshot?.unsupportedInstructions.first.map {
             " unsupported=0x\(String($0.instruction, radix: 16))/\($0.count)"
         } ?? ""
-        let hotPCs = softwareBackend?
-            .nativeHotPCSnapshot(limit: 3)
-            .map {
+        let hotSamples = softwareBackend?.nativeHotPCSnapshot(limit: captureHotPCProfile ? 32 : 3) ?? []
+        if captureHotPCProfile {
+            let entries = hotSamples.map { entry in
+                ["vcpu": "0", "pc": Self.hex(entry.pc), "samples": String(entry.samples),
+                 "lr": Self.hex(entry.linkRegister),
+                 "instructions": entry.instructions.map { String(format: "%08x", $0) }.joined(separator: " ")]
+            }
+            lock.lock()
+            latestHotPCProfile = entries
+            lock.unlock()
+        }
+        let hotPCs = hotSamples.prefix(3).map {
                 let words = $0.instructions
                     .map { String(format: "%08x", $0) }
                     .joined(separator: ".")
                 return "\(Self.hex($0.pc))/\($0.samples)/lr\(Self.hex($0.linkRegister))/\(words)"
             }
-            .joined(separator: ",") ?? ""
+            .joined(separator: ",")
         let hotPCTrace = hotPCs.isEmpty ? "" : " hpc=\(hotPCs)"
         let network = " net=tx\(networkBridge.transmittedFrameCount)" +
             "/gen\(networkBridge.generatedFrameCount)" +
@@ -1928,6 +1995,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         _ metadata: VirtualFramebufferFrameMetadata,
         publishedAtNanoseconds: UInt64
     ) {
+        noteTouchDeliveredIfNeeded()
         displayCommitSignal.notePublished(
             metadata: metadata,
             timestampNanoseconds: publishedAtNanoseconds
@@ -1940,34 +2008,19 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         )
 
         lock.lock()
-        let shouldInspectApplicationFrame =
-            applicationLaunchAwaitingFrame &&
-            applicationLaunchFrameGeneration == nil
-        lock.unlock()
-        if shouldInspectApplicationFrame,
-           isSubstantialVisibleApplicationFrame(metadata: metadata) {
-            lock.lock()
-            if applicationLaunchAwaitingFrame &&
-                applicationLaunchFrameGeneration == nil {
-                applicationLaunchFrameGeneration = metadata.generation
-            }
-            lock.unlock()
-        }
-
-        lock.lock()
-        let latencySensitive = isTouchLatencySensitiveLocked(now: publishedAtNanoseconds)
         let baselineGeneration = touchBaselineDisplayGeneration
+        interactionExecutionPolicy.frame(at: publishedAtNanoseconds)
         let deliveredNanoseconds = latestTouchDeliveredNanoseconds
-        guard latencySensitive,
+        // Scheduling boost expiry must not discard the slowest measurements.
+        guard touchAwaitingFrame,
               let deliveredNanoseconds,
-              metadata.generation > baselineGeneration,
-              metadata.commitTimestampNanoseconds >= deliveredNanoseconds else {
+              metadata.commitTimestampNanoseconds >= deliveredNanoseconds,
+              metadata.generation > baselineGeneration else {
             lock.unlock()
             return
         }
         touchAwaitingFrame = false
         touchInputFrameInFlight = false
-        touchDeliverySlicePending = false
         touchDeliveryTargetFrameCount = 0
         Self.appendLatencySampleLocked(
             metadata.commitTimestampNanoseconds - deliveredNanoseconds,
@@ -1978,6 +2031,8 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             to: &touchFrameToPublishSamples
         )
         if let queued = inFlightTouchQueuedNanoseconds {
+            performanceTimeline.recordTouchFrame(generation: metadata.generation,
+                queued: queued, delivered: deliveredNanoseconds)
             let endToEnd = publishedAtNanoseconds &- queued
             Self.appendLatencySampleLocked(
                 endToEnd,
@@ -2001,32 +2056,18 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             uploadedBytes: uploadedBytes,
             timestampNanoseconds: presentedAtNanoseconds
         )
-        performanceTimeline.recordFramePresented(
+        let recordedInteraction = performanceTimeline.recordFramePresented(
             generation: generation,
             presentedAtNanoseconds: presentedAtNanoseconds,
             uploadedByteCount: uploadedBytes
         )
         lock.lock()
-        let completedApplicationLaunch =
-            applicationLaunchAwaitingFrame &&
-            applicationLaunchFrameGeneration.map { generation >= $0 } == true
-        if completedApplicationLaunch {
-            applicationLaunchAwaitingFrame = false
-            applicationLaunchFrameGeneration = nil
-            applicationLaunchBoostDeadlineNanoseconds = nil
-        }
         let shouldWriteMetrics = !wrotePresentedFrameMetrics
         wrotePresentedFrameMetrics = true
         lock.unlock()
-        if completedApplicationLaunch {
-            _ = performanceTimeline.mark(
-                .applicationFirstVisibleFrame,
-                execution: executionMilestoneSnapshot()
-            )
-        }
         if shouldWriteMetrics {
             writePerformanceMetricsIfRequested()
-        } else if completedApplicationLaunch {
+        } else if recordedInteraction {
             writePerformanceMetricsIfRequested()
         }
     }
@@ -2118,57 +2159,6 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
     }
 
-    private func isSubstantialVisibleApplicationFrame(
-        metadata: VirtualFramebufferFrameMetadata
-    ) -> Bool {
-        let framePixels = metadata.width * metadata.height
-        let damagedPixels = metadata.damage.reduce(0) { partial, rectangle in
-            partial + rectangle.width * rectangle.height
-        }
-        guard framePixels > 0, damagedPixels >= framePixels / 8 else {
-            return false
-        }
-
-        var visibleSamples = 0
-        var sampledPixels = 0
-        let previousGeneration = metadata.generation == 0
-            ? nil
-            : metadata.generation - 1
-        _ = machine.virtioDisplay.withDisplayFrameBytes(
-            afterGeneration: previousGeneration
-        ) { frame, bytes in
-            guard frame.bytesPerPixel >= 3 else { return }
-            let sampleBudget = 2_048
-            let sampleStep = max(
-                1,
-                Int((Double(max(1, damagedPixels)) /
-                    Double(sampleBudget)).squareRoot())
-            )
-            for rectangle in frame.damage {
-                for y in stride(
-                    from: rectangle.y,
-                    to: rectangle.y + rectangle.height,
-                    by: sampleStep
-                ) {
-                    for x in stride(
-                        from: rectangle.x,
-                        to: rectangle.x + rectangle.width,
-                        by: sampleStep
-                    ) {
-                        let offset = y * frame.stride + x * frame.bytesPerPixel
-                        guard offset + 2 < bytes.count else { continue }
-                        sampledPixels += 1
-                        if bytes[offset] > 16 || bytes[offset + 1] > 16 ||
-                            bytes[offset + 2] > 16 {
-                            visibleSamples += 1
-                        }
-                    }
-                }
-            }
-        }
-        return sampledPixels > 0 && visibleSamples * 100 >= sampledPixels
-    }
-
 #if targetEnvironment(simulator)
     private func dumpFramebufferForDiagnosticsIfRequested() {
         guard ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_DUMP_FRAMEBUFFER"] == "1" else {
@@ -2250,14 +2240,29 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         return pending
     }
 
+    private var hasActiveTouchContact: Bool {
+        lock.lock()
+        let active = touchInteractionActive
+        lock.unlock()
+        return active
+    }
+
     private func configureExecutionProfile(
         touchActive: Bool,
         deliveryPending: Bool,
+        touchContactActive: Bool,
         applicationLaunchActive: Bool
     ) {
+        if touchActive || applicationLaunchActive {
+            machine.parallelVCPUCluster?.setContinuousExecutionPacing(enabled: false)
+        }
         let profile: ExecutionProfile
         if touchActive {
-            profile = deliveryPending ? .touchDelivery : .touchRendering
+            if deliveryPending {
+                profile = .touchDelivery
+            } else {
+                profile = touchContactActive ? .touchTracking : .touchRendering
+            }
         } else if applicationLaunchActive {
             profile = .applicationLaunch
         } else {
@@ -2273,35 +2278,35 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
 
         let wallClockBudget: UInt64
         let checkpointInterval: UInt64
+        let secondaryRunStepBudget: Int
         switch profile {
         case .touchDelivery:
             wallClockBudget = Self.touchDeliveryWallClockRunBudgetNanoseconds
             checkpointInterval = 1_024
+            secondaryRunStepBudget = Self.touchDeliverySecondaryRunSliceSteps
+        case .touchTracking:
+            wallClockBudget = Self.touchTrackingWallClockRunBudgetNanoseconds
+            checkpointInterval = 2_048
+            secondaryRunStepBudget = Self.touchTrackingSecondaryRunSliceSteps
         case .touchRendering:
             wallClockBudget = Self.touchRenderingWallClockRunBudgetNanoseconds
             checkpointInterval = 4_096
+            secondaryRunStepBudget = Self.touchRenderingSecondaryRunSliceSteps
         case .applicationLaunch:
             wallClockBudget = Self.applicationLaunchWallClockRunBudgetNanoseconds
             checkpointInterval = 8_192
+            secondaryRunStepBudget = Self.applicationLaunchSecondaryRunSliceSteps
         case .normal:
             wallClockBudget = Self.normalWallClockRunBudgetNanoseconds
             checkpointInterval = 4_096
+            secondaryRunStepBudget = Self.normalSecondaryRunSliceSteps
         }
         machine.vm.wallClockRunBudgetNanoseconds = wallClockBudget
         machine.vm.nativeCheckpointBlockInterval = checkpointInterval
         machine.parallelVCPUCluster?.configureRunBudget(
             wallClockRunBudgetNanoseconds: wallClockBudget,
             nativeCheckpointBlockInterval: checkpointInterval,
-            secondaryRunStepBudget: switch profile {
-            case .touchDelivery:
-                Self.touchDeliverySecondaryRunSliceSteps
-            case .touchRendering:
-                Self.touchRenderingSecondaryRunSliceSteps
-            case .applicationLaunch:
-                Self.applicationLaunchSecondaryRunSliceSteps
-            case .normal:
-                Self.normalSecondaryRunSliceSteps
-            }
+            secondaryRunStepBudget: secondaryRunStepBudget
         )
     }
 
@@ -2309,6 +2314,13 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         let deliveryProgress = machine.virtioInput.inputFrameDeliveryProgress
 
         lock.lock()
+        if touchDeliverySlicePending,
+           touchSchedulingDeliveryTargetFrameCount > 0,
+           deliveryProgress.delivered >=
+             touchSchedulingDeliveryTargetFrameCount {
+            touchDeliverySlicePending = false
+            touchSchedulingDeliveryTargetFrameCount = 0
+        }
         guard touchAwaitingFrame,
               latestTouchInjectedNanoseconds != nil,
               latestTouchDeliveredNanoseconds == nil,
@@ -2318,9 +2330,19 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let now = DispatchTime.now().uptimeNanoseconds
+        let targetFrame = touchDeliveryTargetFrameCount
+        lock.unlock()
+        guard let now = machine.virtioInput.inputFrameDeliveryTimestamp(for: targetFrame) else {
+            return
+        }
+        lock.lock()
+        guard touchAwaitingFrame, latestTouchDeliveredNanoseconds == nil,
+              touchDeliveryTargetFrameCount == targetFrame else {
+            lock.unlock()
+            return
+        }
         latestTouchDeliveredNanoseconds = now
-        touchDeliverySlicePending = false
+        performanceTimeline.recordInteractionStarted(atNanoseconds: now)
         if let queued = inFlightTouchQueuedNanoseconds {
             Self.appendLatencySampleLocked(now &- queued, to: &touchQueueToDeviceSamples)
         }
@@ -2328,23 +2350,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     }
 
     private func isTouchLatencySensitiveLocked(now: UInt64) -> Bool {
-        guard touchInteractionActive || touchAwaitingFrame else {
-            return false
-        }
-        let activityTimestamp = inFlightTouchQueuedNanoseconds ??
-            latestTouchQueuedNanoseconds
-        guard let queued = activityTimestamp,
-              now >= queued,
-              now - queued <= Self.touchInteractionWatchdogNanoseconds else {
-            touchInteractionActive = false
-            touchAwaitingFrame = false
-            touchInputFrameInFlight = false
-            touchDeliverySlicePending = false
-            touchDeliveryTargetFrameCount = 0
-            inFlightTouchQueuedNanoseconds = nil
-            return false
-        }
-        return true
+        interactionExecutionPolicy.isLatencySensitive(at: now)
     }
 
     private static func appendLatencySampleLocked(_ value: UInt64, to samples: inout [UInt64]) {
@@ -2400,7 +2406,8 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         if !output.isEmpty {
             recordShellPromptIfNeeded(output)
             recordInputLatencyIfNeeded()
-            onUART(output)
+            let visible = guestControlConsoleFilter.append(output)
+            if !visible.isEmpty { onUART(visible) }
         }
     }
 
@@ -2424,6 +2431,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private func recordShellPromptIfNeeded(_ bytes: [UInt8]) {
         var schedulePostReadyActions = false
         lock.lock()
+        let guestRecords = guestTraceDecoder.appendRecords(bytes)
         uartPromptTail += String(decoding: bytes, as: UTF8.self)
         if uartPromptTail.count > 1_024 {
             uartPromptTail.removeFirst(uartPromptTail.count - 1_024)
@@ -2433,14 +2441,6 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
                 uartPromptTail.contains("arm64viz-root #")
         )
         let foundWorkloadReady = uartPromptTail.contains("Phosh ready after")
-        var foundApplicationLaunch = false
-        let applicationLaunchMarker = "Pinecone app launch requested:"
-        while let markerRange = uartPromptTail.range(
-            of: applicationLaunchMarker
-        ) {
-            foundApplicationLaunch = true
-            uartPromptTail.removeSubrange(markerRange)
-        }
         if foundPrompt {
             shellPromptSeen = true
             displayContentVisible = false
@@ -2460,15 +2460,48 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             }
 #endif
         }
-        if foundApplicationLaunch {
-            let now = DispatchTime.now().uptimeNanoseconds
-            applicationLaunchAwaitingFrame = true
-            applicationLaunchFrameGeneration = nil
-            applicationLaunchBoostDeadlineNanoseconds = now &+
-                Self.applicationLaunchBoostNanoseconds
-            lastHostActivityNanoseconds = now
-        }
         lock.unlock()
+        for record in guestRecords {
+            if case .applicationLaunch(let name) = record {
+                let now = DispatchTime.now().uptimeNanoseconds
+                lock.lock()
+                applicationLaunchAwaitingFrame = true
+                expectedApplicationIDs = name == "settings"
+                    ? ["org.gnome.Settings", "gnome-control-center"] : []
+                applicationLaunchBoostDeadlineNanoseconds = now &+
+                    Self.applicationLaunchBoostNanoseconds
+                lastHostActivityNanoseconds = now
+                lock.unlock()
+                if performanceTimeline.mark(.applicationLaunchRequested,
+                    execution: executionMilestoneSnapshot()) {
+#if targetEnvironment(simulator)
+                    if captureHotPCProfile {
+                        (machine.vm.backend as? SoftwareARM64Backend)?.resetNativeHotPCProfile()
+                    }
+#endif
+                }
+                continue
+            }
+            if case .graphics(let event) = record {
+                performanceTimeline.recordGuestGraphics(event)
+                continue
+            }
+            guard case .applicationPresented(let appID) = record else { continue }
+            lock.lock()
+            let applicationPresented = applicationLaunchAwaitingFrame &&
+                expectedApplicationIDs.contains(appID)
+            if applicationPresented {
+                applicationLaunchAwaitingFrame = false
+                expectedApplicationIDs.removeAll(keepingCapacity: true)
+                applicationLaunchBoostDeadlineNanoseconds = nil
+            }
+            lock.unlock()
+            if applicationPresented {
+                _ = performanceTimeline.mark(.applicationSurfacePresented,
+                    execution: executionMilestoneSnapshot())
+            }
+        }
+        if !guestRecords.isEmpty { writePerformanceMetricsIfRequested() }
         if foundPrompt, performanceTimeline.mark(
             .shellPrompt,
             execution: executionMilestoneSnapshot()
@@ -2479,20 +2512,6 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             .interactiveWorkloadReady,
             execution: executionMilestoneSnapshot()
         ) {
-            writePerformanceMetricsIfRequested()
-        }
-        if foundApplicationLaunch, performanceTimeline.mark(
-            .applicationLaunchRequested,
-            execution: executionMilestoneSnapshot()
-        ) {
-#if targetEnvironment(simulator)
-            if ProcessInfo.processInfo.environment[
-                "PINECONE_SIMULATOR_HOT_PC_PROFILE"
-            ] == "1" {
-                (machine.vm.backend as? SoftwareARM64Backend)?
-                    .resetNativeHotPCProfile()
-            }
-#endif
             writePerformanceMetricsIfRequested()
         }
 #if targetEnvironment(simulator)
@@ -2518,6 +2537,17 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             if shouldUnlock {
+                let deadline = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
+                var visible = false
+                repeat {
+                    self.lock.lock()
+                    visible = self.displayContentVisible
+                    let stopped = self.stopRequested
+                    self.lock.unlock()
+                    if stopped { return }
+                    if !visible { usleep(100_000) }
+                } while !visible && DispatchTime.now().uptimeNanoseconds < deadline
+                guard visible else { return }
                 usleep(500_000)
                 let x: UInt32 = 240
                 let startY: UInt32 = 940
@@ -2552,9 +2582,23 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             for: .cachesDirectory,
             in: .userDomainMask
         ).first,
-        let data = try? JSONEncoder().encode(performanceTimeline.snapshot()) else {
+        let timelineData = try? JSONEncoder().encode(performanceTimeline.snapshot()),
+        var report = try? JSONSerialization.jsonObject(with: timelineData) as? [String: Any]
+        else {
             return
         }
+        report["graphics"] = [
+            "virtioGPU": machine.virtioDisplay.displayPerformanceCounters,
+            "metal": graphicsAccelerator?.performanceCounters ?? [:],
+        ]
+        lock.lock()
+        report["hotPCs"] = latestHotPCProfile
+        lock.unlock()
+        report["secondaryHotPCs"] = machine.parallelVCPUCluster?.secondaryHotPCProfile ?? []
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: report,
+            options: [.sortedKeys]
+        ) else { return }
         try? data.write(
             to: cacheDirectory.appendingPathComponent("pinecone-performance.json"),
             options: .atomic

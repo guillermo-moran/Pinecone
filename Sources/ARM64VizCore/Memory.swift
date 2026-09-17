@@ -280,6 +280,130 @@ public final class PhysicalMemory {
     }
 
     func copyOwnedDeviceBytes(
+        from ranges: [(address: GuestAddress, count: Int)],
+        to destination: inout [UInt8]
+    ) throws {
+        guard !ranges.isEmpty, !destination.isEmpty else {
+            if ranges.isEmpty && destination.isEmpty { return }
+            throw VMError.invalidMemoryAccess(address: ranges.first?.address ?? base, width: 0)
+        }
+        var spans: [AVZGuestMemorySpan] = []
+        spans.reserveCapacity(ranges.count)
+        var total = 0
+        for range in ranges {
+            guard range.count > 0,
+                  range.count <= destination.count,
+                  total <= destination.count - range.count else {
+                throw VMError.invalidMemoryAccess(address: range.address, width: range.count)
+            }
+            let offset = try index(for: range.address, width: range.count)
+            spans.append(AVZGuestMemorySpan(offset: offset, byte_count: range.count))
+            total += range.count
+        }
+        guard total == destination.count else {
+            throw VMError.invalidMemoryAccess(address: ranges[0].address, width: total)
+        }
+        let copied = spans.withUnsafeBufferPointer { spanBuffer in
+            destination.withUnsafeMutableBytes { destinationBytes in
+                avz_guest_memory_dma_readv_owned(
+                    nativeMemory,
+                    spanBuffer.baseAddress,
+                    spanBuffer.count,
+                    destinationBytes.baseAddress,
+                    destinationBytes.count
+                )
+            }
+        }
+        guard copied != 0 else {
+            throw VMError.invalidMemoryAccess(address: ranges[0].address, width: total)
+        }
+    }
+
+    func copyOwnedDeviceRectangle(
+        from ranges: [(address: GuestAddress, count: Int)],
+        logicalOffset: Int,
+        rowByteCount: Int,
+        rowStride: Int,
+        rowCount: Int,
+        to destination: UnsafeMutableRawPointer,
+        destinationByteCount: Int
+    ) throws {
+        let spans = try ownedDeviceSpans(ranges)
+        guard logicalOffset >= 0, rowByteCount > 0, rowStride >= rowByteCount,
+              rowCount > 0, destinationByteCount > 0 else {
+            throw VMError.invalidMemoryAccess(
+                address: ranges.first?.address ?? base,
+                width: rowByteCount
+            )
+        }
+        let copied = spans.withUnsafeBufferPointer {
+            avz_guest_memory_dma_read_rect_owned(
+                nativeMemory, $0.baseAddress, $0.count,
+                logicalOffset, rowByteCount, rowStride, rowCount,
+                destination, destinationByteCount
+            )
+        }
+        guard copied != 0 else {
+            throw VMError.invalidMemoryAccess(
+                address: ranges.first?.address ?? base,
+                width: rowByteCount
+            )
+        }
+    }
+
+    func copyOwnedDeviceRectangle(
+        from source: UnsafeRawPointer,
+        sourceByteCount: Int,
+        logicalOffset: Int,
+        rowByteCount: Int,
+        rowStride: Int,
+        rowCount: Int,
+        to ranges: [(address: GuestAddress, count: Int)]
+    ) throws {
+        let spans = try ownedDeviceSpans(ranges)
+        guard sourceByteCount > 0, logicalOffset >= 0, rowByteCount > 0,
+              rowStride >= rowByteCount, rowCount > 0 else {
+            throw VMError.invalidMemoryAccess(
+                address: ranges.first?.address ?? base,
+                width: rowByteCount
+            )
+        }
+        let copied = spans.withUnsafeBufferPointer {
+            avz_guest_memory_dma_write_rect_owned(
+                nativeMemory, $0.baseAddress, $0.count,
+                logicalOffset, rowByteCount, rowStride, rowCount,
+                source, sourceByteCount
+            )
+        }
+        guard copied != 0 else {
+            throw VMError.invalidMemoryAccess(
+                address: ranges.first?.address ?? base,
+                width: rowByteCount
+            )
+        }
+    }
+
+    private func ownedDeviceSpans(
+        _ ranges: [(address: GuestAddress, count: Int)]
+    ) throws -> [AVZGuestMemorySpan] {
+        guard !ranges.isEmpty else {
+            throw VMError.invalidMemoryAccess(address: base, width: 0)
+        }
+        return try ranges.map { range in
+            guard range.count > 0 else {
+                throw VMError.invalidMemoryAccess(
+                    address: range.address,
+                    width: range.count
+                )
+            }
+            return AVZGuestMemorySpan(
+                offset: try index(for: range.address, width: range.count),
+                byte_count: range.count
+            )
+        }
+    }
+
+    func copyOwnedDeviceBytes(
         from address: GuestAddress,
         count: Int,
         to destination: inout [UInt8],
@@ -611,6 +735,10 @@ public final class PhysicalMemory {
 
     func invalidateSharedTranslationCaches() {
         avz_guest_memory_invalidate_translations(nativeMemory)
+    }
+
+    func publishTranslationInvalidation(_ invalidation: AVZNativeTLBI) {
+        avz_guest_memory_publish_tlbi(nativeMemory, invalidation)
     }
 
     var sharedTranslationEpoch: UInt64 {

@@ -8,6 +8,7 @@ INSTANCE="${PINECONE_WLROOTS_LIMA_INSTANCE:-pinecone-wlroots}"
 
 mkdir -p "${OUTPUT_DIR}"
 cp "${ROOT_DIR}/scripts/patches/phoc-pinecone-layout.patch" "${PACKAGE_DIR}/"
+cp "${ROOT_DIR}/scripts/patches/phoc-pinecone-interactions.patch" "${PACKAGE_DIR}/"
 cp "${ROOT_DIR}/scripts/patches/wlroots-pinecone-0.20.2.patch" \
   "${PACKAGE_DIR}/wlroots-pinecone-0.20.2.patch.embed"
 
@@ -29,22 +30,23 @@ GUEST_BUILD_DIR="${GUEST_HOME}/pinecone-phoc-build"
 limactl shell "${INSTANCE}" mkdir -p "${GUEST_BUILD_DIR}"
 limactl copy "${PACKAGE_DIR}/APKBUILD" \
   "${PACKAGE_DIR}/phoc-pinecone-layout.patch" \
+  "${PACKAGE_DIR}/phoc-pinecone-interactions.patch" \
   "${PACKAGE_DIR}/wlroots-pinecone-0.20.2.patch.embed" \
   "${INSTANCE}:${GUEST_BUILD_DIR}/"
 limactl shell "${INSTANCE}" sudo -u "${GUEST_USER}" -g abuild sh -lc \
   "cd '${GUEST_BUILD_DIR}' && abuild -r"
 
 GUEST_PACKAGE="$(limactl shell "${INSTANCE}" sh -lc \
-  "find ~/packages -path '*/aarch64/phoc-0.57.0-r1.apk' -print -quit")"
+  "find ~/packages -path '*/aarch64/phoc-0.57.0-r5.apk' -print -quit")"
 [[ -n "${GUEST_PACKAGE}" ]] || {
   echo "Pinecone Phoc runtime package was not produced" >&2
   exit 1
 }
 limactl copy "${INSTANCE}:${GUEST_PACKAGE}" "${OUTPUT_DIR}/"
-PACKAGE="${OUTPUT_DIR}/phoc-0.57.0-r1.apk"
+PACKAGE="${OUTPUT_DIR}/phoc-0.57.0-r5.apk"
 INFO="$(bsdtar -xOf "${PACKAGE}" .PKGINFO)"
 grep -qx 'pkgname = phoc' <<<"${INFO}"
-grep -qx 'pkgver = 0.57.0-r1' <<<"${INFO}"
+grep -qx 'pkgver = 0.57.0-r5' <<<"${INFO}"
 grep -qx 'arch = aarch64' <<<"${INFO}"
 bsdtar -tf "${PACKAGE}" | grep -q '^usr/bin/phoc$'
 echo "Built and verified ${PACKAGE}"

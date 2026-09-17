@@ -248,6 +248,9 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
         handler: GuestDisplayPresentedHandler
     )?
 
+    private static let directSharedScanoutEnabled =
+        ProcessInfo.processInfo.environment["PINECONE_DIRECT_SHARED_SCANOUT"] == "1"
+
     var requiresSourceLease: Bool { textureUsesSharedStorage }
 
     init?(device: MTLDevice) {
@@ -309,7 +312,8 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
             return 0
         }
 
-        if metadata.hasStableStorage,
+        if Self.directSharedScanoutEnabled,
+           metadata.hasStableStorage,
            bindSharedTexture(
                device: device,
                metadata: metadata,

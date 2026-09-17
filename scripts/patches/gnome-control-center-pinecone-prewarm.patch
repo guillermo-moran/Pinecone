@@ -1,37 +1,46 @@
-diff --git a/shell/cc-application.c b/shell/cc-application.c
-index 68dcb93..428573a 100644
 --- a/shell/cc-application.c
 +++ b/shell/cc-application.c
-@@ -20,6 +20,8 @@
- #include "config.h"
+@@ -32,6 +32,15 @@
+ #include "cc-panel-loader.h"
+ #include "cc-window.h"
  
-+#include <errno.h>
- #include <stdlib.h>
-+#include <sys/resource.h>
- 
- #include <adwaita.h>
- #include <gio/gio.h>
-@@ -28,6 +30,9 @@ struct _CcApplication {
-   CcShellModel *model;
- 
-   CcWindow *window;
++typedef enum
++{
++  PINECONE_PREWARM_OFF,
++  PINECONE_PREWARM_PENDING,
++  PINECONE_PREWARM_READY,
++  PINECONE_PREWARM_INTERACTIVE,
++  PINECONE_PREWARM_STOPPED
++} PineconePrewarmState;
 +
-+  gboolean pinecone_prewarm_held;
-+  gboolean pinecone_prewarm_scheduled;
+ struct _CcApplication
+ {
+   AdwApplication  parent;
+@@ -39,6 +48,10 @@
+   CcShellModel   *model;
+ 
+   CcWindow       *window;
++
++  gboolean        pinecone_prewarm_held;
++  PineconePrewarmState pinecone_prewarm_state;
++  guint           pinecone_prewarm_source_id;
  };
  
- static void cc_application_quit (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
-@@ -44,5 +49,6 @@ const GOptionEntry all_options[] = {
+ static void cc_application_quit    (GSimpleAction *simple,
+@@ -73,6 +86,7 @@
+   { "verbose", 'v', G_OPTION_FLAG_NO_ARG, G_OPTION_ARG_CALLBACK, cmd_verbose_cb, N_("Enable verbose mode. Specify multiple times to increase verbosity"), NULL },
    { "search", 's', 0, G_OPTION_ARG_STRING, NULL, N_("Search for the string"), "SEARCH" },
    { "list", 'l', 0, G_OPTION_ARG_NONE, NULL, N_("List possible panel names and exit"), NULL },
 +  { "pinecone-prewarm", 0, G_OPTION_FLAG_HIDDEN, G_OPTION_ARG_NONE, NULL, NULL, NULL },
-   { G_OPTION_REMAINING, '\0', 0, G_OPTION_ARG_FILENAME_ARRAY, NULL,
-     N_("Panel to display"), N_("[PANEL] [ARGUMENT…]") },
+   { G_OPTION_REMAINING, '\0', 0, G_OPTION_ARG_FILENAME_ARRAY, NULL, N_("Panel to display"), N_("[PANEL] [ARGUMENT…]") },
    { NULL, 0, 0, 0, NULL, NULL, NULL } /* end the list */
-@@ -133,6 +139,49 @@ is_supported_desktop (void)
-   return FALSE;
- }
+ };
+@@ -204,8 +218,106 @@
+     }
  
+   return FALSE;
++}
++
 +static void
 +cc_application_ensure_window (CcApplication *self)
 +{
@@ -57,77 +66,153 @@ index 68dcb93..428573a 100644
 +               error->message);
 +}
 +
++static void
++pinecone_release_prewarm (CcApplication *self)
++{
++  if (self->pinecone_prewarm_held)
++    {
++      self->pinecone_prewarm_held = FALSE;
++      g_application_release (G_APPLICATION (self));
++    }
++}
++
++static void
++pinecone_cancel_prewarm (CcApplication       *self,
++                         PineconePrewarmState state)
++{
++  self->pinecone_prewarm_state = state;
++  /* Clear the ID before removal invokes the source's unref destroy notify. */
++  g_clear_handle_id (&self->pinecone_prewarm_source_id, g_source_remove);
++}
++
 +static gboolean
 +pinecone_finish_prewarm (gpointer user_data)
 +{
 +  CcApplication *self = CC_APPLICATION (user_data);
 +
-+  self->pinecone_prewarm_scheduled = FALSE;
-+  cc_application_ensure_window (self);
++  self->pinecone_prewarm_source_id = 0;
++  if (self->pinecone_prewarm_state != PINECONE_PREWARM_PENDING)
++    return G_SOURCE_REMOVE;
 +
-+  /* Realize the complete Settings hierarchy and its GdkSurface without
-+   * mapping it. A later normal GApplication activation only has to present
-+   * the already linked, parsed, styled and realized process. */
-+  gtk_widget_realize (GTK_WIDGET (self->window));
++  if (self->window == NULL)
++    {
++      self->pinecone_prewarm_state = PINECONE_PREWARM_STOPPED;
++      pinecone_release_prewarm (self);
++      return G_SOURCE_REMOVE;
++    }
++
++  self->pinecone_prewarm_state = PINECONE_PREWARM_READY;
++  gtk_widget_set_visible (GTK_WIDGET (self->window), FALSE);
++  gtk_widget_set_opacity (GTK_WIDGET (self->window), 1.0);
 +  pinecone_write_prewarm_ready_file ();
 +  g_message ("Pinecone Settings prewarm ready");
 +
 +  return G_SOURCE_REMOVE;
+ }
+ 
++static void
++pinecone_start_prewarm (CcApplication *self)
++{
++  /* Only an explicit option starts prewarm, and only once per process.
++   * In particular, a late prewarm request must never hide an active window. */
++  if (self->pinecone_prewarm_state != PINECONE_PREWARM_OFF)
++    return;
++
++  self->pinecone_prewarm_state = PINECONE_PREWARM_PENDING;
++  g_application_hold (G_APPLICATION (self));
++  self->pinecone_prewarm_held = TRUE;
++  cc_application_ensure_window (self);
++  if (self->pinecone_prewarm_state != PINECONE_PREWARM_PENDING)
++    return;
++
++  /* Do not synthesize an activation: every activation belongs to the user. */
++  gtk_widget_set_opacity (GTK_WIDGET (self->window), 0.0);
++  gtk_window_present (GTK_WINDOW (self->window));
++
++  /* Presentation may dispatch a real activation through a nested main loop. */
++  if (self->pinecone_prewarm_state == PINECONE_PREWARM_PENDING)
++    self->pinecone_prewarm_source_id =
++      g_timeout_add_full (G_PRIORITY_LOW,
++                          34,
++                          pinecone_finish_prewarm,
++                          g_object_ref (self),
++                          g_object_unref);
 +}
 +
  static gint
- cc_application_handle_local_options (GApplication *application, GVariantDict *options)
- {
-@@ -178,6 +227,30 @@ cc_application_command_line (GApplication            *application,
+ cc_application_handle_local_options (GApplication *application,
+                                      GVariantDict *options)
+@@ -250,6 +362,12 @@
    if (debug)
      cc_log_init ();
  
-+  if (g_variant_dict_contains (options, "pinecone-prewarm")) {
-+    cc_application_ensure_window (self);
-+    if (!self->pinecone_prewarm_held) {
-+      g_application_hold (application);
-+      self->pinecone_prewarm_held = TRUE;
++  if (g_variant_dict_contains (options, "pinecone-prewarm"))
++    {
++      pinecone_start_prewarm (self);
++      return 0;
 +    }
-+    if (!self->pinecone_prewarm_scheduled) {
-+      self->pinecone_prewarm_scheduled = TRUE;
-+      g_idle_add_full (G_PRIORITY_LOW,
-+                       pinecone_finish_prewarm,
-+                       g_object_ref (self),
-+                       g_object_unref);
-+    }
-+    return 0;
-+  }
-+
-+  /* The hidden prewarm instance is intentionally background-priority while
-+   * it parses resources and realizes its window. Restore the compositor's
-+   * interactive priority before handling the real launch request. */
-+  if (self->pinecone_prewarm_held &&
-+      setpriority (PRIO_PROCESS, 0, -5) != 0)
-+    g_warning ("Failed to restore Pinecone Settings priority: %s",
-+               g_strerror (errno));
 +
    g_application_activate (application);
  
-   if (g_variant_dict_lookup (options, "search", "&s", &search_str)) {
-@@ -237,6 +310,11 @@ cc_application_quit (GSimpleAction *simple,
+   if (g_variant_dict_lookup (options, "search", "&s", &search_str))
+@@ -298,6 +416,9 @@
+ {
+   CcApplication *self = CC_APPLICATION (user_data);
  
++  pinecone_cancel_prewarm (self, PINECONE_PREWARM_STOPPED);
++  pinecone_release_prewarm (self);
++
    if (self->window)
      gtk_window_destroy (GTK_WINDOW (self->window));
-+
-+  if (self->pinecone_prewarm_held) {
-+    self->pinecone_prewarm_held = FALSE;
-+    g_application_release (G_APPLICATION (self));
-+  }
  }
- 
- static void
-@@ -245,8 +323,7 @@ cc_application_activate (GApplication *application)
+@@ -308,13 +429,28 @@
  {
    CcApplication *self = CC_APPLICATION (application);
  
 -  if (!self->window)
 -    self->window = cc_window_new (GTK_APPLICATION (application), self->model);
++  pinecone_cancel_prewarm (self, PINECONE_PREWARM_INTERACTIVE);
 +  cc_application_ensure_window (self);
++  gtk_widget_set_opacity (GTK_WIDGET (self->window), 1.0);
  
    gtk_window_present (GTK_WINDOW (self->window));
++  pinecone_release_prewarm (self);
+ }
+ 
+ static void
++cc_application_shutdown (GApplication *application)
++{
++  CcApplication *self = CC_APPLICATION (application);
++
++  pinecone_cancel_prewarm (self, PINECONE_PREWARM_STOPPED);
++  pinecone_release_prewarm (self);
++  if (self->window)
++    gtk_widget_set_opacity (GTK_WIDGET (self->window), 1.0);
++
++  G_APPLICATION_CLASS (cc_application_parent_class)->shutdown (application);
++}
++
++static void
+ cc_application_startup (GApplication *application)
+ {
+   CcApplication *self = CC_APPLICATION (application);
+@@ -345,6 +481,11 @@
+ static void
+ cc_application_finalize (GObject *object)
+ {
++  CcApplication *self = CC_APPLICATION (object);
++
++  if (self->window)
++    g_object_remove_weak_pointer (G_OBJECT (self->window),
++                                  (gpointer *) &self->window);
+   /* Destroy the object storage cache when finalizing */
+   cc_object_storage_destroy ();
+ 
+@@ -380,6 +521,7 @@
+   object_class->constructor = cc_application_constructor;
+   application_class->activate = cc_application_activate;
+   application_class->startup = cc_application_startup;
++  application_class->shutdown = cc_application_shutdown;
+   application_class->command_line = cc_application_command_line;
+   application_class->handle_local_options = cc_application_handle_local_options;
  }

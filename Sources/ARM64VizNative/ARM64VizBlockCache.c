@@ -135,6 +135,7 @@ typedef struct {
     uint64_t serial;
     uint64_t validated_code_mutation_epoch;
     uint64_t validated_shared_code_mutation_epoch;
+    uint64_t validated_translation_epoch;
     uint64_t last_used;
     uint8_t valid;
     uint8_t prefetched;
@@ -176,6 +177,9 @@ struct AVZNativeBlockCache {
     uint64_t mutation_epoch;
     uint64_t code_mutation_epoch;
     uint64_t reset_epoch;
+    uint64_t translation_epoch;
+    AVZNativeInstructionMappingValidateCallback validate_mapping;
+    void *mapping_context;
     AVZGuestMemory *guest_memory;
     AVZNativeBlockCacheStatistics statistics;
 };
@@ -436,6 +440,22 @@ static int avz_entry_code_is_current(
     }
     if (entry->validated_code_mutation_epoch == cache->code_mutation_epoch) {
         return 1;
+    }
+    if (entry->validated_translation_epoch != cache->translation_epoch) {
+        if (cache->validate_mapping == NULL) return 0;
+        uint64_t epoch = cache->translation_epoch;
+        uint64_t previous_page = UINT64_MAX;
+        for (size_t index = 0; index < entry->block.instruction_count; index++) {
+            uint64_t va = entry->block.key.pc + index * sizeof(uint32_t);
+            if ((va >> 12) == previous_page) continue;
+            if (!cache->validate_mapping(cache->mapping_context, va,
+                    entry->block.physical_addresses[index])) return 0;
+            previous_page = va >> 12;
+        }
+        /* A callback may observe another shared TLBI. Do not acknowledge that
+         * newer epoch using a mapping checked before its publication. */
+        if (epoch != cache->translation_epoch) return 0;
+        entry->validated_translation_epoch = epoch;
     }
     if (!avz_block_code_pages_are_current(&entry->block)) {
         return 0;
@@ -973,6 +993,27 @@ void avz_native_block_cache_invalidate_decode_window(
     }
 }
 
+void avz_native_block_cache_invalidate_translation_mappings(AVZNativeBlockCache *cache) {
+    if (cache == NULL) return;
+    cache->decode_window_valid = 0;
+    avz_advance_nonzero_counter(&cache->translation_epoch);
+    /* Existing chain/link guards already observe this token. Physical code
+     * generations and decoded contents remain untouched. */
+    avz_advance_nonzero_counter(&cache->code_mutation_epoch);
+}
+
+void avz_native_block_cache_set_mapping_validator(
+    AVZNativeBlockCache *cache,
+    AVZNativeInstructionMappingValidateCallback validate,
+    void *context
+) {
+    if (cache == NULL) return;
+    if (cache->validate_mapping == validate && cache->mapping_context == context) return;
+    cache->validate_mapping = validate;
+    cache->mapping_context = context;
+    avz_native_block_cache_invalidate_translation_mappings(cache);
+}
+
 static int avz_decode_block(
     AVZNativeBlockCache *cache,
     AVZNativeDecodedBlock *block,
@@ -1198,6 +1239,7 @@ const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
         cache->code_mutation_epoch;
     cache->entries[entry_index].validated_shared_code_mutation_epoch =
         avz_native_block_cache_shared_code_mutation_epoch(cache);
+    cache->entries[entry_index].validated_translation_epoch = cache->translation_epoch;
     cache->entries[entry_index].valid = 1;
     cache->entries[entry_index].prefetched = cache->batch_prefetch_active;
     avz_touch_entry(cache, &cache->entries[entry_index]);

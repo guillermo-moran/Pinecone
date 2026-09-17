@@ -724,6 +724,43 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         }
     }
 
+    func testSharedCounterReadsDoNotExposePerCPUInstructionSkew() throws {
+        var ram = [UInt8](repeating: 0, count: 0x1000)
+        let memory = NativeTestMemory()
+        let context = Unmanaged.passUnretained(memory).toOpaque()
+        var clock = AVZNativeCounterClock()
+        XCTAssertEqual(avz_native_counter_clock_initialize(&clock, 100, 24_000_000), 1)
+        try ram.withUnsafeMutableBufferPointer { buffer in
+            var paths: [OpaquePointer] = []
+            defer { paths.forEach(avz_native_memory_fast_path_destroy) }
+            for _ in 0..<2 {
+                paths.append(try XCTUnwrap(avz_native_memory_fast_path_create(
+                    buffer.baseAddress, 0, UInt64(buffer.count), nil, context,
+                    nativeIdentityTranslateRAM, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)))
+            }
+            for (index, path) in paths.enumerated() {
+                var state = AVZNativeArchitecturalState()
+                state.counter_ticks = index == 0 ? 1_000_000_000_000 : 0
+                state.timer_cycles_per_instruction = 100
+                state.cntp_ctl_el0 = 1
+                state.cntp_cval_el0 = 0
+                avz_native_memory_fast_path_set_architectural_state(path, &state)
+                avz_native_memory_fast_path_set_counter_clock(path, &clock)
+            }
+            var previous: UInt64 = 0
+            for index in 0..<100 {
+                let path = paths[index % 2]
+                XCTAssertNotEqual(avz_native_memory_fast_path_advance_time(path, 1_000_000, 0), 0)
+                var value: UInt64 = 0
+                XCTAssertNotEqual(avz_native_fast_read_system_register(
+                    UnsafeMutableRawPointer(path), 0xd53b_e040, 0x4000, 0, 0, &value), 0)
+                XCTAssertGreaterThanOrEqual(value, previous)
+                XCTAssertLessThanOrEqual(value, avz_native_counter_clock_read(&clock))
+                previous = value
+            }
+        }
+    }
+
     func testNativeFastPathStopsAtArchitecturalTimerDeadline() throws {
         var ram = [UInt8](repeating: 0, count: 0x1000)
         let memory = NativeTestMemory()
@@ -4602,7 +4639,7 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         }
     }
 
-    func testMappedSuperblockBulkExecutesGLibBoundedMemcmpScan() throws {
+    func testMappedSuperblockExecutesGLibScanWithoutAssumingCalleeSemantics() throws {
         let fetch = NativeBlockFetchContext(words: [], virtualBase: 0x7fe8)
         let words: [UInt64: UInt32] = [
             0x7fe8: 0xa946_0fe2, 0x7fec: 0xaa18_03e1,
@@ -4679,7 +4716,7 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
                     )
                 }
                 return avz_native_execution_context_run_cached_chain_checkpointed(
-                    execution, cache, &key, 65_536, 65_536, 256, 64,
+                    execution, cache, &key, 65_536, 65_536, 65_536, 64,
                     nativeChainCheckpoint,
                     Unmanaged.passUnretained(checkpoint).toOpaque(),
                     nativeBlockFetch,
@@ -4714,13 +4751,7 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
             }
 
             XCTAssertGreaterThan(accelerated.superblock_dispatches, 0)
-            XCTAssertEqual(
-                accelerated.superblock_blocks,
-                accelerated.superblock_dispatches,
-                "semantic guest steps must not be mistaken for mapped blocks"
-            )
-            XCTAssertEqual(accelerated.fast_path_hits, 1)
-            XCTAssertEqual(accelerated.fast_path_steps, 769 * 49)
+            XCTAssertGreaterThan(accelerated.steps, 0)
             XCTAssertEqual(pc, 0x8060)
             XCTAssertEqual(registers[0], 0)
             XCTAssertEqual(registers[1], 0x5305)
@@ -4729,6 +4760,29 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
             XCTAssertEqual(registers[4], UInt64(Character("D").asciiValue!))
             XCTAssertEqual(registers[24], 0x5301)
             XCTAssertEqual(registers[25], 769)
+
+            // The same caller can resolve to an interposed function. A BL is
+            // not proof of memcmp semantics, even when the caller shape matches.
+            fetch.words[0x8ffc] = 0x5280_0020 // mov w0, #1
+            fetch.words[0x9000] = 0xd65f_03c0 // ret
+            for (address, word) in [(0x8ffc, UInt32(0x5280_0020)),
+                                    (0x9000, UInt32(0xd65f_03c0))] {
+                for byte in 0..<4 {
+                    ramBuffer[address + byte] = UInt8(truncatingIfNeeded: word >> (byte * 8))
+                }
+            }
+            avz_native_block_cache_clear(cache)
+            _ = loadAndRun()
+            _ = loadAndRun()
+            registers.withUnsafeMutableBufferPointer {
+                avz_native_execution_context_store(
+                    execution, $0.baseAddress, nil, nil,
+                    &sp, &pc, &pstate, &fpcr, &fpsr,
+                    &exclusiveAddress, &exclusiveSize, &exclusiveValid, &halted
+                )
+            }
+            XCTAssertEqual(pc, 0x8098, "The interposed comparator never returns equality")
+            XCTAssertEqual(registers[25], 1024)
         }
     }
 
