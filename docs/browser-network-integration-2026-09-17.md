@@ -64,3 +64,42 @@ No package-manager UI, browser-performance tuning, CPU decoder, or graphics
 pipeline changes are part of this work. The custom IPv4 bridge is not a complete
 replacement for a mature virtual network stack. Physical-device Wi-Fi/cellular
 handover was not tested; this verification used the iOS Simulator.
+
+## Guest Keyboard Packaging Fix
+
+The initial image omitted `/usr/lib/gtk-3.0/3.0.0/immodules.cache`.
+Extracting Alpine APKs does not execute the GTK package trigger, so shipping
+`im-wayland.so` alone did not register the input method. Squeekboard was running,
+but focusing the NetSurf address field did not request its keyboard.
+See [GTK input-module discovery](https://docs.gtk.org/gtk3/running.html).
+
+`generate-aarch64-rootfs-caches.sh` now runs the shipped ARM64
+`gtk-query-immodules-3.0` inside the build chroot and copies its registry into
+the image, alongside the existing font and image-loader caches. Both Linux and
+macOS/Lima builds reject an absent Wayland module. No iOS keyboard, forced OSK
+visibility, interpreter change, or per-launch cache rebuild is involved.
+
+Five offline cache-generation regressions cover success, missing query tool,
+query failure, missing Wayland registration, and non-GTK images. All 15 browser packaging tests
+also pass. The OSK mocked launcher regressions pass; their host kernel priority
+check is skipped when macOS refuses `setpriority`.
+
+In the running Simulator, generating the missing registry and relaunching
+NetSurf made Squeekboard appear on address-field focus. Tapping its keys edited
+the URL. The previously observed black popup was absent in that test; its
+independent rendering cause has not been established.
+
+The rebuilt Release app was then installed in the iPhone 17 Simulator and
+cold-booted from the new bundled image. Phosh unlocked, NetSurf rendered HTTPS,
+and address-field focus displayed Squeekboard without any manual cache repair.
+A tap on its `r` key inserted that character; backspace removed it. The native
+counter reported zero fallback instructions. The prior guest disk is preserved
+at `/tmp/pinecone-before-keyboard.ext4`.
+
+NetSurf was selected for an initial connectivity test, not because Firefox or
+Chromium is architecturally impossible. The current kernel disables namespaces
+and seccomp, and the demo session runs as root. A modern-browser integration
+should add and test the required isolation facilities and an unprivileged
+session instead of disabling its sandbox. See
+[Firefox's namespace use](https://support.mozilla.org/en-US/kb/linux-security-warning)
+and [Chromium's Linux sandbox](https://chromium.googlesource.com/chromium/src.git/+/master/sandbox/linux).

@@ -1,0 +1,172 @@
+Subject: [PATCH] virtio_input: map Pinecone v2 capture times into evdev time
+
+Based on Linux 6.18.38 drivers/virtio/virtio_input.c. Private opt-in protocol,
+gated by the exact Pinecone touch id/version/serial; other devices are unchanged.
+Protocol definitions live in Sources/ARM64VizCore/TouchPipeline.swift. The kernel
+build applies this patch through scripts/build-arm64-shell-kernel.sh.
+
+MSC_TIMESTAMP does not set evdev timestamps. Consume two private EV_MSC words
+carrying a full 64-bit host monotonic capture time, calibrate against a latched
+host clock snapshot, then call input_set_timestamp in guest CLOCK_MONOTONIC.
+Retaining the pair preserves capture intervals even when frames arrive in bursts
+or span virtqueue refills. Recalibrate at every BTN_TOUCH down and on PM restore,
+not mid-gesture, so idle/pacing drift cannot accumulate forever. Invalid/partial prefixes
+fall back to receipt time; future/backwards/overflowing times are bounded.
+An event predating guest boot saturates to 1ns (zero means unset in input core).
+
+The native two-vCPU counter and host uptime run at the same monotonic rate.
+One clock read's scheduling latency remains in the absolute offset, not in
+inter-sample deltas. This is intentionally not a generic virtio-input extension.
+
+--- a/drivers/virtio/virtio_input.c
++++ b/drivers/virtio/virtio_input.c
+@@ -9,6 +9,13 @@
+ #include <uapi/linux/virtio_input.h>
+ #include <linux/input/mt.h>
+ 
++/* Pinecone input protocol v2. These words are transport metadata, not evdev
++ * MSC_TIMESTAMP: libinput consumes the input_event CLOCK_MONOTONIC time.
++ */
++#define PINECONE_INPUT_CLOCK 0x80
++#define PINECONE_TIME_LO 0x7f00
++#define PINECONE_TIME_HI 0x7f01
++
+ struct virtio_input {
+ 	struct virtio_device       *vdev;
+ 	struct input_dev           *idev;
+@@ -19,7 +26,95 @@
+ 	struct virtio_input_event  evts[64];
+ 	spinlock_t                 lock;
+ 	bool                       ready;
++	bool                       pinecone_timestamps;
++	bool                       clock_valid;
++	bool                       time_low_valid;
++	bool                       capture_valid;
++	u32                        time_low;
++	u64                        capture_ns;
++	u64                        host_anchor_ns;
++	u64                        guest_anchor_ns;
++	u64                        last_time_ns;
+ };
++
++static u8 virtinput_cfg_select(struct virtio_input *vi, u8 select, u8 subsel);
++
++static u64 virtinput_map_time(struct virtio_input *vi, u64 capture, u64 now)
++{
++	u64 candidate, delta;
++
++	if (capture > S64_MAX) {
++		candidate = now;
++	} else if (capture <= vi->host_anchor_ns) {
++		delta = vi->host_anchor_ns - capture;
++		candidate = vi->guest_anchor_ns > delta ?
++			vi->guest_anchor_ns - delta : 1;
++	} else {
++		delta = capture - vi->host_anchor_ns;
++		candidate = U64_MAX - vi->guest_anchor_ns < delta ?
++			now : vi->guest_anchor_ns + delta;
++	}
++	/* A pair is retained across frames, preserving intervals in a burst.
++	 * Reject future/backwards times without changing the clock anchor.
++	 */
++	candidate = max(vi->last_time_ns, max(1ULL, min(candidate, now)));
++	vi->last_time_ns = candidate;
++	return candidate;
++}
++
++static void virtinput_apply_time(struct virtio_input *vi)
++{
++	u64 now;
++	__le64 host;
++
++	if (!vi->clock_valid) {
++		/* The host latches its monotonic clock on the subselect write.
++		 * Sampling before the write avoids assigning a future guest time.
++		 */
++		vi->guest_anchor_ns = ktime_get_ns();
++		if (virtinput_cfg_select(vi, PINECONE_INPUT_CLOCK, 0) != sizeof(host))
++			return;
++		virtio_cread_bytes(vi->vdev,
++			offsetof(struct virtio_input_config, u), &host, sizeof(host));
++		vi->host_anchor_ns = le64_to_cpu(host);
++		if (vi->host_anchor_ns > S64_MAX)
++			return;
++		vi->clock_valid = true;
++	}
++	now = ktime_get_ns();
++	input_set_timestamp(vi->idev,
++			ns_to_ktime(virtinput_map_time(vi, vi->capture_ns, now)));
++}
++
++static bool virtinput_pinecone_time(struct virtio_input *vi,
++				   u16 type, u16 code, u32 value)
++{
++	if (!vi->pinecone_timestamps)
++		return false;
++	if (type != EV_MSC || (code != PINECONE_TIME_LO &&
++			      code != PINECONE_TIME_HI)) {
++		/* BTN_TOUCH is the first data word in a down frame. Reanchor
++		 * here, never between motion samples of the same gesture.
++		 */
++		if (type == EV_KEY && code == BTN_TOUCH && value == 1)
++			vi->clock_valid = false;
++		if (vi->capture_valid)
++			virtinput_apply_time(vi);
++		vi->capture_valid = false;
++		vi->time_low_valid = false;
++		return false;
++	}
++	if (code == PINECONE_TIME_LO) {
++		vi->capture_valid = false;
++		vi->time_low = value;
++		vi->time_low_valid = true;
++		return true;
++	}
++	vi->capture_valid = vi->time_low_valid;
++	vi->capture_ns = ((u64)value << 32) | vi->time_low;
++	vi->time_low_valid = false;
++	return true;
++}
+ 
+ static void virtinput_queue_evtbuf(struct virtio_input *vi,
+ 				   struct virtio_input_event *evtbuf)
+@@ -41,10 +136,14 @@
+ 	if (vi->ready) {
+ 		while ((event = virtqueue_get_buf(vi->evt, &len)) != NULL) {
+ 			spin_unlock_irqrestore(&vi->lock, flags);
+-			input_event(vi->idev,
+-				    le16_to_cpu(event->type),
+-				    le16_to_cpu(event->code),
+-				    le32_to_cpu(event->value));
++			if (!virtinput_pinecone_time(vi,
++					le16_to_cpu(event->type),
++					le16_to_cpu(event->code),
++					le32_to_cpu(event->value)))
++				input_event(vi->idev,
++					    le16_to_cpu(event->type),
++					    le16_to_cpu(event->code),
++					    le32_to_cpu(event->value));
+ 			spin_lock_irqsave(&vi->lock, flags);
+ 			virtinput_queue_evtbuf(vi, event);
+ 		}
+@@ -272,6 +371,9 @@
+ 	} else {
+ 		vi->idev->id.bustype = BUS_VIRTUAL;
+ 	}
++	vi->pinecone_timestamps = vi->idev->id.vendor == 0x4156 &&
++		vi->idev->id.product == 1 && vi->idev->id.version == 2 &&
++		!strcmp(vi->serial, "arm64viz-touch0");
+ 
+ 	virtinput_cfg_bits(vi, VIRTIO_INPUT_CFG_PROP_BITS, 0,
+ 			   vi->idev->propbit, INPUT_PROP_CNT);
+@@ -378,6 +480,10 @@
+ 	struct virtio_input *vi = vdev->priv;
+ 	int err;
+ 
++	vi->clock_valid = false;
++	vi->time_low_valid = false;
++	vi->capture_valid = false;
++	vi->last_time_ns = 0;
+ 	err = virtinput_init_vqs(vi);
+ 	if (err)
+ 		return err;

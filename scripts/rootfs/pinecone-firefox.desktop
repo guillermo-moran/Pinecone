@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Firefox
+GenericName=Web Browser
+Comment=Browse the web with Firefox
+Exec=/usr/local/bin/pinecone-launch-firefox %u
+Icon=firefox
+Terminal=false
+DBusActivatable=false
+StartupNotify=true
+StartupWMClass=firefox
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;

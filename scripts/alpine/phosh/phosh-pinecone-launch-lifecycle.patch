@@ -1,0 +1,325 @@
+diff --git a/src/app-tracker.c b/src/app-tracker.c
+--- a/src/app-tracker.c
++++ b/src/app-tracker.c
+@@ -13,6 +13,7 @@
+ 
+ #include "app-list-model.h"
+ #include "app-tracker.h"
++#include "pinecone-launch-lifecycle.h"
+ #include "phosh-wayland.h"
+ #include "shell-priv.h"
+ #include "toplevel-manager.h"
+@@ -401,7 +402,7 @@
+   g_autofree char *startup_id = NULL;
+   const char *app_id;
+   PhoshAppState *state;
+-  gint32 pid;
++  gint32 pid = 0;
+ 
+   g_return_if_fail (G_IS_DESKTOP_APP_INFO (info));
+ 
+@@ -443,7 +444,6 @@
+                                g_strdup (app_id));
+   }
+ 
+-  g_object_unref (context);
+ }
+ 
+ static void
+@@ -470,7 +470,7 @@
+ 
+   g_hash_table_remove (self->apps, startup_id);
+  out:
+-  g_object_unref (context);
++  return;
+ }
+ 
+ 
+@@ -763,6 +763,7 @@
+     g_autoptr (GDesktopAppInfo) toplevel_info = phosh_get_desktop_app_info_for_app_id (window_id);
+     if (toplevel_info && g_app_info_equal (G_APP_INFO (toplevel_info), G_APP_INFO (info))) {
+       /* activate the first matching window for now, since we don't have toplevels sorted by last-focus yet */
++      pinecone_launch_activate (info, window_id);
+       phosh_toplevel_activate (toplevel, phosh_wayland_get_wl_seat (phosh_wayland_get_default ()));
+       g_signal_emit (self, signals[APP_ACTIVATED], 0, info);
+       return;
+@@ -770,7 +771,9 @@
+   }
+ 
+   context = gdk_display_get_app_launch_context (gdk_display_get_default ());
+-  g_object_ref (context);
++  /* GIO owns its async reference. A single extra ref released per signal is
++   * incorrect when one operation emits multiple launched/failed callbacks. */
++  pinecone_launch_begin (G_APP_LAUNCH_CONTEXT (context), info);
+ 
+   g_signal_connect_swapped (G_APP_LAUNCH_CONTEXT (context),
+                             "launch-started",
+@@ -796,6 +799,7 @@
+                                                        NULL, NULL,
+                                                        NULL, NULL,
+                                                        &error);
++  pinecone_launch_result (G_APP_LAUNCH_CONTEXT (context), success);
+   if (!success) {
+     g_critical ("Failed to launch app %s: %s",
+                 g_app_info_get_id (info),
+diff --git a/src/app-grid-button.c b/src/app-grid-button.c
+--- a/src/app-grid-button.c
++++ b/src/app-grid-button.c
+@@ -8,6 +8,7 @@
+ 
+ #include "phosh-config.h"
+ #include "app-tracker.h"
++#include "pinecone-launch-lifecycle.h"
+ #include "app-grid-button.h"
+ #include "clamp.h"
+ #include "fading-label.h"
+@@ -322,6 +323,7 @@
+   g_return_if_fail (G_IS_DESKTOP_APP_INFO (priv->info));
+ 
+   context = gdk_display_get_app_launch_context (gtk_widget_get_display (GTK_WIDGET (self)));
++  pinecone_launch_begin (G_APP_LAUNCH_CONTEXT (context), priv->info);
+ 
+   g_desktop_app_info_launch_action (G_DESKTOP_APP_INFO (priv->info),
+                                     action_name,
+diff --git a/src/pinecone-launch-lifecycle.h b/src/pinecone-launch-lifecycle.h
+--- /dev/null
++++ b/src/pinecone-launch-lifecycle.h
+@@ -0,0 +1,238 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++
++#include <gio/gdesktopappinfo.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++/* Control, not tracing: a single nonblocking UART write, <= 2048 bytes.
++ * Partial writes are not retried. The host resynchronizes on RS and has a
++ * monotonic 12-second boost watchdog even if every terminal event is lost. */
++typedef struct {
++  char token[37];
++  char desktop_id[96];
++  char app_ids[8][96];
++  guint n_ids;
++  char *startup_id;
++  gboolean started, launched, terminal;
++} PineconeLaunch;
++
++typedef struct {
++  PineconeLaunch launches[16];
++  guint count;
++} PineconeLaunchContext;
++
++static inline gboolean
++pinecone_launch_valid_id (const char *id)
++{
++  if (!id || !*id || strnlen (id, 96) >= 96)
++    return FALSE;
++  for (const char *p = id; *p; p++)
++    if (!g_ascii_isalnum (*p) && !strchr ("._-", *p))
++      return FALSE;
++  return TRUE;
++}
++
++static inline void
++pinecone_launch_add_id (PineconeLaunch *launch, const char *id)
++{
++  if (!pinecone_launch_valid_id (id))
++    return;
++  for (guint i = 0; i < launch->n_ids; i++)
++    if (strcmp (launch->app_ids[i], id) == 0)
++      return;
++  if (launch->n_ids < G_N_ELEMENTS (launch->app_ids))
++    g_strlcpy (launch->app_ids[launch->n_ids++], id, 96);
++}
++
++static inline void
++pinecone_launch_emit (PineconeLaunch *launch, const char *event)
++{
++  static int fd = -2;
++  char line[1536];
++  int n;
++
++  if (fd == -2)
++    fd = open ("/dev/ttyAMA0", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++  if (fd < 0)
++    return;
++  n = snprintf (line, sizeof line,
++                "\036PINECONE_APP_LIFECYCLE {\"version\":1,\"event\":\"%s\","
++                "\"token\":\"%s\",\"desktopID\":\"%s\",\"appIDs\":[",
++                event, launch->token, launch->desktop_id);
++  for (guint i = 0; n > 0 && (size_t)n < sizeof line && i < launch->n_ids; i++)
++    n += snprintf (line + n, sizeof line - n, "%s\"%s\"", i ? "," : "", launch->app_ids[i]);
++  if (n > 0 && (size_t)n + 3 < sizeof line) {
++    memcpy (line + n, "]}\n", 3);
++    (void)write (fd, line, n + 3);
++  }
++}
++
++static inline PineconeLaunch *
++pinecone_launch_new (PineconeLaunchContext *state, GAppInfo *info, const char *window_id)
++{
++  const char *desktop_id = g_app_info_get_id (info);
++  g_autofree char *stem = NULL;
++  g_autofree char *uuid = NULL;
++  g_auto (GStrv) aliases = NULL;
++  gsize n_aliases = 0;
++  PineconeLaunch *launch;
++
++  if (!pinecone_launch_valid_id (desktop_id) || state->count == G_N_ELEMENTS (state->launches))
++    return NULL;
++  launch = &state->launches[state->count++];
++  uuid = g_uuid_string_random ();
++  g_strlcpy (launch->token, uuid, sizeof launch->token);
++  g_strlcpy (launch->desktop_id, desktop_id, sizeof launch->desktop_id);
++  stem = g_strdup (desktop_id);
++  if (g_str_has_suffix (stem, ".desktop"))
++    stem[strlen (stem) - strlen (".desktop")] = '\0';
++  /* Never infer an executable name or lowercase IDs. The actual toplevel ID,
++   * desktop stem, StartupWMClass and image-owned explicit mappings may differ. */
++  pinecone_launch_add_id (launch, window_id);
++  pinecone_launch_add_id (launch, stem);
++  if (G_IS_DESKTOP_APP_INFO (info)) {
++    pinecone_launch_add_id (launch, g_desktop_app_info_get_startup_wm_class (G_DESKTOP_APP_INFO (info)));
++    aliases = g_desktop_app_info_get_string_list (G_DESKTOP_APP_INFO (info),
++                                                 "X-Pinecone-WaylandAppIds", &n_aliases);
++    for (gsize i = 0; i < MIN (n_aliases, 8); i++)
++      pinecone_launch_add_id (launch, aliases[i]);
++  }
++  if (!launch->n_ids) {
++    state->count--;
++    return NULL;
++  }
++  pinecone_launch_emit (launch, "requested");
++  return launch;
++}
++
++static inline const char *
++pinecone_launch_startup_id (GVariant *platform_data)
++{
++  const char *id = NULL;
++  if (platform_data && g_variant_is_of_type (platform_data, G_VARIANT_TYPE_VARDICT))
++    g_variant_lookup (platform_data, "startup-notification-id", "&s", &id);
++  return id && *id && strnlen (id, 513) <= 512 ? id : NULL;
++}
++
++static inline PineconeLaunch *
++pinecone_launch_find (PineconeLaunchContext *state, const char *startup_id)
++{
++  PineconeLaunch *anonymous = NULL;
++  for (guint i = 0; i < state->count; i++) {
++    PineconeLaunch *launch = &state->launches[i];
++    if (startup_id && g_strcmp0 (launch->startup_id, startup_id) == 0)
++      return launch;
++    if (!startup_id && !launch->startup_id && !launch->terminal && !launch->launched) {
++      /* Missing IDs cannot safely disambiguate multiple outstanding instances. */
++      if (anonymous)
++        return NULL;
++      anonymous = launch;
++    }
++  }
++  return anonymous;
++}
++
++/* These are normal (not swapped) GAppLaunchContext callbacks. launch-failed
++ * carries only a startup ID, unlike launch-started/launched's info + variant. */
++static inline void
++pinecone_launch_started (GAppLaunchContext *context, GAppInfo *info,
++                         GVariant *platform_data, gpointer data)
++{
++  PineconeLaunchContext *state = data;
++  const char *id = pinecone_launch_startup_id (platform_data);
++  PineconeLaunch *launch = pinecone_launch_find (state, id);
++  (void)context;
++  if (launch && launch->started)
++    return; /* Duplicate started: never renew the token/deadline. */
++  for (guint i = 0; !launch && i < state->count; i++) {
++    if (!state->launches[i].started && !state->launches[i].launched && !state->launches[i].terminal) {
++      launch = &state->launches[i];
++      break;
++    }
++  }
++  if (!launch)
++    launch = pinecone_launch_new (state, info, NULL);
++  if (launch) {
++    launch->started = TRUE;
++    launch->startup_id = g_strdup (id);
++  }
++}
++
++static inline void
++pinecone_launch_launched (GAppLaunchContext *context, GAppInfo *info,
++                          GVariant *platform_data, gpointer data)
++{
++  PineconeLaunch *launch = pinecone_launch_find (data, pinecone_launch_startup_id (platform_data));
++  (void)context;
++  (void)info;
++  if (!launch || launch->terminal || launch->launched)
++    return;
++  launch->launched = TRUE;
++  pinecone_launch_emit (launch, "launched");
++}
++
++static inline void
++pinecone_launch_failed (GAppLaunchContext *context, const char *startup_id, gpointer data)
++{
++  PineconeLaunch *launch = pinecone_launch_find (data, startup_id);
++  (void)context;
++  if (!launch || launch->terminal)
++    return;
++  launch->terminal = TRUE;
++  pinecone_launch_emit (launch, "failed");
++}
++
++static inline void
++pinecone_launch_context_free (gpointer data)
++{
++  PineconeLaunchContext *state = data;
++  for (guint i = 0; i < state->count; i++) {
++    PineconeLaunch *launch = &state->launches[i];
++    if (!launch->terminal && !launch->launched)
++      pinecone_launch_emit (launch, "cancelled");
++    g_free (launch->startup_id);
++  }
++  g_free (state);
++}
++
++static inline void
++pinecone_launch_begin (GAppLaunchContext *context, GAppInfo *info)
++{
++  PineconeLaunchContext *state;
++  if (g_object_get_data (G_OBJECT (context), "pinecone-launch"))
++    return;
++  state = g_new0 (PineconeLaunchContext, 1);
++  g_object_set_data_full (G_OBJECT (context), "pinecone-launch", state, pinecone_launch_context_free);
++  pinecone_launch_new (state, info, NULL);
++  g_signal_connect (context, "launch-started", G_CALLBACK (pinecone_launch_started), state);
++  g_signal_connect (context, "launched", G_CALLBACK (pinecone_launch_launched), state);
++  g_signal_connect (context, "launch-failed", G_CALLBACK (pinecone_launch_failed), state);
++}
++
++static inline void
++pinecone_launch_result (GAppLaunchContext *context, gboolean success)
++{
++  PineconeLaunchContext *state = g_object_get_data (G_OBJECT (context), "pinecone-launch");
++  if (success || !state)
++    return;
++  /* Synchronous validation/spawn failures need not emit any context signal. */
++  for (guint i = 0; i < state->count; i++) {
++    PineconeLaunch *launch = &state->launches[i];
++    if (!launch->terminal && !launch->launched) {
++      launch->terminal = TRUE;
++      pinecone_launch_emit (launch, "failed");
++    }
++  }
++}
++
++static inline void
++pinecone_launch_activate (GAppInfo *info, const char *window_id)
++{
++  PineconeLaunchContext state = {0};
++  PineconeLaunch *launch = pinecone_launch_new (&state, info, window_id);
++  if (launch)
++    pinecone_launch_emit (launch, "launched");
++}

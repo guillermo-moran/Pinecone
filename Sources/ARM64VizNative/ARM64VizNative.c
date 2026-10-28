@@ -1,5 +1,8 @@
 #include "ARM64VizNative.h"
 #include "ARM64VizGuestMemoryInternal.h"
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+#include "ARM64VizThreadedPrototype.h"
+#endif
 
 #include <math.h>
 #include <stdatomic.h>
@@ -137,6 +140,20 @@ static uint64_t read_vector_element(const AVZNativeCPU *cpu, unsigned vector, un
         return (cpu->v[vector].low >> bit_offset) & lane_mask;
     }
     return (cpu->v[vector].high >> (bit_offset - 64)) & lane_mask;
+}
+
+static uint64_t vector_element_to_general(
+    const AVZNativeCPU *cpu, const AVZNativeInstruction *instruction
+) {
+    uint64_t value = read_vector_element(
+        cpu, instruction->rn, instruction->condition, instruction->bits);
+    if ((instruction->flags & 1u) != 0u) {
+        value = (uint64_t)sign_extend_u64(value, instruction->bits);
+        if ((instruction->flags & 2u) == 0u) {
+            value &= UINT64_C(0xffffffff);
+        }
+    }
+    return value;
 }
 
 static void write_vector_element(
@@ -655,6 +672,9 @@ static int execute_simd_narrow_high_neon(
     AVZNativeCPU *cpu,
     const AVZNativeInstruction *instruction
 ) {
+    if ((instruction->flags & 64u) != 0u) {
+        return 0; /* Saturating forms update guest FPSR in the shared handler. */
+    }
     unsigned source_bits = instruction->bits;
     unsigned writes_upper_half = instruction->flags & 1u;
     uint64_t narrowed = 0;
@@ -2883,9 +2903,11 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         break;
     }
 
-    if ((instruction & UINT32_C(0xbfe0fc00)) == UINT32_C(0x0e003c00)) {
+    if ((instruction & UINT32_C(0xbfe0fc00)) == UINT32_C(0x0e003c00) ||
+        (instruction & UINT32_C(0xbfe0fc00)) == UINT32_C(0x0e002c00)) {
         uint32_t imm5 = (instruction >> 16) & 0x1f;
         uint32_t q = (instruction >> 30) & 1u;
+        unsigned signed_move = ((instruction >> 12) & 1u) == 0u;
         if (imm5 == 0) {
             return 0;
         }
@@ -2895,7 +2917,8 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         }
         unsigned element_bits = 8u << trailing;
         unsigned lane = imm5 >> (trailing + 1u);
-        if (element_bits > 64 || (element_bits == 64) != (q != 0)) {
+        if (signed_move ? element_bits >= (q != 0u ? 64u : 32u)
+                        : (element_bits > 64u || (element_bits == 64u) != (q != 0u))) {
             return 0;
         }
         decoded->kind = AVZ_NATIVE_OP_SIMD_MOVE_VECTOR_ELEMENT_TO_GENERAL;
@@ -2903,6 +2926,7 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         decoded->rn = (instruction >> 5) & 0x1f;
         decoded->bits = (uint8_t)element_bits;
         decoded->condition = (uint8_t)lane;
+        decoded->flags = (uint8_t)(signed_move | (q << 1));
         return 1;
     }
 
@@ -2967,8 +2991,10 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         return 1;
     }
 
-    if ((instruction & UINT32_C(0xbf80fc00)) == UINT32_C(0x0f005400) ||
-        (instruction & UINT32_C(0xbf80fc00)) == UINT32_C(0x2f005400)) {
+    /* immh=0 belongs to modified immediates, including ORR/BIC #imm, LSL #16. */
+    if ((instruction & UINT32_C(0x00780000)) != 0u &&
+        ((instruction & UINT32_C(0xbf80fc00)) == UINT32_C(0x0f005400) ||
+         (instruction & UINT32_C(0xbf80fc00)) == UINT32_C(0x2f005400))) {
         unsigned encoded_shift = (instruction >> 16) & 0x7fu;
         unsigned q = (instruction >> 30) & 1u;
         if (encoded_shift < 8u) {
@@ -3115,7 +3141,8 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         return 1;
     }
 
-    if ((instruction & UINT32_C(0x9f3ffc00)) == UINT32_C(0x0e202800)) {
+    /* S/UADDLP and S/UADALP differ only in accumulation (bit 14). */
+    if ((instruction & UINT32_C(0x9f3fbc00)) == UINT32_C(0x0e202800)) {
         unsigned size = (instruction >> 22) & 3u;
         if (size > 2) {
             return 0;
@@ -3125,7 +3152,8 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         decoded->rn = (instruction >> 5) & 0x1f;
         decoded->bits = (uint8_t)(8u << size);
         decoded->flags = (uint8_t)((((instruction >> 30) & 1u) != 0 ? 1u : 0u) |
-            (((instruction >> 29) & 1u) != 0 ? 2u : 0u));
+            (((instruction >> 29) & 1u) != 0 ? 2u : 0u) |
+            (((instruction >> 14) & 1u) != 0 ? 4u : 0u));
         return 1;
     }
 
@@ -3445,6 +3473,20 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         return 1;
     }
 
+    if ((instruction & UINT32_C(0xbfa0fc00)) == UINT32_C(0x2ea0d400)) {
+        unsigned q = (instruction >> 30) & 1u;
+        unsigned is_double = (instruction >> 22) & 1u;
+        if (is_double != 0u && q == 0u) {
+            return 0;
+        }
+        decoded->kind = AVZ_NATIVE_OP_SIMD_SCALAR_FP_ABSOLUTE_DIFFERENCE;
+        decoded->rd = instruction & 0x1f;
+        decoded->rn = (instruction >> 5) & 0x1f;
+        decoded->rm = (instruction >> 16) & 0x1f;
+        decoded->flags = (uint8_t)(is_double | 2u | (q << 2));
+        return 1;
+    }
+
     switch (instruction & UINT32_C(0xffe0fc00)) {
     case UINT32_C(0x7ea0d400):
     case UINT32_C(0x7ee0d400):
@@ -3471,6 +3513,19 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         decoded->flags = (uint8_t)(((instruction >> 30) & 1u) |
             ((((instruction >> 29) & 1u) != 0u) ? 2u : 0u) |
             ((((instruction >> 11) & 1u) != 0u) ? 4u : 0u));
+        return 1;
+    }
+
+    /* Scalar FADDP reduces Vn.2S/2D using the existing lane-selected add. */
+    if ((instruction & UINT32_C(0xffbffc00)) == UINT32_C(0x7e30d800)) {
+        unsigned is_double = (instruction >> 22) & 1u;
+        decoded->kind = AVZ_NATIVE_OP_FP_SCALAR_ARITHMETIC;
+        decoded->rd = instruction & 0x1f;
+        decoded->rn = (instruction >> 5) & 0x1f;
+        decoded->rm = decoded->rn;
+        decoded->bits = is_double ? 64u : 32u;
+        decoded->condition = 1u;
+        decoded->flags = (uint8_t)(32u | (is_double << 2));
         return 1;
     }
 
@@ -3655,16 +3710,18 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
     }
 
     /*
-     * FMUL (vector, by element): multiply every FP lane in Vn by one selected
+     * FMUL (scalar/vector, by element): multiply FP lanes in Vn by one selected
      * FP element from Vm.  Only the base Armv8 single- and double-precision
-     * arrangements are accepted here; FP16, scalar by-element forms, and
+     * arrangements are accepted here; FP16 and
      * FMULX remain outside this narrowly gated family.
      *
      * Reuse AVZ_NATIVE_OP_FP_SCALAR_ARITHMETIC so the existing Swift ABI and
      * vector-state classification remain unchanged. Private flag bit 5 marks
-     * the by-element vector form; condition carries the selected source lane.
+     * the by-element source; condition carries the selected source lane.
      */
-    if ((instruction & UINT32_C(0xbf80f400)) == UINT32_C(0x0f809000)) {
+    if ((instruction & UINT32_C(0xbf80f400)) == UINT32_C(0x0f809000) ||
+        (instruction & UINT32_C(0xff80f400)) == UINT32_C(0x5f809000)) {
+        unsigned scalar = (instruction >> 28) & 1u;
         unsigned q = (instruction >> 30) & 1u;
         unsigned size = (instruction >> 22) & 3u;
         unsigned l = (instruction >> 21) & 1u;
@@ -3675,8 +3732,8 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         if (size == 2u) {
             element_bits = 32u;
             source_lane = (h << 1) | l;
-        } else if (size == 3u && q != 0u && l == 0u) {
-            /* The D form is 2D only and uses H as its one-bit lane index. */
+        } else if (size == 3u && (scalar != 0u || q != 0u) && l == 0u) {
+            /* Double precision uses H as its one-bit lane index. */
             element_bits = 64u;
             source_lane = h;
         }
@@ -3689,7 +3746,7 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
             decoded->bits = (uint8_t)element_bits;
             decoded->condition = (uint8_t)source_lane;
             decoded->flags = (uint8_t)(2u | ((element_bits == 64u) ? 4u : 0u) |
-                8u | (q << 4) | 32u);
+                (scalar != 0u ? 0u : (8u | (q << 4))) | 32u);
             return 1;
         }
         /* Neighboring encodings continue through the existing decoder. */
@@ -4161,6 +4218,24 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         return 1;
     }
 
+    /* SABD/UABD/SABA/UABA: flag 5 selects absolute difference, 6 unsigned,
+     * and 7 accumulation. These forms only have 8/16/32-bit elements. */
+    if ((instruction & UINT32_C(0x9f20f400)) == UINT32_C(0x0e207400)) {
+        unsigned size = (instruction >> 22) & 3u;
+        if (size == 3u) {
+            return 0;
+        }
+        decoded->kind = AVZ_NATIVE_OP_SIMD_ADD_VECTOR;
+        decoded->rd = instruction & 0x1f;
+        decoded->rn = (instruction >> 5) & 0x1f;
+        decoded->rm = (instruction >> 16) & 0x1f;
+        decoded->bits = (uint8_t)(8u << size);
+        decoded->flags = (uint8_t)(32u | ((instruction >> 30) & 1u) |
+            (((instruction >> 29) & 1u) << 6) |
+            (((instruction >> 11) & 1u) << 7));
+        return 1;
+    }
+
     /* ADD/SUB (Advanced SIMD scalar): the only allocated element is D. */
     if ((instruction & UINT32_C(0xdf20fc00)) == UINT32_C(0x5e208400)) {
         unsigned size = (instruction >> 22) & 3u;
@@ -4193,7 +4268,20 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         return 1;
     }
 
-    if ((instruction & UINT32_C(0xbf20fc00)) == UINT32_C(0x2e204400)) {
+    if ((instruction & UINT32_C(0xdf20fc00)) == UINT32_C(0x5e204400)) {
+        if (((instruction >> 22) & 3u) != 3u) {
+            return 0;
+        }
+        decoded->kind = AVZ_NATIVE_OP_SIMD_UNSIGNED_SHIFT_REGISTER;
+        decoded->rd = instruction & 0x1f;
+        decoded->rn = (instruction >> 5) & 0x1f;
+        decoded->rm = (instruction >> 16) & 0x1f;
+        decoded->bits = 64u;
+        decoded->flags = (instruction & UINT32_C(0x20000000)) ? 0u : 2u;
+        return 1;
+    }
+
+    if ((instruction & UINT32_C(0x9f20fc00)) == UINT32_C(0x0e204400)) {
         unsigned q = (instruction >> 30) & 1u;
         unsigned size = (instruction >> 22) & 3u;
         unsigned element_bits = 8u << size;
@@ -4205,7 +4293,7 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         decoded->rn = (instruction >> 5) & 0x1f;
         decoded->rm = (instruction >> 16) & 0x1f;
         decoded->bits = (uint8_t)element_bits;
-        decoded->flags = (uint8_t)q;
+        decoded->flags = (uint8_t)(q | ((instruction & UINT32_C(0x20000000)) ? 0u : 2u));
         return 1;
     }
 
@@ -4484,16 +4572,16 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         return 1;
     }
 
-    if ((instruction & UINT32_C(0xfffffc00)) == UINT32_C(0x7ee0b800)) {
+    if ((instruction & UINT32_C(0xdffffc00)) == UINT32_C(0x5ee0b800)) {
         decoded->kind = AVZ_NATIVE_OP_SIMD_INTEGER_NEGATE;
         decoded->rd = instruction & 0x1f;
         decoded->rn = (instruction >> 5) & 0x1f;
         decoded->bits = 64;
-        decoded->flags = 2u;
+        decoded->flags = (uint8_t)(2u | ((instruction & UINT32_C(0x20000000)) ? 0u : 4u));
         return 1;
     }
 
-    if ((instruction & UINT32_C(0xbf3ffc00)) == UINT32_C(0x2e20b800)) {
+    if ((instruction & UINT32_C(0x9f3ffc00)) == UINT32_C(0x0e20b800)) {
         unsigned q = (instruction >> 30) & 1u;
         unsigned element_bits = 8u << ((instruction >> 22) & 3u);
         if (element_bits > 64u || (element_bits == 64u && q == 0u)) {
@@ -4503,7 +4591,7 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         decoded->rd = instruction & 0x1f;
         decoded->rn = (instruction >> 5) & 0x1f;
         decoded->bits = (uint8_t)element_bits;
-        decoded->flags = (uint8_t)q;
+        decoded->flags = (uint8_t)(q | ((instruction & UINT32_C(0x20000000)) ? 0u : 4u));
         return 1;
     }
 
@@ -4671,6 +4759,65 @@ int avz_native_decode_instruction(uint32_t instruction, AVZNativeInstruction *de
         decoded->flags = (uint8_t)((((instruction >> 30) & 1u) != 0 ? 1u : 0u) |
             (((instruction >> 29) & 1u) != 0 ? 2u : 0u));
         return 1;
+    }
+
+    /* Shifted saturating narrow. immh=0 is the modified-immediate class. */
+    switch (instruction & UINT32_C(0xbf80f400)) {
+    case UINT32_C(0x0f009400):
+    case UINT32_C(0x2f009400):
+    case UINT32_C(0x2f008400):
+    case UINT32_C(0x1f009400):
+    case UINT32_C(0x3f009400):
+    case UINT32_C(0x3f008400): {
+        unsigned encoded = (instruction >> 16) & 0x7fu;
+        unsigned scalar = (instruction >> 28) & 1u;
+        if (encoded < 8u) {
+            break;
+        }
+        if (encoded >= 64u || (scalar && (instruction & UINT32_C(0x40000000)) == 0u)) {
+            return 0;
+        }
+        unsigned source_bits = encoded < 16u ? 16u : encoded < 32u ? 32u : 64u;
+        decoded->kind = AVZ_NATIVE_OP_SIMD_NARROW_HIGH;
+        decoded->rd = instruction & 0x1f;
+        decoded->rn = (instruction >> 5) & 0x1f;
+        decoded->bits = (uint8_t)source_bits;
+        decoded->shift_amount = (uint8_t)(source_bits - encoded);
+        decoded->condition = (instruction & UINT32_C(0x1000)) == 0u
+            ? 0u : ((instruction >> 29) & 1u) ? 2u : 1u;
+        decoded->flags = (uint8_t)(64u | 16u | (((instruction >> 11) & 1u) << 3) |
+            (scalar ? 128u : ((instruction >> 30) & 1u)));
+        return 1;
+    }
+    default:
+        break;
+    }
+
+    /* Saturating narrow: condition selects signed-to-unsigned, signed, unsigned.
+     * Scalar forms use one lane; vector *2 forms preserve the low half. */
+    switch (instruction & UINT32_C(0xbf3ffc00)) {
+    case UINT32_C(0x2e212800):
+    case UINT32_C(0x0e214800):
+    case UINT32_C(0x2e214800):
+    case UINT32_C(0x3e212800):
+    case UINT32_C(0x1e214800):
+    case UINT32_C(0x3e214800): {
+        unsigned size = (instruction >> 22) & 3u;
+        unsigned scalar = (instruction >> 28) & 1u;
+        if (size == 3u || (scalar != 0u && (instruction & UINT32_C(0x40000000)) == 0u)) {
+            return 0;
+        }
+        decoded->kind = AVZ_NATIVE_OP_SIMD_NARROW_HIGH;
+        decoded->rd = instruction & 0x1f;
+        decoded->rn = (instruction >> 5) & 0x1f;
+        decoded->bits = (uint8_t)(16u << size);
+        decoded->condition = (instruction & UINT32_C(0x6000)) == UINT32_C(0x2000)
+            ? 0u : ((instruction >> 29) & 1u) != 0u ? 2u : 1u;
+        decoded->flags = (uint8_t)(64u | (scalar ? 128u : ((instruction >> 30) & 1u)));
+        return 1;
+    }
+    default:
+        break;
     }
 
     /* XTN/XTN2: truncate each source lane to half its width. */
@@ -6135,7 +6282,7 @@ static int execute_decoded_instruction(
         write_register(
             cpu,
             instruction->rd,
-            read_vector_element(cpu, instruction->rn, instruction->condition, instruction->bits)
+            vector_element_to_general(cpu, instruction)
         );
         cpu->pc = pc + 4;
         return 1;
@@ -6307,9 +6454,13 @@ static int execute_decoded_instruction(
             cpu->pc = pc + 4;
             return 1;
         }
+        uint64_t scalar_rhs_bits = (instruction->flags & 32u) != 0u
+            ? read_vector_element(cpu, instruction->rm, instruction->condition,
+                                  is_double ? 64u : 32u)
+            : cpu->v[instruction->rm].low;
         if (is_double) {
             union { uint64_t bits; double value; } lhs = {cpu->v[instruction->rn].low};
-            union { uint64_t bits; double value; } rhs = {cpu->v[instruction->rm].low};
+            union { uint64_t bits; double value; } rhs = {scalar_rhs_bits};
             union { double value; uint64_t bits; } result;
             if (operation == 0) {
                 result.value = lhs.value + rhs.value;
@@ -6325,7 +6476,7 @@ static int execute_decoded_instruction(
             cpu->v[instruction->rd] = (AVZNativeVectorRegister){result.bits, 0};
         } else {
             union { uint32_t bits; float value; } lhs = {(uint32_t)cpu->v[instruction->rn].low};
-            union { uint32_t bits; float value; } rhs = {(uint32_t)cpu->v[instruction->rm].low};
+            union { uint32_t bits; float value; } rhs = {(uint32_t)scalar_rhs_bits};
             union { float value; uint32_t bits; } result;
             if (operation == 0) {
                 result.value = lhs.value + rhs.value;
@@ -6916,17 +7067,28 @@ static int execute_decoded_instruction(
     }
     case AVZ_NATIVE_OP_SIMD_SCALAR_FP_ABSOLUTE_DIFFERENCE: {
         int is_double = (instruction->flags & 1u) != 0;
-        if (is_double) {
-            union { uint64_t bits; double value; } lhs = {cpu->v[instruction->rn].low};
-            union { uint64_t bits; double value; } rhs = {cpu->v[instruction->rm].low};
-            union { double value; uint64_t bits; } result = {fabs(lhs.value - rhs.value)};
-            cpu->v[instruction->rd] = (AVZNativeVectorRegister){result.bits, 0};
-        } else {
-            union { uint32_t bits; float value; } lhs = {(uint32_t)cpu->v[instruction->rn].low};
-            union { uint32_t bits; float value; } rhs = {(uint32_t)cpu->v[instruction->rm].low};
-            union { float value; uint32_t bits; } result = {fabsf(lhs.value - rhs.value)};
-            cpu->v[instruction->rd] = (AVZNativeVectorRegister){(uint64_t)result.bits, 0};
+        unsigned element_bits = is_double ? 64u : 32u;
+        unsigned lanes = (instruction->flags & 2u) != 0u
+            ? ((instruction->flags & 4u) != 0u ? 128u : 64u) / element_bits : 1u;
+        AVZNativeVectorRegister result = {0, 0};
+        for (unsigned lane = 0; lane < lanes; lane++) {
+            uint64_t lhs_bits = read_vector_element(cpu, instruction->rn, lane, element_bits);
+            uint64_t rhs_bits = read_vector_element(cpu, instruction->rm, lane, element_bits);
+            uint64_t result_bits;
+            if (is_double) {
+                union { uint64_t bits; double value; } lhs = {lhs_bits};
+                union { uint64_t bits; double value; } rhs = {rhs_bits};
+                union { double value; uint64_t bits; } value = {fabs(lhs.value - rhs.value)};
+                result_bits = value.bits;
+            } else {
+                union { uint32_t bits; float value; } lhs = {(uint32_t)lhs_bits};
+                union { uint32_t bits; float value; } rhs = {(uint32_t)rhs_bits};
+                union { float value; uint32_t bits; } value = {fabsf(lhs.value - rhs.value)};
+                result_bits = value.bits;
+            }
+            write_vector_element(&result, lane, element_bits, result_bits);
         }
+        cpu->v[instruction->rd] = result;
         cpu->pc = pc + 4;
         return 1;
     }
@@ -7337,6 +7499,29 @@ static int execute_decoded_instruction(
     }
     case AVZ_NATIVE_OP_SIMD_ADD_VECTOR: {
         unsigned element_bits = instruction->bits;
+        if ((instruction->flags & 32u) != 0u) {
+            unsigned vector_bits = (instruction->flags & 1u) != 0u ? 128u : 64u;
+            int is_unsigned = (instruction->flags & 64u) != 0u;
+            uint64_t lane_mask = mask_for_bits(element_bits);
+            AVZNativeVectorRegister result = {0, 0};
+            for (unsigned lane = 0; lane < vector_bits / element_bits; lane++) {
+                int64_t lhs = is_unsigned
+                    ? (int64_t)read_vector_element(cpu, instruction->rn, lane, element_bits)
+                    : (int64_t)sign_extend_vector_element(cpu, instruction->rn, lane, element_bits);
+                int64_t rhs = is_unsigned
+                    ? (int64_t)read_vector_element(cpu, instruction->rm, lane, element_bits)
+                    : (int64_t)sign_extend_vector_element(cpu, instruction->rm, lane, element_bits);
+                /* At most 32-bit operands: their full difference fits int64_t. */
+                uint64_t value = (uint64_t)(lhs >= rhs ? lhs - rhs : rhs - lhs);
+                if ((instruction->flags & 128u) != 0u) {
+                    value += read_vector_element(cpu, instruction->rd, lane, element_bits);
+                }
+                write_vector_element(&result, lane, element_bits, value & lane_mask);
+            }
+            cpu->v[instruction->rd] = result;
+            cpu->pc = pc + 4;
+            return 1;
+        }
         if ((instruction->flags & 4u) != 0u) {
             unsigned destination_bits = element_bits * 2u;
             unsigned lane_count = 128u / destination_bits;
@@ -7406,7 +7591,16 @@ static int execute_decoded_instruction(
                     : 0;
             } else {
                 unsigned magnitude = (unsigned)(-shift);
-                shifted = magnitude < element_bits ? value >> magnitude : 0;
+                int negative = (instruction->flags & 2u) != 0u &&
+                    (value & (UINT64_C(1) << (element_bits - 1u))) != 0u;
+                if (magnitude >= element_bits) {
+                    shifted = negative ? lane_mask : 0u;
+                } else {
+                    shifted = value >> magnitude;
+                    if (negative) {
+                        shifted |= lane_mask ^ (lane_mask >> magnitude);
+                    }
+                }
             }
             write_vector_element(&result, lane, element_bits, shifted);
         }
@@ -7423,7 +7617,10 @@ static int execute_decoded_instruction(
         AVZNativeVectorRegister result = {0, 0};
         for (unsigned lane = 0; lane < vector_bits / element_bits; lane++) {
             uint64_t source = read_vector_element(cpu, instruction->rn, lane, element_bits);
-            write_vector_element(&result, lane, element_bits, (UINT64_C(0) - source) & lane_mask);
+            int absolute = (instruction->flags & 4u) != 0u;
+            uint64_t value = absolute && (source >> (element_bits - 1u)) == 0u
+                ? source : (UINT64_C(0) - source) & lane_mask;
+            write_vector_element(&result, lane, element_bits, value);
         }
         cpu->v[instruction->rd] = result;
         cpu->pc = pc + 4;
@@ -7537,6 +7734,62 @@ static int execute_decoded_instruction(
         return 1;
     }
     case AVZ_NATIVE_OP_SIMD_NARROW_HIGH: {
+        if ((instruction->flags & 64u) != 0u) {
+            unsigned source_bits = instruction->bits;
+            unsigned destination_bits = source_bits / 2u;
+            unsigned lanes = (instruction->flags & 128u) ? 1u : 128u / source_bits;
+            unsigned upper = instruction->flags & 1u;
+            uint64_t maximum = instruction->condition == 1u
+                ? (UINT64_C(1) << (destination_bits - 1u)) - 1u
+                : mask_for_bits(destination_bits);
+            int64_t minimum = instruction->condition == 1u
+                ? -(INT64_C(1) << (destination_bits - 1u)) : 0;
+            AVZNativeVectorRegister result = upper ? cpu->v[instruction->rd]
+                : (AVZNativeVectorRegister){0, 0};
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t value;
+                int saturated = 0;
+                if (instruction->condition == 2u) {
+                    value = read_vector_element(cpu, instruction->rn, lane, source_bits);
+                    if ((instruction->flags & 16u) != 0u) {
+                        __uint128_t wide = value;
+                        if ((instruction->flags & 8u) != 0u) {
+                            wide += ((__uint128_t)1) << (instruction->shift_amount - 1u);
+                        }
+                        value = (uint64_t)(wide >> instruction->shift_amount);
+                    }
+                    if (value > maximum) {
+                        value = maximum;
+                        saturated = 1;
+                    }
+                } else {
+                    int64_t source = (int64_t)sign_extend_vector_element(
+                        cpu, instruction->rn, lane, source_bits);
+                    if ((instruction->flags & 16u) != 0u) {
+                        __int128 wide = source;
+                        if ((instruction->flags & 8u) != 0u) {
+                            wide += ((__int128)1) << (instruction->shift_amount - 1u);
+                        }
+                        source = (int64_t)(wide >> instruction->shift_amount);
+                    }
+                    if (source < minimum) {
+                        source = minimum;
+                        saturated = 1;
+                    } else if (source > (int64_t)maximum) {
+                        source = (int64_t)maximum;
+                        saturated = 1;
+                    }
+                    value = (uint64_t)source;
+                }
+                if (saturated) {
+                    cpu->fpsr |= UINT64_C(1) << 27;
+                }
+                write_vector_element(&result, lane + (upper ? lanes : 0u), destination_bits, value);
+            }
+            cpu->v[instruction->rd] = result;
+            cpu->pc = pc + 4;
+            return 1;
+        }
 #if defined(__aarch64__) && defined(__ARM_NEON)
         if (execute_simd_narrow_high_neon(cpu, instruction)) {
             cpu->pc = pc + 4;
@@ -8650,6 +8903,9 @@ static int execute_decoded_instruction(
                     instruction->bits
                 );
                 sum = (uint64_t)(first + second);
+            }
+            if ((instruction->flags & 4u) != 0u) {
+                sum += read_vector_element(cpu, instruction->rd, lane, destination_bits);
             }
             write_vector_element(&result, lane, destination_bits, sum);
         }
@@ -10794,7 +11050,60 @@ static AVZNativeBlockResult avz_native_run_decoded_block_full_generic(
 
 #endif
 
-static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped(
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((always_inline))
+#endif
+static inline int avz_native_code_span_is_current(
+    const uint64_t *code_token, uint64_t code_epoch,
+    const uint64_t *shared_token, uint64_t shared_epoch
+) {
+    return code_token != NULL && *code_token == code_epoch &&
+        (shared_epoch == 0 || (shared_token != NULL &&
+         __atomic_load_n(shared_token, __ATOMIC_ACQUIRE) == shared_epoch));
+}
+
+typedef struct AVZNativeSuperblock AVZNativeSuperblock;
+
+typedef struct {
+    AVZNativeBlockCache *cache;
+    const AVZNativeDecodedBlock *block;
+    const uint64_t *serial_token;
+    uint64_t serial;
+    uint64_t reset_epoch;
+    AVZNativeBlockKey key;
+    const AVZNativeSuperblock *superblock;
+} AVZNativeExecutionSpan;
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((cold, noinline))
+#endif
+static int avz_native_revalidate_execution_span(
+    const AVZNativeExecutionSpan *span,
+    uint64_t *code_epoch, uint64_t *shared_epoch
+);
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((always_inline))
+#endif
+static inline int avz_native_execution_span_is_current(
+    const AVZNativeExecutionSpan *span,
+    const uint64_t *code_token, uint64_t *code_epoch,
+    const uint64_t *shared_token, uint64_t *shared_epoch
+) {
+    if (span != NULL && span->block != NULL &&
+        (span->serial_token == NULL || span->serial == 0 ||
+         *span->serial_token != span->serial)) {
+        return 0;
+    }
+    if (avz_native_code_span_is_current(
+            code_token, *code_epoch, shared_token, *shared_epoch)) {
+        return 1;
+    }
+    return span != NULL && avz_native_revalidate_execution_span(
+        span, code_epoch, shared_epoch);
+}
+
+static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped_span(
     const AVZNativeInstruction *restrict instructions,
     size_t instruction_count,
     uint64_t base_pc,
@@ -10819,7 +11128,8 @@ static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped(
     const AVZNativeBlockCache *block_cache,
     uint64_t code_mutation_epoch,
     uint64_t shared_code_mutation_epoch,
-    int uses_fast_memory_context
+    int uses_fast_memory_context,
+    const AVZNativeExecutionSpan *execution_span
 ) {
     AVZNativeBlockResult result = {
         .steps = 0,
@@ -10833,28 +11143,24 @@ static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped(
         return result;
     }
 
-    if (instruction_pcs != NULL) {
-        const uint64_t *code_epoch_token =
-            avz_native_block_cache_code_mutation_epoch_token(block_cache);
-        const uint64_t *shared_code_epoch_token =
-            avz_native_block_cache_shared_code_mutation_epoch_token(
-                block_cache);
-        if (code_epoch_token == NULL ||
-            *code_epoch_token != code_mutation_epoch ||
-            (shared_code_mutation_epoch != 0 &&
-             (shared_code_epoch_token == NULL ||
-              __atomic_load_n(
-                  shared_code_epoch_token,
-                  __ATOMIC_ACQUIRE
-              ) != shared_code_mutation_epoch))) {
-            return result;
-        }
+    const uint64_t *code_epoch_token =
+        avz_native_block_cache_code_mutation_epoch_token(block_cache);
+    const uint64_t *shared_code_epoch_token =
+        avz_native_block_cache_shared_code_mutation_epoch_token(block_cache);
+    if ((instruction_pcs != NULL || block_cache != NULL) &&
+        !avz_native_execution_span_is_current(execution_span,
+            code_epoch_token, &code_mutation_epoch,
+            shared_code_epoch_token, &shared_code_mutation_epoch)) {
+        return result;
     }
+    uint64_t entry_mutation_epoch = execution_span == NULL
+        ? avz_native_block_cache_mutation_epoch(block_cache) : 0;
 
 #define cpu (*cpu_state)
 
 #if !defined(AVZ_DISABLE_COMPUTED_GOTO)
     const AVZNativeInstruction *instruction = 0;
+    AVZNativeInstruction callback_instruction;
     uint64_t index64 = 0;
     size_t boundary_cursor = 1;
 
@@ -10872,6 +11178,29 @@ static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped(
         } \
         goto dispatch; \
     } while (0)
+
+#define AVZ_PRESERVE_CALLBACK_INSTRUCTION() \
+    do { \
+        if (block_cache != NULL && instruction_pcs == NULL) { \
+            callback_instruction = *instruction; \
+            instruction = &callback_instruction; \
+        } \
+    } while (0)
+
+    goto dispatch;
+callback_step:
+    result.steps++;
+    if (instruction_pcs != NULL) index64++;
+    /* Callbacks may write code, remap it, or recycle a resident single block.
+     * Copied traces do not depend on resident entries while executing. */
+    if (block_cache != NULL &&
+        (!avz_native_execution_span_is_current(execution_span,
+             code_epoch_token, &code_mutation_epoch,
+             shared_code_epoch_token, &shared_code_mutation_epoch) ||
+         (execution_span == NULL && instruction_pcs == NULL && entry_mutation_epoch !=
+             avz_native_block_cache_mutation_epoch(block_cache)))) {
+        AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+    }
 
 dispatch:
     if (result.steps >= max_steps) {
@@ -10899,13 +11228,12 @@ dispatch:
             if (instruction_pcs[index64] != cpu.pc) {
                 AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
             }
-            /*
-             * The complete mapped trace was validated immediately before
-             * entry. It contains at most 32 blocks, and cache maintenance,
-             * barriers, or other synchronization points terminate chaining.
-             * Rechecking a global epoch at every internal boundary only
-             * serializes ordinary immutable Linux and shared-library text.
-             */
+            /* A different vCPU may have changed code since trace entry. */
+            if (!avz_native_execution_span_is_current(execution_span,
+                    code_epoch_token, &code_mutation_epoch,
+                    shared_code_epoch_token, &shared_code_mutation_epoch)) {
+                AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+            }
             result.mapped_blocks++;
             boundary_cursor++;
         }
@@ -11112,6 +11440,7 @@ dispatch:
             memory_context,
             &fast_steps
         );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
         break;
     case AVZ_NATIVE_SEMANTIC_STORE_PAIR_FILL:
         used_semantic_fast_path = try_execute_store_pair_fill_loop(
@@ -11124,9 +11453,21 @@ dispatch:
             memory_context,
             &fast_steps
         );
+        semantic_fast_path_exits_mapped_block = used_semantic_fast_path;
         break;
     case AVZ_NATIVE_SEMANTIC_NONE:
         break;
+    }
+    if (block_cache != NULL &&
+        (!avz_native_execution_span_is_current(execution_span,
+            code_epoch_token, &code_mutation_epoch,
+            shared_code_epoch_token, &shared_code_mutation_epoch) ||
+         (execution_span == NULL && instruction_pcs == NULL && entry_mutation_epoch !=
+            avz_native_block_cache_mutation_epoch(block_cache)))) {
+        result.steps += fast_steps;
+        result.fast_path_steps += fast_steps;
+        result.fast_path_hits += used_semantic_fast_path != 0;
+        AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
     }
     if (used_semantic_fast_path) {
         result.steps += fast_steps;
@@ -11286,10 +11627,25 @@ op_add_sub_immediate: {
     uint64_t lhs = masked_operand(read_base_register(&cpu, instruction->rn), bits);
     uint64_t rhs = masked_operand((uint64_t)instruction->immediate, bits);
     uint64_t value = 0;
-    if (subtract) {
-        rhs = (~rhs) & mask_for_bits(bits);
+    uint64_t flags = 0;
+    if (bits == 32 || bits == 64) {
+        value = masked_operand(subtract ? lhs - rhs : lhs + rhs, bits);
+        if (set_flags) {
+            /* Operands and result are already narrowed to the decoded width. */
+            uint64_t sign = UINT64_C(1) << (bits - 1);
+            uint64_t overflow = (lhs ^ value) &
+                (subtract ? lhs ^ rhs : ~(lhs ^ rhs));
+            flags = ((value & sign) ? UINT64_C(0x80000000) : 0) |
+                (value == 0 ? UINT64_C(0x40000000) : 0) |
+                ((subtract ? lhs >= rhs : value < lhs) ? UINT64_C(0x20000000) : 0) |
+                ((overflow & sign) ? UINT64_C(0x10000000) : 0);
+        }
+    } else {
+        if (subtract) {
+            rhs = (~rhs) & mask_for_bits(bits);
+        }
+        flags = add_with_carry_nzcv(lhs, rhs, subtract ? 1 : 0, bits, &value);
     }
-    uint64_t flags = add_with_carry_nzcv(lhs, rhs, subtract ? 1 : 0, bits, &value);
     if (set_flags) {
         cpu.pstate = (cpu.pstate & ~UINT64_C(0xf0000000)) | (flags & UINT64_C(0xf0000000));
         write_register(&cpu, instruction->rd, value);
@@ -11518,6 +11874,7 @@ op_data_processing_two_source: {
 }
 
 op_load_literal: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     if (instruction->flags == 3u) {
         cpu.pc += 4;
         AVZ_THREADED_STEP();
@@ -11539,7 +11896,7 @@ op_load_literal: {
     }
     write_register(&cpu, instruction->rt, value);
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_conditional_compare: {
@@ -11676,6 +12033,7 @@ op_unsigned_multiply_high: {
 }
 
 op_system_register_read: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t value = 0;
     uint16_t key = decoded_system_register_key(instruction->raw);
     int use_local_system_registers =
@@ -11713,10 +12071,11 @@ op_system_register_read: {
     }
     write_register(&cpu, instruction->rt, value);
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_system_register_write: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t value = read_register(&cpu, instruction->rt);
     uint16_t key = decoded_system_register_key(instruction->raw);
     int use_local_system_registers =
@@ -11756,7 +12115,7 @@ op_system_register_write: {
         break;
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_barrier:
@@ -11765,6 +12124,7 @@ op_barrier:
     AVZ_THREADED_STEP();
 
 op_system_instruction:
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     if (execute_system_instruction == 0 ||
         !execute_system_instruction(
             memory_context,
@@ -11775,15 +12135,16 @@ op_system_instruction:
         AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_UNSUPPORTED);
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 
 op_exception_return:
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     if (exception_return == 0 ||
         !exception_return(memory_context, &cpu.pstate, &cpu.sp, &cpu.pc)) {
         result.unsupported_instruction = instruction->raw;
         AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_UNSUPPORTED);
     }
-    AVZ_THREADED_STEP();
+    goto callback_step;
 
 op_pstate_immediate:
     if (instruction->flags == 0x6u) {
@@ -11795,6 +12156,7 @@ op_pstate_immediate:
     AVZ_THREADED_STEP();
 
 op_synchronous_exception:
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     if (synchronous_exception == 0 ||
         !synchronous_exception(
             memory_context,
@@ -11808,9 +12170,10 @@ op_synchronous_exception:
         AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_UNSUPPORTED);
     }
     clear_exclusive_reservation(&cpu);
-    AVZ_THREADED_STEP();
+    goto callback_step;
 
 op_wait:
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     if (wait == 0) {
         result.unsupported_instruction = instruction->raw;
         AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_UNSUPPORTED);
@@ -11826,13 +12189,13 @@ op_wait:
             AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_YIELDED);
         }
     }
-    AVZ_THREADED_STEP();
+    goto callback_step;
 
 op_simd_move_vector_element_to_general:
     write_register(
         &cpu,
         instruction->rd,
-        read_vector_element(&cpu, instruction->rn, instruction->condition, instruction->bits)
+        vector_element_to_general(&cpu, instruction)
     );
     cpu.pc += 4;
     AVZ_THREADED_STEP();
@@ -11902,6 +12265,7 @@ op_simd_shift_right_immediate:
     AVZ_THREADED_STEP();
 
 op_simd_load_store_multiple_structure:
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     if (try_execute_simd_multiple_structure_bulk(
             &cpu,
             instruction,
@@ -11909,7 +12273,7 @@ op_simd_load_store_multiple_structure:
             write_memory,
             memory_context
         )) {
-        AVZ_THREADED_STEP();
+        goto callback_step;
     }
     goto op_generic;
 
@@ -12000,6 +12364,7 @@ op_logical_immediate: {
 }
 
 op_load_store_register_offset: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t offset = extended_register_value(
         read_register(&cpu, instruction->rm),
         instruction->condition
@@ -12040,10 +12405,11 @@ op_load_store_register_offset: {
         clear_exclusive_reservation(&cpu);
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_load_acquire_store_release: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t address = read_base_register(&cpu, instruction->rn);
     uint64_t value = 0;
     if ((instruction->flags & 1) != 0) {
@@ -12075,10 +12441,11 @@ op_load_acquire_store_release: {
         clear_exclusive_reservation(&cpu);
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_load_store_exclusive: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t address = read_base_register(&cpu, instruction->rn);
     uint64_t value = 0;
     if ((instruction->flags & 1) != 0) {
@@ -12148,10 +12515,11 @@ op_load_store_exclusive: {
         clear_exclusive_reservation(&cpu);
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_load_store_unsigned_immediate: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t address = read_base_register(&cpu, instruction->rn) +
         (uint64_t)instruction->immediate;
     uint64_t value = 0;
@@ -12189,7 +12557,7 @@ op_load_store_unsigned_immediate: {
         clear_exclusive_reservation(&cpu);
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_simd_compare_equal_vector: {
@@ -12294,6 +12662,7 @@ op_simd_count_leading_zeros: {
 }
 
 op_load_store_signed_immediate: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t base = read_base_register(&cpu, instruction->rn);
     uint64_t address = add_signed_offset(base, instruction->immediate);
     uint64_t value = 0;
@@ -12338,10 +12707,11 @@ op_load_store_signed_immediate: {
         );
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_load_store_pair: {
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     uint64_t base = read_base_register(&cpu, instruction->rn);
     uint64_t first_address = add_signed_offset(base, instruction->immediate);
     uint64_t second_address = first_address + instruction->width;
@@ -12413,7 +12783,7 @@ op_load_store_pair: {
         );
     }
     cpu.pc += 4;
-    AVZ_THREADED_STEP();
+    goto callback_step;
 }
 
 op_simd_duplicate_general:
@@ -12425,15 +12795,25 @@ op_simd_duplicate_vector_element:
     AVZ_THREADED_STEP();
 
 op_simd_load_store_single_structure_lane:
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     if (!execute_simd_load_store_single_structure_lane(
             &cpu, instruction, read_memory, write_memory,
             uses_fast_memory_context, memory_context)) {
         result.unsupported_instruction = instruction->raw;
         AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_UNSUPPORTED);
     }
-    AVZ_THREADED_STEP();
+    goto callback_step;
 
 op_generic:
+    if (block_cache != NULL &&
+        (!avz_native_execution_span_is_current(execution_span,
+            code_epoch_token, &code_mutation_epoch,
+            shared_code_epoch_token, &shared_code_mutation_epoch) ||
+         (execution_span == NULL && instruction_pcs == NULL && entry_mutation_epoch !=
+            avz_native_block_cache_mutation_epoch(block_cache)))) {
+        AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+    }
+    AVZ_PRESERVE_CALLBACK_INSTRUCTION();
     result.generic_dispatches++;
     {
         int execution_status = execute_decoded_instruction(
@@ -12461,18 +12841,27 @@ op_generic:
             AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_YIELDED);
         }
     }
-    AVZ_THREADED_STEP();
+    goto callback_step;
 
 done:
     return result;
 
 #undef AVZ_THREADED_FINISH
 #undef AVZ_THREADED_STEP
+#undef AVZ_PRESERVE_CALLBACK_INSTRUCTION
 #else
     (void)fill_memory;
     uint64_t index64 = 0;
     size_t boundary_cursor = 1;
     while (result.steps < max_steps) {
+        if (block_cache != NULL &&
+            (!avz_native_execution_span_is_current(execution_span,
+                code_epoch_token, &code_mutation_epoch,
+                shared_code_epoch_token, &shared_code_mutation_epoch) ||
+             (execution_span == NULL && instruction_pcs == NULL && entry_mutation_epoch !=
+                avz_native_block_cache_mutation_epoch(block_cache)))) {
+            break;
+        }
         if (cpu.halted) {
             result.status = AVZ_NATIVE_STATUS_HALTED;
             break;
@@ -12502,7 +12891,8 @@ done:
                 break;
             }
         }
-        const AVZNativeInstruction *instruction = &instructions[index64];
+        AVZNativeInstruction instruction_snapshot = instructions[index64];
+        const AVZNativeInstruction *instruction = &instruction_snapshot;
         int execution_status = execute_decoded_instruction(
             instruction,
             &cpu,
@@ -12539,6 +12929,38 @@ done:
     return result;
 #endif
 #undef cpu
+}
+
+static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped(
+    const AVZNativeInstruction *restrict instructions,
+    size_t instruction_count, uint64_t base_pc, uint64_t max_steps,
+    AVZNativeCPU *restrict cpu_state,
+    AVZNativeMemoryReadCallback read_memory,
+    AVZNativeMemoryWriteCallback write_memory,
+    AVZNativeMemoryCanAccessCallback can_access_memory,
+    AVZNativeMemoryFillCallback fill_memory,
+    AVZNativeSystemRegisterReadCallback read_system_register,
+    AVZNativeSystemRegisterWriteCallback write_system_register,
+    AVZNativeSystemInstructionCallback execute_system_instruction,
+    AVZNativeExceptionReturnCallback exception_return,
+    AVZNativeSynchronousExceptionCallback synchronous_exception,
+    AVZNativeWaitCallback wait, void *restrict memory_context,
+    uint8_t *restrict semantic_hints,
+    const uint8_t *restrict semantic_candidates,
+    const uint64_t *restrict instruction_pcs,
+    const uint16_t *restrict block_offsets, size_t fused_block_count,
+    const AVZNativeBlockCache *block_cache,
+    uint64_t code_mutation_epoch, uint64_t shared_code_mutation_epoch,
+    int uses_fast_memory_context
+) {
+    return avz_native_run_threaded_decoded_block_cpu_mapped_span(
+        instructions, instruction_count, base_pc, max_steps, cpu_state,
+        read_memory, write_memory, can_access_memory, fill_memory,
+        read_system_register, write_system_register, execute_system_instruction,
+        exception_return, synchronous_exception, wait, memory_context,
+        semantic_hints, semantic_candidates, instruction_pcs, block_offsets,
+        fused_block_count, block_cache, code_mutation_epoch,
+        shared_code_mutation_epoch, uses_fast_memory_context, NULL);
 }
 
 static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_impl(
@@ -12774,7 +13196,7 @@ typedef struct {
     uint64_t last_used;
 } AVZNativeDirectLink;
 
-typedef struct {
+struct AVZNativeSuperblock {
     AVZNativeBlockKey key;
     const AVZNativeBlockCache *cache;
     const AVZNativeDecodedBlock
@@ -12800,7 +13222,7 @@ typedef struct {
     uint8_t code_page_count;
     uint8_t requires_cache_residency;
     uint8_t valid;
-} AVZNativeSuperblock;
+};
 
 static int avz_native_serial_token_matches(
     const uint64_t *token,
@@ -12849,7 +13271,8 @@ static int avz_native_direct_link_is_current(
         return 1;
     }
     if (!avz_native_decoded_block_code_is_current(cache, link->source) ||
-        !avz_native_decoded_block_code_is_current(cache, link->target)) {
+        (link->target != link->source &&
+         !avz_native_decoded_block_code_is_current(cache, link->target))) {
         return 0;
     }
     link->code_mutation_epoch = code_mutation_epoch;
@@ -12859,6 +13282,12 @@ static int avz_native_direct_link_is_current(
 
 struct AVZNativeExecutionContext {
     AVZNativeCPU cpu;
+    _Atomic uint64_t threaded_prototype_enabled;
+    _Atomic uint64_t threaded_prototype_blocks;
+    _Atomic uint64_t threaded_prototype_steps;
+    _Atomic uint64_t threaded_memory_enabled;
+    _Atomic uint64_t threaded_memory_boundaries;
+    _Atomic uint64_t threaded_memory_faults;
     AVZNativeDirectLink direct_links[AVZ_NATIVE_DIRECT_LINK_COUNT];
     AVZNativeDirectLink recent_links[AVZ_NATIVE_RECENT_LINK_COUNT];
     AVZNativeSuperblock superblocks[AVZ_NATIVE_SUPERBLOCK_COUNT];
@@ -13265,6 +13694,90 @@ AVZNativeExecutionContext *avz_native_execution_context_create(void) {
     return calloc(1, sizeof(AVZNativeExecutionContext));
 }
 
+void avz_native_execution_context_set_threaded_prototype(
+    AVZNativeExecutionContext *context, uint8_t enabled
+) {
+    if (context == NULL) return;
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+    atomic_store_explicit(&context->threaded_prototype_enabled,
+        enabled != 0 && avz_tp_available(), memory_order_relaxed);
+#else
+    (void)enabled;
+    atomic_store_explicit(&context->threaded_prototype_enabled, 0, memory_order_relaxed);
+#endif
+}
+
+AVZNativeThreadedPrototypeStatistics avz_native_execution_context_threaded_statistics(
+    const AVZNativeExecutionContext *context
+) {
+    if (context == NULL) return (AVZNativeThreadedPrototypeStatistics){0};
+    return (AVZNativeThreadedPrototypeStatistics){
+        .enabled = atomic_load_explicit(&context->threaded_prototype_enabled, memory_order_relaxed),
+        .blocks = atomic_load_explicit(&context->threaded_prototype_blocks, memory_order_relaxed),
+        .steps = atomic_load_explicit(&context->threaded_prototype_steps, memory_order_relaxed),
+        .memory_enabled = atomic_load_explicit(&context->threaded_memory_enabled, memory_order_relaxed),
+        .memory_boundaries = atomic_load_explicit(&context->threaded_memory_boundaries, memory_order_relaxed),
+        .memory_faults = atomic_load_explicit(&context->threaded_memory_faults, memory_order_relaxed)
+    };
+}
+
+void avz_native_execution_context_set_threaded_memory(
+    AVZNativeExecutionContext *context, uint8_t enabled
+) {
+    if (context == NULL) return;
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+    atomic_store_explicit(&context->threaded_memory_enabled,
+        enabled != 0 && avz_tp_available(), memory_order_relaxed);
+#else
+    (void)enabled;
+    atomic_store_explicit(&context->threaded_memory_enabled, 0, memory_order_relaxed);
+#endif
+}
+
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+static const AVZThreadedPrototype *avz_native_prepare_threaded_block(
+    AVZNativeExecutionContext *context, AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *block, int allow_memory
+) {
+    if (!atomic_load_explicit(&context->threaded_prototype_enabled, memory_order_relaxed))
+        return NULL;
+    return avz_native_block_cache_threaded_program_with_memory(cache, block,
+        allow_memory && atomic_load_explicit(&context->threaded_memory_enabled,
+                                            memory_order_relaxed));
+}
+
+static AVZNativeBlockResult avz_native_run_threaded_prototype_block(
+    AVZNativeExecutionContext *context, AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *block, uint64_t requested_steps,
+    AVZNativeMemoryFastPath *memory
+) {
+    /* A host checkpoint may have invalidated the earlier eligibility lookup. */
+    const AVZThreadedPrototype *program =
+        avz_native_prepare_threaded_block(context, cache, block, memory != NULL);
+    if (program == NULL || context->cpu.pc != avz_native_decoded_block_pc(block))
+        return (AVZNativeBlockResult){.status = AVZ_NATIVE_STATUS_OUTSIDE_BLOCK};
+    /* At most one block's worth of instructions, including backward branches.
+     * Re-enter the existing cache validation/timer/checkpoint path afterwards.
+     * Pure arithmetic cannot invoke callbacks or invalidate its own snapshot. */
+    uint64_t limit = avz_native_decoded_block_instruction_count(block);
+    if (limit > requested_steps) limit = requested_steps;
+    int memory_program = memory != NULL && avz_tp_program_uses_memory(program);
+    AVZNativeBlockResult result = avz_tp_run_with_memory(program, limit, &context->cpu, memory);
+    /* Budget-ending memory also requires a host boundary. The program may have
+     * been destroyed by its last callback, so use only the captured flag. */
+    if (memory_program && result.status == AVZ_NATIVE_STATUS_MAX_STEPS)
+        result.status = AVZ_TP_STATUS_REVALIDATE;
+    if (result.status == AVZ_TP_STATUS_REVALIDATE)
+        atomic_fetch_add_explicit(&context->threaded_memory_boundaries, 1, memory_order_relaxed);
+    if (result.status == AVZ_TP_STATUS_MEMORY_FAULT)
+        atomic_fetch_add_explicit(&context->threaded_memory_faults, 1, memory_order_relaxed);
+    result.generic_dispatches = 0;
+    atomic_fetch_add_explicit(&context->threaded_prototype_blocks, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&context->threaded_prototype_steps, result.steps, memory_order_relaxed);
+    return result;
+}
+#endif
+
 void avz_native_execution_context_destroy(AVZNativeExecutionContext *context) {
     if (context == NULL) {
         return;
@@ -13559,6 +14072,24 @@ static inline AVZNativeSuperblock *avz_native_validate_superblock(
     if (superblock->code_mutation_epoch != code_mutation_epoch ||
         shared_code_changed) {
         for (size_t slot = 0; slot < superblock->count; slot++) {
+            /* The trace owns its instructions, but not these cache entries.
+             * Never validate replacement code on behalf of the old trace. */
+            if (!avz_native_serial_token_matches(
+                    superblock->serial_tokens[slot],
+                    superblock->serials[slot])) {
+                superblock->valid = 0;
+                return NULL;
+            }
+            int duplicate = 0;
+            for (size_t earlier = 0; earlier < slot; earlier++) {
+                if (superblock->blocks[earlier] == superblock->blocks[slot]) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
             if (!avz_native_decoded_block_code_is_current(
                     cache,
                     superblock->blocks[slot]
@@ -13600,6 +14131,55 @@ static inline AVZNativeSuperblock *avz_native_validate_superblock(
         superblock->code_mutation_epoch = code_mutation_epoch;
     }
     return superblock;
+}
+
+static int avz_native_revalidate_execution_span(
+    const AVZNativeExecutionSpan *span,
+    uint64_t *code_epoch, uint64_t *shared_epoch
+) {
+    AVZNativeBlockCache *cache = span->cache;
+    uint64_t reset = avz_native_block_cache_reset_epoch(cache);
+    uint64_t mutation = avz_native_block_cache_mutation_epoch(cache);
+    uint64_t code = avz_native_block_cache_code_mutation_epoch(cache);
+    uint64_t shared = avz_native_block_cache_shared_code_mutation_epoch(cache);
+    if (reset != span->reset_epoch) return 0;
+    AVZNativeSuperblock *trace = (AVZNativeSuperblock *)span->superblock;
+    int valid;
+    if (trace != NULL) {
+        valid = avz_native_validate_superblock(trace, cache, &span->key,
+            mutation, code, shared, reset) != NULL;
+    } else {
+        valid = avz_native_serial_token_matches(span->serial_token, span->serial) &&
+            avz_native_block_cache_validate_block(cache, span->block,
+                span->serial, &span->key) &&
+            avz_native_decoded_block_code_is_current(cache, span->block);
+    }
+    /* Translation validation can invoke host code. Never acknowledge an epoch
+     * published during that validation, or a recycled selected entry. */
+    if (!valid || reset != avz_native_block_cache_reset_epoch(cache) ||
+        mutation != avz_native_block_cache_mutation_epoch(cache) ||
+        code != avz_native_block_cache_code_mutation_epoch(cache) ||
+        shared != avz_native_block_cache_shared_code_mutation_epoch(cache) ||
+        (trace == NULL && !avz_native_serial_token_matches(
+            span->serial_token, span->serial))) {
+        if (trace != NULL) trace->valid = 0;
+        return 0;
+    }
+    *code_epoch = code;
+    *shared_epoch = shared;
+    return 1;
+}
+
+static AVZNativeExecutionSpan avz_native_selected_execution_span(
+    AVZNativeBlockCache *cache, const AVZNativeDecodedBlock *block,
+    const AVZNativeBlockKey *key
+) {
+    return (AVZNativeExecutionSpan) {
+        .cache = cache, .block = block, .key = *key,
+        .serial_token = avz_native_decoded_block_serial_token(cache, block),
+        .serial = avz_native_decoded_block_serial(cache, block),
+        .reset_epoch = avz_native_block_cache_reset_epoch(cache)
+    };
 }
 
 static const AVZNativeSuperblock *avz_native_find_superblock(
@@ -13684,6 +14264,19 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
         return NULL;
     }
 
+    /* A composition attempt is one validation span. A repeated edge may use
+     * its earlier result only while both local and shared epochs are stable.
+     * Fetch/mapping callbacks and cross-vCPU writes can end the span. */
+    uint64_t generation = avz_native_block_cache_generation(cache);
+    uint64_t mutation_epoch = avz_native_block_cache_mutation_epoch(cache);
+    uint64_t code_epoch = avz_native_block_cache_code_mutation_epoch(cache);
+    uint64_t shared_epoch =
+        avz_native_block_cache_shared_code_mutation_epoch(cache);
+    if (avz_native_decoded_block_serial(cache, first_block) != first_serial ||
+        !avz_native_decoded_block_code_is_current(cache, first_block)) {
+        return NULL;
+    }
+
     const AVZNativeDecodedBlock
         *blocks[AVZ_NATIVE_SUPERBLOCK_MAX_BLOCKS] = {first_block};
     uint64_t serials[AVZ_NATIVE_SUPERBLOCK_MAX_BLOCKS] = {first_serial};
@@ -13703,15 +14296,31 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
     const AVZNativeDecodedBlock *source = first_block;
     uint64_t source_serial = first_serial;
     while (block_count < AVZ_NATIVE_SUPERBLOCK_MAX_BLOCKS) {
+        if (generation != avz_native_block_cache_generation(cache) ||
+            mutation_epoch != avz_native_block_cache_mutation_epoch(cache) ||
+            code_epoch != avz_native_block_cache_code_mutation_epoch(cache) ||
+            shared_epoch !=
+                avz_native_block_cache_shared_code_mutation_epoch(cache)) {
+            return NULL;
+        }
         uint64_t target_serial = 0;
-        const AVZNativeDecodedBlock *target =
-            avz_native_decoded_block_find_recent_successor(
+        const AVZNativeDecodedBlock *target = NULL;
+        for (size_t earlier = 0; earlier + 1 < block_count; earlier++) {
+            if (blocks[earlier] == source && serials[earlier] == source_serial) {
+                target = blocks[earlier + 1];
+                target_serial = serials[earlier + 1];
+                break;
+            }
+        }
+        if (target == NULL) {
+            target = avz_native_decoded_block_find_recent_successor(
                 cache,
                 source,
                 source_serial,
                 key_template,
                 &target_serial
             );
+        }
         if (target == NULL) {
             AVZNativeDirectLink *link = avz_native_find_recent_direct_link(
                 context,
@@ -13757,7 +14366,6 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
         source_serial = target_serial;
     }
 
-    uint64_t generation = avz_native_block_cache_generation(cache);
     if (block_count < 2) {
         return NULL;
     }
@@ -13795,7 +14403,10 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
                 : block_semantic_candidates[index];
         }
     }
-    if (generation != avz_native_block_cache_generation(cache)) {
+    if (generation != avz_native_block_cache_generation(cache) ||
+        mutation_epoch != avz_native_block_cache_mutation_epoch(cache) ||
+        code_epoch != avz_native_block_cache_code_mutation_epoch(cache) ||
+        shared_epoch != avz_native_block_cache_shared_code_mutation_epoch(cache)) {
         free(instructions);
         return NULL;
     }
@@ -13868,10 +14479,8 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
     composed->cache = cache;
     composed->reset_epoch = avz_native_block_cache_reset_epoch(cache);
     composed->mutation_epoch = avz_native_block_cache_mutation_epoch(cache);
-    composed->code_mutation_epoch =
-        avz_native_block_cache_code_mutation_epoch(cache);
-    composed->shared_code_mutation_epoch =
-        avz_native_block_cache_shared_code_mutation_epoch(cache);
+    composed->code_mutation_epoch = code_epoch;
+    composed->shared_code_mutation_epoch = shared_epoch;
     composed->count = (uint8_t)block_count;
     composed->code_page_count = (uint8_t)code_page_count;
     composed->requires_cache_residency =
@@ -13950,6 +14559,8 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
         key.pc = context->cpu.pc;
         key.current_el = (uint8_t)((context->cpu.pstate >> 2) & 0x3u);
         key = avz_native_canonical_block_key(&key);
+        uint64_t selected_code_epoch = avz_native_block_cache_code_mutation_epoch(cache);
+        uint64_t selected_shared_epoch = avz_native_block_cache_shared_code_mutation_epoch(cache);
         uint32_t decode_status = AVZ_NATIVE_BLOCK_DECODE_FETCH_FAULT;
         uint32_t unsupported = 0;
         const AVZNativeDecodedBlock *block =
@@ -13970,9 +14581,20 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
             break;
         }
 
+        AVZNativeExecutionSpan execution_span =
+            avz_native_selected_execution_span(cache, block, &key);
         uint64_t remaining_steps = max_steps - chain.steps;
-        AVZNativeBlockResult block_result =
-            avz_native_run_threaded_decoded_block_cpu_impl(
+        AVZNativeBlockResult block_result;
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+        const AVZThreadedPrototype *program =
+            avz_native_prepare_threaded_block(context, cache, block, 0);
+        if (program != NULL) {
+            block_result = avz_native_run_threaded_prototype_block(
+                context, cache, block, remaining_steps, NULL);
+        } else
+#endif
+        {
+            block_result = avz_native_run_threaded_decoded_block_cpu_mapped_span(
                 avz_native_decoded_block_instructions(block),
                 avz_native_decoded_block_instruction_count(block),
                 avz_native_decoded_block_pc(block),
@@ -13989,12 +14611,19 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
                 synchronous_exception,
                 wait,
                 memory_context,
+                NULL,
                 avz_native_decoded_block_semantic_candidates(block),
-                0
+                NULL, NULL, 0, cache, selected_code_epoch, selected_shared_epoch,
+                0, &execution_span
             );
+        }
         chain.steps += block_result.steps;
-        int native_irq_due = avz_native_memory_fast_path_advance_time(
-            memory_context, block_result.steps, context->cpu.pstate);
+        /* Generic callback contexts have no native clock state. */
+        int native_irq_due =
+            read_memory == avz_native_fast_memory_read &&
+            write_memory == avz_native_fast_memory_write &&
+            avz_native_memory_fast_path_advance_time(
+                memory_context, block_result.steps, context->cpu.pstate);
         chain.generic_dispatches += block_result.generic_dispatches;
         chain.fast_path_steps += block_result.fast_path_steps;
         chain.fast_path_hits += block_result.fast_path_hits;
@@ -14088,6 +14717,8 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
         key.pc = context->cpu.pc;
         key.current_el = (uint8_t)((context->cpu.pstate >> 2) & 0x3u);
         key = avz_native_canonical_block_key(&key);
+        uint64_t selected_code_epoch = avz_native_block_cache_code_mutation_epoch(cache);
+        uint64_t selected_shared_epoch = avz_native_block_cache_shared_code_mutation_epoch(cache);
         uint32_t decode_status = AVZ_NATIVE_BLOCK_DECODE_FETCH_FAULT;
         uint32_t unsupported = 0;
         const AVZNativeDecodedBlock *block = NULL;
@@ -14195,7 +14826,17 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             chain.unsupported_instruction = unsupported;
             break;
         }
-        if (active_superblock == NULL) {
+        AVZNativeExecutionSpan execution_span =
+            avz_native_selected_execution_span(cache, block, &key);
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+        int threaded_eligible = active_superblock == NULL &&
+            avz_native_prepare_threaded_block(context, cache, block, uses_fast_memory_context) != NULL;
+#endif
+        if (active_superblock == NULL
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+            && !threaded_eligible
+#endif
+        ) {
             uint64_t block_serial =
                 avz_native_decoded_block_serial(cache, block);
             const AVZNativeSuperblock *composed =
@@ -14233,6 +14874,10 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             if (block_step_limit == 0) {
                 break;
             }
+            /* Host code may clear/recycle the selected entry or remap its PC. */
+            previous_block = NULL;
+            previous_serial = 0;
+            continue;
         }
 
         uint64_t remaining_steps = max_steps - chain.steps;
@@ -14255,7 +14900,9 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             if (block_step_limit == 0) {
                 break;
             }
-            checkpoint_remaining = block_step_limit;
+            previous_block = NULL;
+            previous_serial = 0;
+            continue;
         }
         uint64_t requested_steps = checkpoint_remaining < remaining_steps
             ? checkpoint_remaining
@@ -14278,7 +14925,11 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             }
             uint16_t fused_instruction_count =
                 active_superblock->block_offsets[fused_block_limit];
-            block_result = avz_native_run_threaded_decoded_block_cpu_mapped(
+            execution_span.block = NULL;
+            execution_span.superblock = active_superblock;
+            execution_span.reset_epoch = active_superblock->reset_epoch;
+            execution_span.key = active_superblock->key;
+            block_result = avz_native_run_threaded_decoded_block_cpu_mapped_span(
                 active_superblock->instructions,
                 fused_instruction_count,
                 active_superblock->instruction_pcs[0],
@@ -14303,7 +14954,7 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
                 cache,
                 active_superblock->code_mutation_epoch,
                 active_superblock->shared_code_mutation_epoch,
-                uses_fast_memory_context
+                uses_fast_memory_context, &execution_span
             );
             chain.superblock_dispatches++;
             executed_blocks = block_result.mapped_blocks;
@@ -14326,8 +14977,19 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
                 );
             }
             chain.superblock_blocks += executed_blocks;
-        } else {
-            block_result = avz_native_run_threaded_decoded_block_cpu_impl(
+        }
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+        else if (threaded_eligible) {
+            avz_native_sample_hot_pc(context, avz_native_decoded_block_pc(block),
+                avz_native_decoded_block_instructions(block),
+                avz_native_decoded_block_instruction_count(block));
+            block_result = avz_native_run_threaded_prototype_block(
+                context, cache, block, requested_steps,
+                uses_fast_memory_context ? memory_context : NULL);
+        }
+#endif
+        else {
+            block_result = avz_native_run_threaded_decoded_block_cpu_mapped_span(
                 avz_native_decoded_block_instructions(block),
                 avz_native_decoded_block_instruction_count(block),
                 avz_native_decoded_block_pc(block),
@@ -14344,8 +15006,10 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
                 synchronous_exception,
                 wait,
                 memory_context,
+                NULL,
                 avz_native_decoded_block_semantic_candidates(block),
-                uses_fast_memory_context
+                NULL, NULL, 0, cache, selected_code_epoch, selected_shared_epoch,
+                uses_fast_memory_context, &execution_span
             );
             avz_native_sample_hot_pc(
                 context,
@@ -14355,16 +15019,20 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             );
         }
         chain.steps += block_result.steps;
-        int native_irq_due = avz_native_memory_fast_path_advance_time(
-            memory_context, block_result.steps, context->cpu.pstate);
+        int native_irq_due = uses_fast_memory_context &&
+            avz_native_memory_fast_path_advance_time(
+                memory_context, block_result.steps, context->cpu.pstate);
         chain.generic_dispatches += block_result.generic_dispatches;
         chain.fast_path_steps += block_result.fast_path_steps;
         chain.fast_path_hits += block_result.fast_path_hits;
         chain.blocks += executed_blocks;
         chain.status = block_result.status;
+        if (chain.status == AVZ_TP_STATUS_REVALIDATE)
+            chain.status = AVZ_NATIVE_STATUS_OUTSIDE_BLOCK;
         if (native_irq_due &&
             chain.status != AVZ_NATIVE_STATUS_HALTED &&
-            chain.status != AVZ_NATIVE_STATUS_UNSUPPORTED)
+            chain.status != AVZ_NATIVE_STATUS_UNSUPPORTED &&
+            chain.status != AVZ_TP_STATUS_MEMORY_FAULT)
             chain.status = AVZ_NATIVE_STATUS_YIELDED;
         chain.unsupported_instruction = block_result.unsupported_instruction;
         checkpoint_steps += block_result.steps;
@@ -14393,7 +15061,8 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             previous_block = block_serial != 0 ? block : NULL;
             previous_serial = block_serial;
         }
-        if (chain_barrier) {
+        if (chain_barrier || block_result.status == AVZ_TP_STATUS_REVALIDATE ||
+            block_result.status == AVZ_TP_STATUS_MEMORY_FAULT) {
             previous_block = NULL;
             previous_serial = 0;
         }
@@ -14403,6 +15072,8 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
         int must_checkpoint =
             checkpoint_steps >= block_step_limit ||
             checkpoint_blocks >= checkpoint_block_interval ||
+            block_result.status == AVZ_TP_STATUS_REVALIDATE ||
+            block_result.status == AVZ_TP_STATUS_MEMORY_FAULT ||
             chain.status == AVZ_NATIVE_STATUS_HALTED ||
             chain.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
             chain.status == AVZ_NATIVE_STATUS_YIELDED ||
@@ -14426,6 +15097,7 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
         if (chain.status == AVZ_NATIVE_STATUS_HALTED ||
             chain.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
             chain.status == AVZ_NATIVE_STATUS_YIELDED ||
+            block_result.status == AVZ_TP_STATUS_MEMORY_FAULT ||
             block_result.steps == 0 ||
             (must_checkpoint && block_step_limit == 0) ||
             chain.steps >= max_steps ||

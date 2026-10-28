@@ -3,7 +3,7 @@ maintainer="Pinecone Project <internal@pinecone.invalid>"
 pkgname=wlroots0.20
 pkgver=0.20.2
 _pkgver=${pkgver/_/-}
-pkgrel=4
+pkgrel=6
 pkgdesc="Modular Wayland compositor library with Pinecone render-pass integration"
 url="https://gitlab.freedesktop.org/wlroots/wlroots"
 license="MIT"
@@ -38,6 +38,8 @@ subpackages="$pkgname-dbg $pkgname-static $pkgname-dev"
 source="https://gitlab.freedesktop.org/wlroots/wlroots/-/archive/$_pkgver/wlroots-$_pkgver.tar.gz
 	e8c983808d8b98a71f991c16c24367494386958b.patch
 	wlroots-pinecone-0.20.2.patch
+	wlroots-pinecone-dmabuf.patch
+	wlroots-pinecone-ownership.patch
 	"
 builddir="$srcdir/wlroots-$_pkgver"
 options="!check"
@@ -68,4 +70,6 @@ sha512sums="
 e96523a2b215e7d1f36bbe5e7fa3e65d15cb87e2f0d9c304d3c2fdc81b0ac0c7202cd955635c01072b34e70f08c6c00fa2cde8c277bd73fcabdcb19f7b579a12  wlroots-0.20.2.tar.gz
 2eb70aa7d57fea7e7e36917d73f2a1a9b304c28a331cac32756cb61f8926c51e989887811037cfb76e29452f0dcbe61fa4980c39553c7433a6f6fc3a8b69c7d7  e8c983808d8b98a71f991c16c24367494386958b.patch
 3d6f04c77b8c005e5bd18efc35e323451c3e55c6cbf3be35adb20e1323b2edbec15df44e10da87e06f20e573492b0803dd705b1521e782c1cc3684462db72ef2  wlroots-pinecone-0.20.2.patch
+df08a4eaa3100e43d58051d694651a8660699460a539a535e889918466896d29357136188e1cf98998355e80c8bec4078c94a638abdc7c05c84426b3a66b515b  wlroots-pinecone-dmabuf.patch
+e84376c11d095e5b096214c40cdd9c9938c1f8f7effd5844b077739a8e06265b41051bd37fa345b4cdb3a050ef9688ad5ff3f85109ec1d8510a3263687d56da0  wlroots-pinecone-ownership.patch
 "

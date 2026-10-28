@@ -2654,6 +2654,16 @@ static void avz_fast_atomic_read_bytes(
     while (offset < byte_count) {
         uint8_t width = avz_fast_atomic_chunk_width(
             host_address + offset, byte_count - offset);
+        /* A separate aligned loop keeps memcpy's size constant without
+         * changing the atomic chunk widths used for guest RAM. */
+        if (width == 8) {
+            do {
+                uint64_t value = avz_fast_load(host_address + offset, 8);
+                memcpy(destination + offset, &value, sizeof(value));
+                offset += 8u;
+            } while (byte_count - offset >= 8u);
+            continue;
+        }
         uint64_t value = avz_fast_load(host_address + offset, width);
         memcpy(destination + offset, &value, width);
         offset += width;
@@ -2669,6 +2679,15 @@ static void avz_fast_atomic_write_bytes(
     while (offset < byte_count) {
         uint8_t width = avz_fast_atomic_chunk_width(
             host_address + offset, byte_count - offset);
+        if (width == 8) {
+            do {
+                uint64_t value;
+                memcpy(&value, source + offset, sizeof(value));
+                avz_fast_store_value(host_address + offset, 8, value);
+                offset += 8u;
+            } while (byte_count - offset >= 8u);
+            continue;
+        }
         uint64_t value = 0;
         memcpy(&value, source + offset, width);
         avz_fast_store_value(host_address + offset, width, value);
@@ -3969,15 +3988,17 @@ int avz_native_fast_memory_read(
         return 1;
     }
     if (translation == AVZ_FAST_TRANSLATION_PHYSICAL &&
-        fast_path->read_physical != NULL &&
-        fast_path->read_physical(
+        fast_path->read_physical != NULL) {
+        int success = fast_path->read_physical(
             fast_path->slow_context,
             physical_address,
             width,
             value
-        )) {
-        AVZ_MEMORY_STAT_INCREMENT(fast_path, physical_device_reads);
-        return 1;
+        );
+        if (success) AVZ_MEMORY_STAT_INCREMENT(fast_path, physical_device_reads);
+        /* A device may have side effects before reporting failure. Never issue
+         * the same access again through the virtual-address slow callback. */
+        return success;
     }
     if (fast_path != NULL && fast_path->translation_fault_pending) {
         return 0;
@@ -4021,15 +4042,15 @@ int avz_native_fast_memory_write(
         return 1;
     }
     if (translation == AVZ_FAST_TRANSLATION_PHYSICAL &&
-        fast_path->write_physical != NULL &&
-        fast_path->write_physical(
+        fast_path->write_physical != NULL) {
+        int success = fast_path->write_physical(
             fast_path->slow_context,
             physical_address,
             width,
             value
-        )) {
-        AVZ_MEMORY_STAT_INCREMENT(fast_path, physical_device_writes);
-        return 1;
+        );
+        if (success) AVZ_MEMORY_STAT_INCREMENT(fast_path, physical_device_writes);
+        return success;
     }
     if (fast_path != NULL && fast_path->translation_fault_pending) {
         return 0;
@@ -4065,6 +4086,40 @@ static int avz_native_fast_memory_translate_pair(
     const size_t pair_byte_count = (size_t)width * 2u;
     const size_t page_offset =
         (size_t)(virtual_address & (AVZ_FAST_PAGE_SIZE - 1u));
+    if (fast_path->ram != NULL && width == 8 &&
+        pair_byte_count <= AVZ_FAST_PAGE_SIZE - page_offset) {
+        /* Sixteen is not a scalar translation width. Reuse a certified hot
+         * span for LDP/STP without extending scalar access widths or asking
+         * a callback to translate sixteen bytes. Cold/cross-page pairs retain
+         * the two independent translations below. */
+        avz_fast_synchronize_shared_translation_epoch(fast_path);
+        const uint64_t virtual_page = virtual_address >> AVZ_FAST_PAGE_SHIFT;
+        const uint64_t context_tag = avz_fast_translation_context_tag(
+            fast_path, virtual_address);
+        const size_t hot_index = (size_t)(
+            (virtual_page ^ (context_tag >> AVZ_FAST_PAGE_SHIFT)) &
+            (AVZ_FAST_DATA_HOT_COUNT - 1u));
+        const AVZNativeFastTLBEntry *hot = is_write
+            ? &fast_path->write_hot[hot_index]
+            : &fast_path->read_hot[hot_index];
+        if (hot->valid &&
+            hot->generation == fast_path->hot_translation_generation &&
+            hot->virtual_page == virtual_page && hot->context_tag == context_tag &&
+            hot->contiguous_span >= page_offset + pair_byte_count &&
+            hot->host_page != NULL &&
+            hot->physical_page <= UINT64_MAX - page_offset - width) {
+            *first_physical = hot->physical_page + page_offset;
+            *second_physical = *first_physical + width;
+            *first_host = hot->host_page + page_offset;
+            *second_host = *first_host + width;
+            if (is_write) {
+                AVZ_MEMORY_STAT_INCREMENT(fast_path, write_tlb_hits);
+            } else {
+                AVZ_MEMORY_STAT_INCREMENT(fast_path, read_tlb_hits);
+            }
+            return 1;
+        }
+    }
     if (pair_byte_count <= AVZ_FAST_PAGE_SIZE - page_offset &&
         avz_fast_translate(
             fast_path,

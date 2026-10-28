@@ -12,6 +12,10 @@ MIN_INTERACTIONS="${PINECONE_PROFILE_MIN_INTERACTIONS:-0}"
   echo 'PINECONE_PROFILE_MIN_INTERACTIONS must be a nonnegative integer' >&2
   exit 2
 }
+[[ "$MIN_INTERACTIONS" =~ ^0+$ ]] || {
+  echo 'PINECONE_PROFILE_MIN_INTERACTIONS > 0 is unsupported: host-to-Phoc causal interaction identity is unavailable; use semantic observation acceptance instead' >&2
+  exit 2
+}
 INTERACTION_TRACE="${PINECONE_PROFILE_INTERACTION_TRACE:-1}"
 [[ "$INTERACTION_TRACE" == 0 || "$INTERACTION_TRACE" == 1 ]] || {
   echo 'PINECONE_PROFILE_INTERACTION_TRACE must be 0 or 1' >&2
@@ -28,6 +32,9 @@ fi
 if [[ "${PINECONE_PROFILE_PIXMAN_DIAGNOSTICS:-0}" == "1" ]]; then
   AUTORUN_COMMAND="PINECONE_PIXMAN_DIAGNOSTICS=1 ${AUTORUN_COMMAND}"
 fi
+if [[ "${AUTO_UNLOCK}" == "1" ]]; then
+  echo 'Auto-unlock requests diagnostic input only: profile readiness does not wait for injection completion or prove unlock; semantic UI observation is required' >&2
+fi
 
 CONTAINER="$(xcrun simctl get_app_container "${DEVICE_ID}" "${BUNDLE_ID}" data)"
 METRICS="${CONTAINER}/Library/Caches/pinecone-performance.json"
@@ -36,6 +43,7 @@ rm -f "${METRICS}" "$RUNTIME_LOG"
 xcrun simctl terminate "${DEVICE_ID}" "${BUNDLE_ID}" >/dev/null 2>&1 || true
 
 SIMCTL_CHILD_PINECONE_SIMULATOR_AUTORUN_COMMAND="${AUTORUN_COMMAND}" \
+SIMCTL_CHILD_PINECONE_INTERACTION_TRACE="${INTERACTION_TRACE}" \
 SIMCTL_CHILD_PINECONE_SIMULATOR_AUTO_UNLOCK="${AUTO_UNLOCK}" \
 SIMCTL_CHILD_PINECONE_SIMULATOR_POST_READY_COMMAND="${APPLICATION_COMMAND}" \
 SIMCTL_CHILD_PINECONE_SIMULATOR_POST_READY_DELAY_MS="${PINECONE_PROFILE_POST_READY_DELAY_MS:-}" \
@@ -58,19 +66,9 @@ while (( SECONDS < deadline )); do
   if [[ -s "${METRICS}" ]] &&
      jq -e '.elapsedMilliseconds.interactiveWorkloadReady != null and
             .framePipeline.frameSampleCount > 0' "${METRICS}" >/dev/null; then
-    if [[ "${AUTO_UNLOCK}" == "1" ]] &&
-       ! jq -e '.touchSampleCount > 0' "${METRICS}" >/dev/null; then
-      sleep 1
-      continue
-    fi
     if [[ -n "${APPLICATION_COMMAND}" ]] &&
        ! jq -e '.elapsedMilliseconds.applicationSurfacePresented != null' \
          "${METRICS}" >/dev/null; then
-      sleep 1
-      continue
-    fi
-    if ! jq -e --argjson minimum "$MIN_INTERACTIONS" \
-      '(.interactions | length) >= $minimum' "$METRICS" >/dev/null; then
       sleep 1
       continue
     fi
@@ -111,7 +109,7 @@ while (( SECONDS < deadline )); do
 done
 
 if [[ -n "${APPLICATION_COMMAND}" ]]; then
-  echo "Phosh/${APPLICATION_COMMAND} presentation or ${MIN_INTERACTIONS} completed interactions missing after ${TIMEOUT_SECONDS}s" >&2
+  echo "Phosh/${APPLICATION_COMMAND} presentation milestone missing after ${TIMEOUT_SECONDS}s (not semantic UI acceptance)" >&2
 else
   echo "Phosh did not publish a visible frame within ${TIMEOUT_SECONDS}s" >&2
 fi

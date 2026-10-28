@@ -3,7 +3,7 @@
 maintainer="team/phosh <newbie13xd@gmail.com>"
 pkgname=phoc
 pkgver=0.57.0
-pkgrel=5
+pkgrel=7
 pkgdesc="wlroots based Phone compositor for the Phosh shell"
 arch="all"
 url="https://gitlab.gnome.org/World/Phosh/phoc"
@@ -31,7 +31,7 @@ _wlrootsmakedepends="
 makedepends="
 	glib-dev
 	gmobile-dev
-	gnome-desktop-dev
+	gnome-desktop-dev=44.5-r0
 	json-glib-dev
 	libdrm-dev
 	libinput-dev
@@ -51,6 +51,8 @@ source="
 	phoc-pinecone-layout.patch
 	phoc-pinecone-interactions.patch
 	wlroots-pinecone-0.20.2.patch.embed
+	wlroots-pinecone-dmabuf.patch.embed
+	wlroots-pinecone-ownership.patch.embed
 	"
 replaces="wlroots-phosh"
 builddir="$srcdir/$pkgname-$pkgver"
@@ -60,6 +62,10 @@ prepare() {
 	patch -Np1 < subprojects/packagefiles/wlroots/0001-Revert-layer-shell-error-on-0-dimension-without-anch.patch \
 		-d subprojects/wlroots-0.20.x
 	patch -Np1 < "$srcdir"/wlroots-pinecone-0.20.2.patch.embed \
+		-d subprojects/wlroots-0.20.x
+	patch -Np1 < "$srcdir"/wlroots-pinecone-dmabuf.patch.embed \
+		-d subprojects/wlroots-0.20.x
+	patch -Np1 < "$srcdir"/wlroots-pinecone-ownership.patch.embed \
 		-d subprojects/wlroots-0.20.x
 }
 
@@ -90,7 +96,9 @@ schemas() {
 
 sha512sums="
 c3dfb5e951422ccedcc1740b788a4c9dbc517ec7c0901967298a77dc5a35b4ca4556fe97b02085868779adddb1b86539224f2c3c6277ff5264315ada54b322a3  phoc-0.57.0.tar.xz
-b493ff6b1be35a659400abeaa90e0870ae1d91d1191fbbfdff21adb47b580406f602bc17a550f30ea15c2ba7d0936d1778d55a3afe41d3e630279f937a98cc5c  phoc-pinecone-layout.patch
-bb9af5905b8240760a1330a9da849f22db257f80e2ea855b005029bbbdb0e2165937ddc55fc0355b2728a382bd8765135f4486006c6944c7f7f9611e02f89d16  phoc-pinecone-interactions.patch
+edc159fe5cb84bbdc3fc91c766b052d2716bbc43a0410f08fea18db9ac4fa36151828214e0a89c95d152612cc817bcc3928c10e4c2a3537cd0135acf90ab86cb  phoc-pinecone-layout.patch
+9faf16220dd2e48212d515acee5a01af235ae54c9031113b0eb99b00de0126fee64aae867dccceda43e2005f43f6a7aabe642a1cd0fbd93404989b60c7e44387  phoc-pinecone-interactions.patch
 3d6f04c77b8c005e5bd18efc35e323451c3e55c6cbf3be35adb20e1323b2edbec15df44e10da87e06f20e573492b0803dd705b1521e782c1cc3684462db72ef2  wlroots-pinecone-0.20.2.patch.embed
+df08a4eaa3100e43d58051d694651a8660699460a539a535e889918466896d29357136188e1cf98998355e80c8bec4078c94a638abdc7c05c84426b3a66b515b  wlroots-pinecone-dmabuf.patch.embed
+e84376c11d095e5b096214c40cdd9c9938c1f8f7effd5844b077739a8e06265b41051bd37fa345b4cdb3a050ef9688ad5ff3f85109ec1d8510a3263687d56da0  wlroots-pinecone-ownership.patch.embed
 "

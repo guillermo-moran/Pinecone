@@ -510,6 +510,8 @@ typedef int (*AVZNativeMemoryWriteCallback)(
     uint64_t value
 );
 
+/* Once invoked, the physical callback result is final for that access. A zero
+ * result reports failure, not permission to retry via a virtual slow callback. */
 typedef int (*AVZNativePhysicalMemoryReadCallback)(
     void *context,
     uint64_t physical_address,
@@ -1281,6 +1283,23 @@ AVZNativeBlockResult avz_native_run_threaded_decoded_block_full_registers_with_e
 
 AVZNativeExecutionContext *avz_native_execution_context_create(void);
 void avz_native_execution_context_destroy(AVZNativeExecutionContext *context);
+/* Configure only while this vCPU is stopped. Experimental subset executor;
+ * all other blocks continue through the existing native executor. */
+void avz_native_execution_context_set_threaded_prototype(
+    AVZNativeExecutionContext *context, uint8_t enabled);
+/* Configure only while stopped; separate opt-in for bounded memory execution. */
+void avz_native_execution_context_set_threaded_memory(
+    AVZNativeExecutionContext *context, uint8_t enabled);
+typedef struct {
+    uint64_t enabled;
+    uint64_t blocks;
+    uint64_t steps;
+    uint64_t memory_enabled;
+    uint64_t memory_boundaries;
+    uint64_t memory_faults;
+} AVZNativeThreadedPrototypeStatistics;
+AVZNativeThreadedPrototypeStatistics avz_native_execution_context_threaded_statistics(
+    const AVZNativeExecutionContext *context);
 void avz_native_execution_context_load(
     AVZNativeExecutionContext *context,
     const uint64_t *x31,
@@ -1635,5 +1654,7 @@ size_t avz_framebuffer_commit_dirty_tiles(
 #ifdef __cplusplus
 }
 #endif
+
+#include "ARM64VizThreadedPrototype.h"
 
 #endif

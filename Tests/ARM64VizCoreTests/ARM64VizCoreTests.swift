@@ -3383,105 +3383,96 @@ final class ARM64VizCoreTests: XCTestCase {
         let availableRing: GuestAddress = 0x4018_1000
         let usedRing: GuestAddress = 0x4018_2000
         let events: GuestAddress = 0x4018_3000
+        try configureVirtioQueue(machine: machine, base: base,
+            descriptorTable: descriptorTable, availableRing: availableRing, usedRing: usedRing)
+        var availableIndex: UInt16 = 0
 
-        try configureVirtioQueue(
-            machine: machine,
-            base: base,
-            descriptorTable: descriptorTable,
-            availableRing: availableRing,
-            usedRing: usedRing
-        )
-        for index in UInt16(0)..<8 {
-            try writeVirtioDescriptor(
-                machine: machine,
-                at: descriptorTable,
-                index: index,
-                address: events + UInt64(index) * 8,
-                length: 8,
-                flags: 2,
-                next: 0
-            )
-            try machine.vm.memory.write16(index, at: availableRing + 4 + UInt64(index) * 2)
+        func receive(_ count: UInt16) throws -> [VirtIOInputEvent] {
+            precondition(count > 0 && count <= 8)
+            for index in UInt16(0)..<count {
+                try writeVirtioDescriptor(machine: machine, at: descriptorTable, index: index,
+                    address: events + UInt64(index) * 8, length: 8, flags: 2, next: 0)
+                let slot = (availableIndex &+ index) % 8
+                try machine.vm.memory.write16(index, at: availableRing + 4 + UInt64(slot) * 2)
+            }
+            availableIndex &+= count
+            try machine.vm.memory.write16(availableIndex, at: availableRing + 2)
+            try machine.vm.writePhysical(base + 0x050, width: .word, value: 0)
+            XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), availableIndex)
+            return try (UInt16(0)..<count).map { index in
+                let address = events + UInt64(index) * 8
+                return VirtIOInputEvent(type: try machine.vm.memory.read16(at: address),
+                    code: try machine.vm.memory.read16(at: address + 2),
+                    value: Int32(bitPattern: try machine.vm.memory.read32(at: address + 4)))
+            }
         }
-        try machine.vm.memory.write16(8, at: availableRing + 2)
 
+        func captureTime(_ frame: [VirtIOInputEvent]) -> UInt64 {
+            XCTAssertEqual(frame[0].type, 4)
+            XCTAssertEqual(frame[0].code, TouchTimestampWire.lowCode)
+            XCTAssertEqual(frame[1].type, 4)
+            XCTAssertEqual(frame[1].code, TouchTimestampWire.highCode)
+            return UInt64(UInt32(bitPattern: frame[0].value)) |
+                UInt64(UInt32(bitPattern: frame[1].value)) << 32
+        }
+
+        let before = DispatchTime.now().uptimeNanoseconds
         machine.virtioInput.enqueueTouch(x: 321, y: 123, isDown: true)
-
-        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 8)
+        let after = DispatchTime.now().uptimeNanoseconds
+        var down = try receive(8)
+        XCTAssertEqual(machine.virtioInput.inputFramesDelivered, 0)
+        XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 2)
+        down += try receive(2)
         XCTAssertEqual(try machine.vm.readPhysical(base + 0x060, width: .word), 1)
-        let expected: [(UInt16, UInt16, UInt32)] = [
-            (1, 330, 1),
-            (3, 0, 321),
-            (3, 1, 123),
-            (3, 47, 0),
-            (3, 57, 0),
-            (3, 53, 321),
-            (3, 54, 123),
-            (0, 0, 0)
-        ]
-        for (index, event) in expected.enumerated() {
-            let address = events + UInt64(index) * 8
-            XCTAssertEqual(try machine.vm.memory.read16(at: address), event.0)
-            XCTAssertEqual(try machine.vm.memory.read16(at: address + 2), event.1)
-            XCTAssertEqual(try machine.vm.memory.read32(at: address + 4), event.2)
-        }
+        XCTAssertGreaterThanOrEqual(captureTime(down), before)
+        XCTAssertLessThanOrEqual(captureTime(down), after)
+        XCTAssertEqual(Array(down.dropFirst(2)), [
+            VirtIOInputEvent(type: 1, code: 330, value: 1),
+            VirtIOInputEvent(type: 3, code: 0, value: 321),
+            VirtIOInputEvent(type: 3, code: 1, value: 123),
+            VirtIOInputEvent(type: 3, code: 47, value: 0),
+            VirtIOInputEvent(type: 3, code: 57, value: 0),
+            VirtIOInputEvent(type: 3, code: 53, value: 321),
+            VirtIOInputEvent(type: 3, code: 54, value: 123),
+            VirtIOInputEvent(type: 0, code: 0, value: 0)
+        ])
 
         machine.virtioInput.enqueueTouches([
             TouchEvent(x: 400, y: 300, isDown: true),
             TouchEvent(x: 350, y: 200, isDown: true)
         ])
-        XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 3)
-        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 1)
-        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 2)
-        for index in UInt16(0)..<6 {
-            try machine.vm.memory.write16(
-                index,
-                at: availableRing + 4 + UInt64(index) * 2
-            )
-        }
-        try machine.vm.memory.write16(14, at: availableRing + 2)
         machine.virtioInput.enqueueTouch(x: 320, y: 80, isDown: true)
+        XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 2)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 1)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 4)
+        var previousTime = captureTime(down)
+        for (x, y): (Int32, Int32) in [(400, 300), (350, 200), (320, 80)] {
+            let move = try receive(8)
+            XCTAssertGreaterThanOrEqual(captureTime(move), previousTime)
+            previousTime = captureTime(move)
+            XCTAssertEqual(Array(move.dropFirst(2)), [
+                VirtIOInputEvent(type: 3, code: 0, value: x),
+                VirtIOInputEvent(type: 3, code: 1, value: y),
+                VirtIOInputEvent(type: 3, code: 47, value: 0),
+                VirtIOInputEvent(type: 3, code: 53, value: x),
+                VirtIOInputEvent(type: 3, code: 54, value: y),
+                VirtIOInputEvent(type: 0, code: 0, value: 0)
+            ])
+        }
         XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 4)
-        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 2)
-        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 2)
-        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 14)
-        let moveExpected: [(UInt16, UInt16, UInt32)] = [
-            (3, 0, 320),
-            (3, 1, 80),
-            (3, 47, 0),
-            (3, 53, 320),
-            (3, 54, 80),
-            (0, 0, 0)
-        ]
-        for (index, event) in moveExpected.enumerated() {
-            let address = events + UInt64(index) * 8
-            XCTAssertEqual(try machine.vm.memory.read16(at: address), event.0)
-            XCTAssertEqual(try machine.vm.memory.read16(at: address + 2), event.1)
-            XCTAssertEqual(try machine.vm.memory.read32(at: address + 4), event.2)
-        }
-
-        for index in UInt16(0)..<4 {
-            let ringSlot = UInt16((14 + Int(index)) % 8)
-            try machine.vm.memory.write16(
-                index,
-                at: availableRing + 4 + UInt64(ringSlot) * 2
-            )
-        }
-        try machine.vm.memory.write16(18, at: availableRing + 2)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 4)
+        XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 4)
         machine.virtioInput.enqueueTouch(x: 320, y: 80, isDown: false)
-        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 18)
-        let releaseExpected: [(UInt16, UInt16, UInt32)] = [
-            (1, 330, 0),
-            (3, 47, 0),
-            (3, 57, UInt32.max),
-            (0, 0, 0)
-        ]
-        for (index, event) in releaseExpected.enumerated() {
-            let address = events + UInt64(index) * 8
-            XCTAssertEqual(try machine.vm.memory.read16(at: address), event.0)
-            XCTAssertEqual(try machine.vm.memory.read16(at: address + 2), event.1)
-            XCTAssertEqual(try machine.vm.memory.read32(at: address + 4), event.2)
-        }
+        let release = try receive(6)
+        XCTAssertGreaterThanOrEqual(captureTime(release), previousTime)
+        XCTAssertEqual(Array(release.dropFirst(2)), [
+            VirtIOInputEvent(type: 1, code: 330, value: 0),
+            VirtIOInputEvent(type: 3, code: 47, value: 0),
+            VirtIOInputEvent(type: 3, code: 57, value: -1),
+            VirtIOInputEvent(type: 0, code: 0, value: 0)
+        ])
+        XCTAssertEqual(machine.virtioInput.inputFramesDelivered, 5)
+        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 40)
     }
 
     func testVirtIOInputRetainsTouchFrameUntilLinuxReplenishesEventQueue() throws {
@@ -3491,50 +3482,44 @@ final class ARM64VizCoreTests: XCTestCase {
         let availableRing: GuestAddress = 0x4019_1000
         let usedRing: GuestAddress = 0x4019_2000
         let events: GuestAddress = 0x4019_3000
-
-        try configureVirtioQueue(
-            machine: machine,
-            base: base,
-            descriptorTable: descriptorTable,
-            availableRing: availableRing,
-            usedRing: usedRing
-        )
+        try configureVirtioQueue(machine: machine, base: base,
+            descriptorTable: descriptorTable, availableRing: availableRing, usedRing: usedRing)
 
         machine.virtioInput.enqueueTouch(x: 240, y: 700, isDown: true)
         XCTAssertEqual(machine.virtioInput.inputSamplesReceived, 1)
-        XCTAssertEqual(machine.virtioInput.inputFramesGenerated, 1)
         XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 1)
-        XCTAssertEqual(machine.virtioInput.deliveredInputFrameCount, 0)
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 0)
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 1)
         XCTAssertNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 1))
-        XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 8)
+        XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 10)
         XCTAssertEqual(machine.virtioInput.inputEventsDelivered, 0)
         XCTAssertGreaterThan(machine.virtioInput.inputQueueStarvations, 0)
 
         for index in UInt16(0)..<8 {
-            try writeVirtioDescriptor(
-                machine: machine,
-                at: descriptorTable,
-                index: index,
-                address: events + UInt64(index) * 8,
-                length: 8,
-                flags: 2,
-                next: 0
-            )
+            try writeVirtioDescriptor(machine: machine, at: descriptorTable, index: index,
+                address: events + UInt64(index) * 8, length: 8, flags: 2, next: 0)
             try machine.vm.memory.write16(index, at: availableRing + 4 + UInt64(index) * 2)
         }
         try machine.vm.memory.write16(8, at: availableRing + 2)
         try machine.vm.writePhysical(base + 0x050, width: .word, value: 0)
-
-        XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 0)
+        XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 2)
         XCTAssertEqual(machine.virtioInput.inputEventsDelivered, 8)
+        XCTAssertEqual(machine.virtioInput.deliveredInputFrameCount, 0)
+        XCTAssertNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 1))
+
+        // A ten-word timestamped down frame must survive an eight-entry ring.
+        for index in UInt16(0)..<2 {
+            try machine.vm.memory.write16(index, at: availableRing + 4 + UInt64(index) * 2)
+        }
+        try machine.vm.memory.write16(10, at: availableRing + 2)
+        try machine.vm.writePhysical(base + 0x050, width: .word, value: 0)
+        XCTAssertEqual(machine.virtioInput.pendingInputEventCount, 0)
+        XCTAssertEqual(machine.virtioInput.inputEventsDelivered, 10)
         XCTAssertEqual(machine.virtioInput.inputFramesDelivered, 1)
         XCTAssertEqual(machine.virtioInput.generatedInputFrameCount, 1)
-        XCTAssertEqual(machine.virtioInput.deliveredInputFrameCount, 1)
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.delivered, 1)
         XCTAssertEqual(machine.virtioInput.inputFrameDeliveryProgress.target, 1)
-        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 8)
+        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 10)
         XCTAssertNotNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 1))
         XCTAssertNil(machine.virtioInput.inputFrameDeliveryTimestamp(for: 2))
         machine.virtioInput.reset()

@@ -1,0 +1,869 @@
+diff -ruN -x subprojects a/src/app-grid.c b/src/app-grid.c
+--- a/src/app-grid.c	2026-10-26 18:51:17
++++ b/src/app-grid.c	2026-10-26 18:53:26
+@@ -10,6 +10,7 @@
+ #include <string.h>
+ 
+ #include "app-grid.h"
++#include "pinecone-launcher.h"
+ #include "app-grid-button.h"
+ #include "app-grid-folder-button.h"
+ #include "app-list-model.h"
+@@ -291,7 +292,7 @@
+   priv->filter_mode = g_settings_get_flags (priv->settings, "app-filter-mode");
+ 
+   show = !!(priv->filter_mode & PHOSH_APP_FILTER_MODE_FLAGS_ADAPTIVE);
+-  gtk_widget_set_visible (priv->btn_adaptive, show);
++  gtk_widget_set_visible (priv->btn_adaptive, show && !pinecone_launcher_enabled ());
+ 
+   gtk_filter_list_model_refilter (priv->model);
+ }
+@@ -304,6 +305,9 @@
+   g_autofree char *mobile = NULL;
+   const char *id;
+ 
++  if (pinecone_launcher_enabled ())
++    return TRUE;
++
+   if (!(priv->filter_mode & PHOSH_APP_FILTER_MODE_FLAGS_ADAPTIVE))
+     return TRUE;
+ 
+@@ -349,7 +353,7 @@
+   if (gm_str_is_null_or_empty (search)) {
+     if (PHOSH_IS_FOLDER_INFO (info))
+       return phosh_folder_info_refilter (PHOSH_FOLDER_INFO (info), search);
+-    if (phosh_favorite_list_model_app_is_favorite (NULL, info))
++    if (!pinecone_launcher_enabled () && phosh_favorite_list_model_app_is_favorite (NULL, info))
+       return FALSE;
+ 
+     return TRUE;
+@@ -385,7 +389,8 @@
+   criteria = ((g_list_model_get_n_items (G_LIST_MODEL (favorites)) == 0) ||
+               !gm_str_is_null_or_empty (priv->search_string));
+ 
+-  gtk_revealer_set_reveal_child (GTK_REVEALER (priv->favs_revealer), !criteria);
++  gtk_revealer_set_reveal_child (GTK_REVEALER (priv->favs_revealer),
++                                !criteria && !pinecone_launcher_enabled ());
+ }
+ 
+ 
+@@ -429,6 +434,11 @@
+   g_autoptr (GAction) action = NULL;
+ 
+   gtk_widget_init_template (GTK_WIDGET (self));
++
++  if (pinecone_launcher_enabled ()) {
++    gtk_flow_box_set_max_children_per_line (GTK_FLOW_BOX (priv->apps), 4);
++    gtk_flow_box_set_max_children_per_line (GTK_FLOW_BOX (priv->folder_apps), 4);
++  }
+ 
+   favorites = phosh_favorite_list_model_get_default ();
+ 
+diff -ruN -x subprojects a/src/app-list-model.c b/src/app-list-model.c
+--- a/src/app-list-model.c	2026-10-26 18:51:17
++++ b/src/app-list-model.c	2026-10-26 19:02:50
+@@ -39,6 +39,7 @@
+   GHashTable *startup_wm_class;
+   GHashTable *exec_to_id;
+   gboolean    initial_refresh_done;
++  gboolean    full_refresh_done;
+ };
+ 
+ static void list_iface_init (GListModelInterface *iface);
+@@ -227,8 +228,10 @@
+     new_apps = load_initial_app_manifest (&manifest_loaded);
+     priv->initial_refresh_done = TRUE;
+   }
+-  if (!manifest_loaded)
++  if (!manifest_loaded) {
+     new_apps = g_app_info_get_all ();
++    priv->full_refresh_done = TRUE;
++  }
+ 
+   if (manifest_loaded && new_apps == NULL)
+     g_warning ("Pinecone app manifest did not contain any usable applications");
+@@ -312,6 +315,21 @@
+   /* A folder has been created or destroyed or modified.
+    * Rearrange the apps from scratch. */
+   on_monitor_changed_cb (priv->monitor, self);
++}
++
++
++/* Home can use the image manifest for startup; All Apps requests full discovery
++ * once. Subsequent desktop-file changes still use GAppInfoMonitor. */
++void
++phosh_app_list_model_ensure_complete (PhoshAppListModel *self)
++{
++  PhoshAppListModelPrivate *priv = phosh_app_list_model_get_instance_private (self);
++  if (priv->full_refresh_done)
++    return;
++  priv->initial_refresh_done = TRUE;
++  g_clear_handle_id (&priv->debounce, g_source_remove);
++  priv->debounce = g_idle_add (items_changed, self);
++  g_source_set_name_by_id (priv->debounce, "[pinecone] discover all applications");
+ }
+ 
+ 
+diff -ruN -x subprojects a/src/app-list-model.h b/src/app-list-model.h
+--- a/src/app-list-model.h	2026-10-26 18:51:17
++++ b/src/app-list-model.h	2026-10-26 19:02:50
+@@ -20,6 +20,7 @@
+ };
+ 
+ PhoshAppListModel *phosh_app_list_model_get_default (void);
++void              phosh_app_list_model_ensure_complete (PhoshAppListModel *self);
+ GDesktopAppInfo *  phosh_app_list_model_lookup_by_startup_wm_class (PhoshAppListModel *self,
+                                                                     const char        *class);
+ GDesktopAppInfo *  phosh_app_list_model_lookup_by_exec (PhoshAppListModel *self, const char *exec);
+diff -ruN -x subprojects a/src/home.c b/src/home.c
+--- a/src/home.c	2026-10-26 18:51:17
++++ b/src/home.c	2026-10-26 19:00:18
+@@ -68,6 +68,9 @@
+   GtkWidget       *rev_powerbar;
+   GtkWidget       *powerbar;
+   GtkWidget       *evbox_home_bar;
++  GtkWidget       *navigation;
++  GtkWidget       *nav_buttons[3];
++  PhoshOverviewPage nav_page;
+ 
+   guint debounce_handle;
+   gboolean         focus_app_search;
+@@ -102,6 +105,13 @@
+   gboolean reveal, solid = TRUE;
+   PhoshDragSurfaceState drag_state = phosh_drag_surface_get_drag_state (PHOSH_DRAG_SURFACE (self));
+ 
++  if (self->navigation) {
++    for (guint i = 0; i < G_N_ELEMENTS (self->nav_buttons); i++)
++      phosh_util_toggle_style_class (self->nav_buttons[i], "selected",
++                                      self->state == PHOSH_HOME_STATE_UNFOLDED && self->nav_page == i);
++    return;
++  }
++
+   reveal = !(self->state == PHOSH_HOME_STATE_UNFOLDED);
+   gtk_revealer_set_reveal_child (GTK_REVEALER (self->rev_powerbar), reveal);
+ 
+@@ -169,6 +179,13 @@
+   /* reset osk_toggle_long_press to prevent OSK from unfolding accidentally */
+   gtk_event_controller_reset (GTK_EVENT_CONTROLLER (self->osk_toggle_long_press));
+ 
++  if (self->navigation) {
++    phosh_drag_surface_set_drag_mode (PHOSH_DRAG_SURFACE (self), PHOSH_DRAG_SURFACE_DRAG_MODE_NONE);
++    if (queue_draw)
++      gtk_widget_queue_draw (GTK_WIDGET (self));
++    return;
++  }
++
+   /* Update the handle's and dragability */
+   if (phosh_overview_has_running_activities (self->overview) == FALSE &&
+     self->state == PHOSH_HOME_STATE_UNFOLDED && drag_state != PHOSH_DRAG_SURFACE_STATE_DRAGGED) {
+@@ -197,7 +214,7 @@
+ static int
+ get_margin (gint height)
+ {
+-  return (-1 * height) + PHOSH_HOME_BAR_HEIGHT;
++  return (-1 * height) + (pinecone_launcher_enabled () ? 0 : PHOSH_HOME_BAR_HEIGHT);
+ }
+ 
+ 
+@@ -426,7 +443,7 @@
+   toplevel = phosh_overview_get_toplevel_from_activity (overview, activity);
+ 
+   /* User raised an activity, make sure we zoom out the correct toplevel */
+-  if (toplevel)
++  if (toplevel && !self->navigation)
+     update_thumbnail_overlay (self, toplevel);
+ 
+   fold_cb (self, overview);
+@@ -448,6 +465,9 @@
+ {
+   g_return_if_fail (PHOSH_IS_HOME (self));
+ 
++  if (self->navigation)
++    return;
++
+   /* TODO: we need to debounce the handle resize a little until all
+      the queued resizing is done, would be nicer to have that tied to
+      a signal */
+@@ -711,6 +731,85 @@
+ 
+ 
+ static void
++on_navigation_visible (PhoshHome *self)
++{
++  if (!self->navigation)
++    return;
++  gtk_widget_set_visible (self->navigation,
++                          gtk_widget_get_visible (GTK_WIDGET (self)) &&
++                          !phosh_shell_get_locked (phosh_shell_get_default ()));
++}
++
++
++static void
++on_navigation_clicked (GtkButton *button, PhoshHome *self)
++{
++  PhoshShell *shell = phosh_shell_get_default ();
++
++  if (phosh_shell_get_locked (shell))
++    return;
++  self->nav_page = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (button), "pinecone-page"));
++  phosh_osk_manager_set_visible (phosh_shell_get_osk_manager (shell), FALSE);
++  phosh_overview_reset (self->overview);
++  phosh_overview_show_page (self->overview, self->nav_page);
++  phosh_home_set_state (self, PHOSH_HOME_STATE_UNFOLDED);
++  if (self->nav_page == PHOSH_OVERVIEW_PAGE_RECENT)
++    phosh_overview_refresh (self->overview);
++  phosh_home_update_home_bar (self);
++}
++
++
++static void
++add_navigation (PhoshHome *self)
++{
++  PhoshShell *shell = phosh_shell_get_default ();
++  PhoshWayland *wl = phosh_wayland_get_default ();
++  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
++  const struct {
++    PhoshOverviewPage page;
++    const char *icon;
++    const char *label;
++  } items[] = {
++    {PHOSH_OVERVIEW_PAGE_RECENT, "view-dual-symbolic", "Recent Apps"},
++    {PHOSH_OVERVIEW_PAGE_HOME, "go-home-symbolic", "Home"},
++    {PHOSH_OVERVIEW_PAGE_APPS, "view-app-grid-symbolic", "All Apps"},
++  };
++
++  self->navigation = g_object_new (PHOSH_TYPE_LAYER_SURFACE,
++                                    "layer-shell", phosh_wayland_get_zwlr_layer_shell_v1 (wl),
++                                    "wl-output", phosh_layer_surface_get_wl_output (PHOSH_LAYER_SURFACE (self)),
++                                    "anchor", ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
++                                              ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
++                                              ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
++                                    "layer", ZWLR_LAYER_SHELL_V1_LAYER_TOP,
++                                    "kbd-interactivity", FALSE,
++                                    "exclusive-zone", PINECONE_NAV_HEIGHT,
++                                    "namespace", "pinecone navigation",
++                                    NULL);
++  gtk_widget_set_name (self->navigation, "pinecone-navigation");
++  phosh_layer_surface_set_size (PHOSH_LAYER_SURFACE (self->navigation), 0, PINECONE_NAV_HEIGHT);
++  gtk_container_add (GTK_CONTAINER (self->navigation), box);
++  for (guint i = 0; i < G_N_ELEMENTS (items); i++) {
++    GtkWidget *button = gtk_button_new_from_icon_name (items[i].icon, GTK_ICON_SIZE_LARGE_TOOLBAR);
++    self->nav_buttons[items[i].page] = button;
++    gtk_widget_set_tooltip_text (button, items[i].label);
++    atk_object_set_name (gtk_widget_get_accessible (button), items[i].label);
++    gtk_widget_set_can_focus (button, FALSE);
++    gtk_button_set_relief (GTK_BUTTON (button), GTK_RELIEF_NONE);
++    gtk_widget_set_size_request (button, 48, PINECONE_NAV_HEIGHT);
++    g_object_set_data (G_OBJECT (button), "pinecone-page", GINT_TO_POINTER (items[i].page));
++    g_signal_connect (button, "clicked", G_CALLBACK (on_navigation_clicked), self);
++    gtk_box_pack_start (GTK_BOX (box), button, TRUE, TRUE, 0);
++  }
++  gtk_widget_show_all (box);
++  gtk_widget_hide (self->evbox_home_bar);
++  g_signal_connect_object (shell, "notify::locked", G_CALLBACK (on_navigation_visible), self, G_CONNECT_SWAPPED);
++  g_signal_connect (self, "notify::visible", G_CALLBACK (on_navigation_visible), NULL);
++  on_navigation_visible (self);
++}
++
++
++static void
+ phosh_home_constructed (GObject *object)
+ {
+   PhoshHome *self = PHOSH_HOME (object);
+@@ -738,6 +837,8 @@
+   g_object_set_data (G_OBJECT (self->osk_toggle_long_press), "phosh-home", self);
+ 
+   phosh_home_add_background (self);
++  if (pinecone_launcher_enabled ())
++    add_navigation (self);
+   g_signal_connect_object (phosh_shell_get_style_manager (shell),
+                            "notify::theme-name",
+                            G_CALLBACK (on_theme_name_changed),
+@@ -763,6 +864,7 @@
+ 
+   g_clear_pointer (&self->thumbnail_overlay, phosh_cp_widget_destroy);
+   g_clear_pointer (&self->background, phosh_cp_widget_destroy);
++  g_clear_pointer (&self->navigation, phosh_cp_widget_destroy);
+ 
+   G_OBJECT_CLASS (phosh_home_parent_class)->dispose (object);
+ }
+@@ -868,11 +970,11 @@
+                                  ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+                        "layer", ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+                        "kbd-interactivity", FALSE,
+-                       "exclusive-zone", PHOSH_HOME_BAR_HEIGHT,
++                       "exclusive-zone", pinecone_launcher_enabled () ? 0 : PHOSH_HOME_BAR_HEIGHT,
+                        "namespace", "phosh home",
+                        /* drag-surface */
+                        "layer-shell-effects", layer_shell_effects,
+-                       "exclusive", PHOSH_HOME_BAR_HEIGHT,
++                       "exclusive", pinecone_launcher_enabled () ? 0 : PHOSH_HOME_BAR_HEIGHT,
+                        "threshold", PHOSH_HOME_DRAG_THRESHOLD,
+                        NULL);
+ }
+diff -ruN -x subprojects a/src/home.h b/src/home.h
+--- a/src/home.h	2026-10-26 18:51:17
++++ b/src/home.h	2026-10-26 18:54:28
+@@ -8,12 +8,19 @@
+ #include "drag-surface.h"
+ #include "monitor/monitor.h"
+ #include "overview.h"
++#include "pinecone-launcher.h"
+ 
+ #include <gtk/gtk.h>
+ 
+ #define PHOSH_TYPE_HOME (phosh_home_get_type())
+ 
+ #define PHOSH_HOME_BAR_HEIGHT 15
++
++static inline int
++phosh_home_get_reserved_height (void)
++{
++  return pinecone_launcher_enabled () ? PINECONE_NAV_HEIGHT : PHOSH_HOME_BAR_HEIGHT;
++}
+ 
+ /**
+  * PhoshHomeState:
+diff -ruN -x subprojects a/src/meson.build b/src/meson.build
+--- a/src/meson.build	2026-10-26 18:51:17
++++ b/src/meson.build	2026-10-26 18:53:08
+@@ -258,6 +258,7 @@
+   'mpris-manager.c',
+   'osd-window.c',
+   'overview.c',
++  'pinecone-launcher.c',
+   'password-entry.c',
+   'phosh-wayland.c',
+   'plugin-loader.c',
+diff -ruN -x subprojects a/src/overview.c b/src/overview.c
+--- a/src/overview.c	2026-10-26 18:51:17
++++ b/src/overview.c	2026-10-26 19:02:50
+@@ -13,6 +13,9 @@
+ 
+ #include "activity.h"
+ #include "app-grid.h"
++#include "app-list-model.h"
++#include "favorite-list-model.h"
++#include "pinecone-launcher.h"
+ #include "overview.h"
+ #include "phosh-wayland.h"
+ #include "shell-priv.h"
+@@ -58,6 +61,10 @@
+   /* Running activities */
+   HdyCarousel        *carousel_running_activities;
+   GtkWidget          *app_grid;
++  GtkWidget          *evbox_app_grid;
++  GtkWidget          *launcher;
++  GtkWidget          *empty_recent;
++  PhoshOverviewPage   page;
+   PhoshActivity      *activity;
+ 
+   PhoshAppTracker    *app_tracker;     /* unowned */
+@@ -564,7 +571,10 @@
+     return;
+ 
+   priv->has_activities = has_activities;
+-  gtk_widget_set_visible (GTK_WIDGET (priv->carousel_running_activities), has_activities);
++  if (priv->launcher)
++    phosh_overview_show_page (self, priv->page);
++  else
++    gtk_widget_set_visible (GTK_WIDGET (priv->carousel_running_activities), has_activities);
+   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_HAS_ACTIVITIES]);
+ }
+ 
+@@ -801,6 +811,7 @@
+   gtk_widget_class_set_template_from_resource (widget_class, "/mobi/phosh/ui/overview.ui");
+ 
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshOverview, app_grid);
++  gtk_widget_class_bind_template_child_private (widget_class, PhoshOverview, evbox_app_grid);
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshOverview,
+                                                 carousel_running_activities);
+   gtk_widget_class_bind_template_callback (widget_class, on_app_launched);
+@@ -820,6 +831,19 @@
+   priv->has_activities = -1;
+   gtk_widget_init_template (GTK_WIDGET (self));
+ 
++  if (pinecone_launcher_enabled ()) {
++    priv->launcher = pinecone_launcher_new (G_LIST_MODEL (phosh_app_list_model_get_default ()),
++                                            G_LIST_MODEL (phosh_favorite_list_model_get_default ()));
++    gtk_box_pack_start (GTK_BOX (self), priv->launcher, TRUE, TRUE, 0);
++    g_signal_connect_object (priv->launcher, "app-launched", G_CALLBACK (on_app_launched),
++                              self, G_CONNECT_SWAPPED);
++    priv->empty_recent = gtk_label_new ("No recent applications");
++    gtk_widget_set_vexpand (priv->empty_recent, TRUE);
++    gtk_box_pack_start (GTK_BOX (self), priv->empty_recent, TRUE, TRUE, 0);
++    gtk_widget_set_vexpand (priv->evbox_app_grid, TRUE);
++    phosh_overview_show_page (self, PHOSH_OVERVIEW_PAGE_HOME);
++  }
++
+   priv->app_tracker = phosh_shell_get_app_tracker (shell);
+   /* Allow it to be empty for tests */
+   if (priv->app_tracker) {
+@@ -848,7 +872,10 @@
+   g_return_if_fail (PHOSH_IS_OVERVIEW (self));
+   priv = phosh_overview_get_instance_private (self);
+ 
+-  if (priv->activity) {
++  if (priv->launcher && priv->page != PHOSH_OVERVIEW_PAGE_RECENT)
++    return;
++
++  if (priv->activity && phosh_overview_get_toplevel_from_activity (self, priv->activity)) {
+     gtk_widget_grab_focus (GTK_WIDGET (priv->activity));
+     request_thumbnail (priv->activity,
+                        phosh_overview_get_toplevel_from_activity (self, priv->activity));
+@@ -875,6 +902,8 @@
+ 
+   g_return_if_fail (PHOSH_IS_OVERVIEW (self));
+   priv = phosh_overview_get_instance_private (self);
++  if (priv->launcher)
++    phosh_overview_show_page (self, PHOSH_OVERVIEW_PAGE_APPS);
+   phosh_app_grid_focus_search (PHOSH_APP_GRID (priv->app_grid));
+ }
+ 
+@@ -886,7 +915,29 @@
+ 
+   g_return_val_if_fail (PHOSH_IS_OVERVIEW (self), GDK_EVENT_PROPAGATE);
+   priv = phosh_overview_get_instance_private (self);
++  if (priv->launcher)
++    phosh_overview_show_page (self, PHOSH_OVERVIEW_PAGE_APPS);
+   return phosh_app_grid_handle_search (PHOSH_APP_GRID (priv->app_grid), event);
++}
++
++
++void
++phosh_overview_show_page (PhoshOverview *self, PhoshOverviewPage page)
++{
++  PhoshOverviewPrivate *priv = phosh_overview_get_instance_private (self);
++
++  g_return_if_fail (page >= PHOSH_OVERVIEW_PAGE_HOME && page <= PHOSH_OVERVIEW_PAGE_RECENT);
++  if (!priv->launcher)
++    return;
++  priv->page = page;
++  if (page == PHOSH_OVERVIEW_PAGE_APPS)
++    phosh_app_list_model_ensure_complete (phosh_app_list_model_get_default ());
++  gtk_widget_set_visible (priv->launcher, page == PHOSH_OVERVIEW_PAGE_HOME);
++  gtk_widget_set_visible (priv->evbox_app_grid, page == PHOSH_OVERVIEW_PAGE_APPS);
++  gtk_widget_set_visible (GTK_WIDGET (priv->carousel_running_activities),
++                          page == PHOSH_OVERVIEW_PAGE_RECENT && priv->has_activities > 0);
++  gtk_widget_set_visible (priv->empty_recent,
++                          page == PHOSH_OVERVIEW_PAGE_RECENT && priv->has_activities <= 0);
+ }
+ 
+ 
+diff -ruN -x subprojects a/src/overview.h b/src/overview.h
+--- a/src/overview.h	2026-10-26 18:51:17
++++ b/src/overview.h	2026-10-26 18:53:25
+@@ -19,6 +19,14 @@
+ 
+ G_DECLARE_FINAL_TYPE (PhoshOverview, phosh_overview, PHOSH, OVERVIEW, GtkBox)
+ 
++typedef enum {
++  PHOSH_OVERVIEW_PAGE_HOME,
++  PHOSH_OVERVIEW_PAGE_APPS,
++  PHOSH_OVERVIEW_PAGE_RECENT,
++} PhoshOverviewPage;
++
++void phosh_overview_show_page (PhoshOverview *self, PhoshOverviewPage page);
++
+ 
+ GtkWidget *phosh_overview_new (void);
+ void       phosh_overview_refresh (PhoshOverview *self);
+diff -ruN -x subprojects a/src/pinecone-launcher.c b/src/pinecone-launcher.c
+--- a/src/pinecone-launcher.c	1969-12-31 18:00:00
++++ b/src/pinecone-launcher.c	2026-10-26 18:55:51
+@@ -0,0 +1,182 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "pinecone-launcher.h"
++#include "app-grid-button.h"
++#include "folder-info.h"
++
++struct _PineconeLauncher {
++  GtkBox parent;
++  GListModel *apps, *favorites;
++  GListStore *home_items, *dock_items;
++  GtkWidget *home, *dock, *empty;
++};
++G_DEFINE_TYPE (PineconeLauncher, pinecone_launcher, GTK_TYPE_BOX)
++static guint app_launched;
++
++static void
++on_app_launched (GtkWidget *button, GAppInfo *info, PineconeLauncher *self)
++{
++  g_signal_emit (self, app_launched, 0, info);
++}
++
++static GtkWidget *
++create_button (gpointer item, gpointer data)
++{
++  GtkWidget *button = phosh_app_grid_button_new (G_APP_INFO (item));
++  gtk_widget_set_tooltip_text (button, g_app_info_get_display_name (item));
++  g_signal_connect_object (button, "app-launched", G_CALLBACK (on_app_launched), data, 0);
++  gtk_widget_show (button);
++  return button;
++}
++
++static gint
++compare_apps (gconstpointer a, gconstpointer b, gpointer data)
++{
++  return g_utf8_collate (g_app_info_get_display_name (G_APP_INFO ((gpointer)a)),
++                         g_app_info_get_display_name (G_APP_INFO ((gpointer)b)));
++}
++
++static GtkWidget *
++create_dock_button (gpointer item, gpointer data)
++{
++  GtkWidget *button = create_button (item, data);
++  GtkWidget *clamp = gtk_bin_get_child (GTK_BIN (button));
++  GtkWidget *icon = phosh_app_grid_base_button_get_child (PHOSH_APP_GRID_BASE_BUTTON (button));
++  g_object_set (clamp, "width-request", 64, "natural-size", 64, NULL);
++  gtk_image_set_pixel_size (GTK_IMAGE (icon), 48);
++  return button;
++}
++
++static void
++append_app (GListStore *store, GHashTable *seen, GAppInfo *info)
++{
++  const char *id = g_app_info_get_id (info);
++  if (!G_IS_DESKTOP_APP_INFO (info) || !id || !g_app_info_should_show (info) ||
++      g_hash_table_contains (seen, id))
++    return;
++  g_hash_table_add (seen, g_strdup (id));
++  g_list_store_append (store, info);
++}
++
++static void
++rebuild (PineconeLauncher *self)
++{
++  g_autoptr (GHashTable) seen = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++  g_list_store_remove_all (self->dock_items);
++  g_list_store_remove_all (self->home_items);
++
++  /* First four favorites form the dock; overflow stays on Home. */
++  for (guint i = 0; i < g_list_model_get_n_items (self->favorites); i++) {
++    g_autoptr (GAppInfo) info = g_list_model_get_item (self->favorites, i);
++    GListStore *target = g_list_model_get_n_items (G_LIST_MODEL (self->dock_items)) < 4 ?
++      self->dock_items : self->home_items;
++    append_app (target, seen, info);
++  }
++  for (guint i = 0; i < g_list_model_get_n_items (self->apps); i++) {
++    g_autoptr (GAppInfo) info = g_list_model_get_item (self->apps, i);
++    if (PHOSH_IS_FOLDER_INFO (info)) {
++      GListModel *children = phosh_folder_info_get_app_infos (PHOSH_FOLDER_INFO (info));
++      for (guint j = 0; j < g_list_model_get_n_items (children); j++) {
++        g_autoptr (GAppInfo) child = g_list_model_get_item (children, j);
++        append_app (self->home_items, seen, child);
++      }
++    } else {
++      append_app (self->home_items, seen, info);
++    }
++  }
++  g_list_store_sort (self->home_items, compare_apps, NULL);
++  gtk_widget_set_visible (self->dock, g_list_model_get_n_items (G_LIST_MODEL (self->dock_items)) > 0);
++  gtk_widget_set_visible (self->empty, g_list_model_get_n_items (G_LIST_MODEL (self->home_items)) == 0);
++}
++
++static void
++on_items_changed (GListModel *model, guint position, guint removed, guint added,
++                  PineconeLauncher *self)
++{
++  rebuild (self);
++}
++
++static GtkWidget *
++new_grid (GListModel *model, PineconeLauncher *self, gboolean dock)
++{
++  GtkWidget *grid = gtk_flow_box_new ();
++  gtk_flow_box_set_selection_mode (GTK_FLOW_BOX (grid), GTK_SELECTION_NONE);
++  gtk_flow_box_set_activate_on_single_click (GTK_FLOW_BOX (grid), FALSE);
++  gtk_flow_box_set_homogeneous (GTK_FLOW_BOX (grid), TRUE);
++  gtk_flow_box_set_min_children_per_line (GTK_FLOW_BOX (grid), dock ? 4 : 1);
++  gtk_flow_box_set_max_children_per_line (GTK_FLOW_BOX (grid), 4);
++  gtk_flow_box_set_row_spacing (GTK_FLOW_BOX (grid), 16);
++  gtk_flow_box_set_column_spacing (GTK_FLOW_BOX (grid), 4);
++  gtk_widget_set_valign (grid, GTK_ALIGN_START);
++  gtk_flow_box_bind_model (GTK_FLOW_BOX (grid), model,
++                           dock ? create_dock_button : create_button, self, NULL);
++  gtk_widget_show (grid);
++  return grid;
++}
++
++static void
++pinecone_launcher_dispose (GObject *object)
++{
++  PineconeLauncher *self = PINECONE_LAUNCHER (object);
++  if (self->apps)
++    g_signal_handlers_disconnect_by_data (self->apps, self);
++  if (self->favorites)
++    g_signal_handlers_disconnect_by_data (self->favorites, self);
++  g_clear_object (&self->apps);
++  g_clear_object (&self->favorites);
++  g_clear_object (&self->home_items);
++  g_clear_object (&self->dock_items);
++  G_OBJECT_CLASS (pinecone_launcher_parent_class)->dispose (object);
++}
++
++static void
++pinecone_launcher_class_init (PineconeLauncherClass *klass)
++{
++  G_OBJECT_CLASS (klass)->dispose = pinecone_launcher_dispose;
++  gtk_widget_class_set_css_name (GTK_WIDGET_CLASS (klass), "pinecone-launcher");
++  app_launched = g_signal_new ("app-launched", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
++                               0, NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_APP_INFO);
++}
++
++static void
++pinecone_launcher_init (PineconeLauncher *self)
++{
++  GtkWidget *heading, *scroll, *content;
++  gtk_orientable_set_orientation (GTK_ORIENTABLE (self), GTK_ORIENTATION_VERTICAL);
++  gtk_widget_set_vexpand (GTK_WIDGET (self), TRUE);
++  self->home_items = g_list_store_new (G_TYPE_DESKTOP_APP_INFO);
++  self->dock_items = g_list_store_new (G_TYPE_DESKTOP_APP_INFO);
++  heading = gtk_label_new ("Pinecone");
++  gtk_label_set_xalign (GTK_LABEL (heading), 0);
++  gtk_widget_set_name (heading, "pinecone-launcher-title");
++  gtk_box_pack_start (GTK_BOX (self), heading, FALSE, FALSE, 0);
++  scroll = gtk_scrolled_window_new (NULL, NULL);
++  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
++  gtk_box_pack_start (GTK_BOX (self), scroll, TRUE, TRUE, 0);
++  content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
++  gtk_container_add (GTK_CONTAINER (scroll), content);
++  self->home = new_grid (G_LIST_MODEL (self->home_items), self, FALSE);
++  gtk_widget_set_name (self->home, "pinecone-home-grid");
++  gtk_box_pack_start (GTK_BOX (content), self->home, FALSE, FALSE, 0);
++  self->empty = gtk_label_new ("No other applications installed");
++  gtk_label_set_line_wrap (GTK_LABEL (self->empty), TRUE);
++  gtk_box_pack_start (GTK_BOX (content), self->empty, FALSE, FALSE, 16);
++  self->dock = new_grid (G_LIST_MODEL (self->dock_items), self, TRUE);
++  gtk_widget_set_name (self->dock, "pinecone-dock");
++  gtk_box_pack_end (GTK_BOX (self), self->dock, FALSE, FALSE, 0);
++  gtk_widget_show_all (GTK_WIDGET (self));
++}
++
++GtkWidget *
++pinecone_launcher_new (GListModel *apps, GListModel *favorites)
++{
++  PineconeLauncher *self;
++  g_return_val_if_fail (G_IS_LIST_MODEL (apps), NULL);
++  g_return_val_if_fail (G_IS_LIST_MODEL (favorites), NULL);
++  self = g_object_new (PINECONE_TYPE_LAUNCHER, NULL);
++  self->apps = g_object_ref (apps);
++  self->favorites = g_object_ref (favorites);
++  g_signal_connect_object (apps, "items-changed", G_CALLBACK (on_items_changed), self, 0);
++  g_signal_connect_object (favorites, "items-changed", G_CALLBACK (on_items_changed), self, 0);
++  rebuild (self);
++  return GTK_WIDGET (self);
++}
+diff -ruN -x subprojects a/src/pinecone-launcher.h b/src/pinecone-launcher.h
+--- a/src/pinecone-launcher.h	1969-12-31 18:00:00
++++ b/src/pinecone-launcher.h	2026-10-26 18:53:07
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <gtk/gtk.h>
++
++#define PINECONE_TYPE_LAUNCHER (pinecone_launcher_get_type ())
++G_DECLARE_FINAL_TYPE (PineconeLauncher, pinecone_launcher, PINECONE, LAUNCHER, GtkBox)
++#define PINECONE_NAV_HEIGHT 56
++
++static inline gboolean
++pinecone_launcher_enabled (void)
++{
++  return g_strcmp0 (g_getenv ("PINECONE_PHOSH_LAUNCHER"), "1") == 0;
++}
++
++GtkWidget *pinecone_launcher_new (GListModel *apps, GListModel *favorites);
+diff -ruN -x subprojects a/src/shell.c b/src/shell.c
+--- a/src/shell.c	2026-10-26 18:51:17
++++ b/src/shell.c	2026-10-26 18:54:29
+@@ -2355,11 +2355,11 @@
+   case PHOSH_MONITOR_TRANSFORM_FLIPPED:
+   case PHOSH_MONITOR_TRANSFORM_FLIPPED_180:
+     w = mode->width / scale;
+-    h = mode->height / scale - PHOSH_TOP_BAR_HEIGHT - PHOSH_HOME_BAR_HEIGHT;
++    h = mode->height / scale - PHOSH_TOP_BAR_HEIGHT - phosh_home_get_reserved_height ();
+     break;
+   default:
+     w = mode->height / scale;
+-    h = mode->width / scale - PHOSH_TOP_BAR_HEIGHT - PHOSH_HOME_BAR_HEIGHT;
++    h = mode->width / scale - PHOSH_TOP_BAR_HEIGHT - phosh_home_get_reserved_height ();
+     break;
+   }
+ 
+@@ -2392,7 +2392,7 @@
+     *width = w;
+ 
+   if (height)
+-    *height = h + PHOSH_TOP_BAR_HEIGHT + PHOSH_HOME_BAR_HEIGHT;
++    *height = h + PHOSH_TOP_BAR_HEIGHT + phosh_home_get_reserved_height ();
+ }
+ 
+ static PhoshShell *instance;
+diff -ruN -x subprojects a/tests/meson.build b/tests/meson.build
+--- a/tests/meson.build	2026-10-26 18:51:17
++++ b/tests/meson.build	2026-10-26 18:55:51
+@@ -131,6 +131,7 @@
+   'notification-source',
+   'notify-feedback',
+   'overview',
++  'pinecone-launcher',
+   'plugin-loader',
+   'quick-setting',
+   'quick-settings-box',
+diff -ruN -x subprojects a/tests/test-pinecone-launcher.c b/tests/test-pinecone-launcher.c
+--- a/tests/test-pinecone-launcher.c	1969-12-31 18:00:00
++++ b/tests/test-pinecone-launcher.c	2026-10-26 19:03:38
+@@ -0,0 +1,153 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "pinecone-launcher.h"
++#include "app-grid-button.h"
++#include "app-list-model.h"
++#include "overview.h"
++#include <glib/gstdio.h>
++#include <handy.h>
++
++static GtkWidget *
++find_named (GtkWidget *widget, const char *name)
++{
++  if (g_strcmp0 (gtk_widget_get_name (widget), name) == 0)
++    return widget;
++  if (GTK_IS_CONTAINER (widget)) {
++    g_autoptr (GList) children = gtk_container_get_children (GTK_CONTAINER (widget));
++    for (GList *l = children; l; l = l->next) {
++      GtkWidget *found = find_named (l->data, name);
++      if (found)
++        return found;
++    }
++  }
++  return NULL;
++}
++
++static guint
++child_count (GtkWidget *widget)
++{
++  g_autoptr (GList) children = gtk_container_get_children (GTK_CONTAINER (widget));
++  return g_list_length (children);
++}
++
++static void
++on_launched (PineconeLauncher *launcher, GAppInfo *info, GAppInfo **received)
++{
++  *received = info;
++}
++
++static void
++test_models (void)
++{
++  g_autoptr (GListStore) apps = g_list_store_new (G_TYPE_DESKTOP_APP_INFO);
++  g_autoptr (GListStore) favorites = g_list_store_new (G_TYPE_DESKTOP_APP_INFO);
++  g_autofree char *dir = g_dir_make_tmp ("pinecone-launcher-test-XXXXXX", NULL);
++  GtkWidget *launcher, *home, *dock;
++  GAppInfo *received = NULL;
++  GAppInfo *info;
++  GtkFlowBoxChild *button;
++  int minimum, natural;
++
++  for (guint i = 0; i < 6; i++) {
++    g_autofree char *file = g_strdup_printf ("%s/app%u.desktop", dir, i);
++    g_autofree char *contents = g_strdup_printf (
++      "[Desktop Entry]\nType=Application\nName=Test %u\nExec=/bin/true\nIcon=utilities-terminal\n", i);
++    g_autoptr (GDesktopAppInfo) info = NULL;
++    g_assert_true (g_file_set_contents (file, contents, -1, NULL));
++    info = g_desktop_app_info_new_from_filename (file);
++    g_assert_nonnull (info);
++    g_list_store_append (apps, info);
++    g_list_store_append (favorites, info);
++    g_remove (file);
++  }
++  g_rmdir (dir);
++  launcher = pinecone_launcher_new (G_LIST_MODEL (apps), G_LIST_MODEL (favorites));
++  g_object_ref_sink (launcher);
++  home = find_named (launcher, "pinecone-home-grid");
++  dock = find_named (launcher, "pinecone-dock");
++  g_assert_nonnull (home);
++  g_assert_nonnull (dock);
++  g_assert_cmpuint (child_count (dock), ==, 4);
++  g_assert_cmpuint (child_count (home), ==, 2);
++
++  /* Favorites update without rereading desktop files; no duplicate icons. */
++  g_list_store_remove_all (favorites);
++  g_assert_cmpuint (child_count (home), ==, 6);
++  g_assert_false (gtk_widget_get_visible (dock));
++  g_list_store_remove (apps, 5);
++  g_assert_cmpuint (child_count (home), ==, 5);
++
++  button = gtk_flow_box_get_child_at_index (GTK_FLOW_BOX (home), 0);
++  info = phosh_app_grid_button_get_app_info (PHOSH_APP_GRID_BUTTON (button));
++  g_signal_connect (launcher, "app-launched", G_CALLBACK (on_launched), &received);
++  g_signal_emit_by_name (button, "app-launched", info);
++  g_assert_true (received == info);
++
++  /* Minimum size never forces horizontal overflow on a 320px display. */
++  gtk_widget_get_preferred_width (launcher, &minimum, &natural);
++  g_assert_cmpint (minimum, <=, 320);
++  gtk_widget_destroy (launcher);
++  g_object_unref (launcher);
++  g_list_store_remove_all (apps); /* Destruction disconnected model callbacks. */
++}
++
++static void
++test_pages (void)
++{
++  GtkWidget *overview = phosh_overview_new ();
++  GtkWidget *launcher = find_named (overview, "PineconeLauncher");
++  GtkWidget *grid = GTK_WIDGET (phosh_overview_get_app_grid (PHOSH_OVERVIEW (overview)));
++  GtkWidget *library = gtk_widget_get_parent (grid);
++  g_assert_nonnull (launcher);
++  g_assert_true (gtk_widget_get_visible (launcher));
++  g_assert_false (gtk_widget_get_visible (library));
++  phosh_overview_show_page (PHOSH_OVERVIEW (overview), PHOSH_OVERVIEW_PAGE_APPS);
++  g_assert_false (gtk_widget_get_visible (launcher));
++  g_assert_true (gtk_widget_get_visible (library));
++  phosh_overview_show_page (PHOSH_OVERVIEW (overview), PHOSH_OVERVIEW_PAGE_RECENT);
++  g_assert_false (gtk_widget_get_visible (launcher));
++  g_assert_false (gtk_widget_get_visible (library));
++  phosh_overview_show_page (PHOSH_OVERVIEW (overview), PHOSH_OVERVIEW_PAGE_HOME);
++  g_assert_true (gtk_widget_get_visible (launcher));
++  gtk_widget_destroy (overview);
++}
++
++static void
++test_complete_discovery (void)
++{
++  g_autoptr (PhoshAppListModel) model = g_object_new (PHOSH_TYPE_APP_LIST_MODEL, NULL);
++  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
++  gboolean found = FALSE;
++
++  phosh_app_list_model_ensure_complete (model);
++  while (g_list_model_get_n_items (G_LIST_MODEL (model)) == 0 &&
++         g_get_monotonic_time () < deadline) {
++    g_main_context_iteration (NULL, FALSE);
++    g_usleep (1000);
++  }
++  for (guint i = 0; i < g_list_model_get_n_items (G_LIST_MODEL (model)); i++) {
++    g_autoptr (GAppInfo) info = g_list_model_get_item (G_LIST_MODEL (model), i);
++    if (g_strcmp0 (g_app_info_get_id (info), "demo.app.Second.desktop") == 0)
++      found = TRUE;
++  }
++  g_assert_true (found); /* This app is deliberately absent from the boot manifest. */
++}
++
++int
++main (int argc, char **argv)
++{
++  g_autofree char *dir = g_dir_make_tmp ("pinecone-manifest-test-XXXXXX", NULL);
++  g_autofree char *manifest = g_build_filename (dir, "apps.list", NULL);
++  int result;
++  g_assert_true (g_file_set_contents (manifest, "demo.app.First.desktop\n", -1, NULL));
++  g_setenv ("PINECONE_PHOSH_LAUNCHER", "1", TRUE);
++  g_setenv ("PINECONE_PHOSH_APP_MANIFEST", manifest, TRUE);
++  gtk_test_init (&argc, &argv, NULL);
++  hdy_init ();
++  g_test_add_func ("/pinecone/launcher/models", test_models);
++  g_test_add_func ("/pinecone/launcher/pages", test_pages);
++  g_test_add_func ("/pinecone/launcher/complete-discovery", test_complete_discovery);
++  result = g_test_run ();
++  g_remove (manifest);
++  g_rmdir (dir);
++  return result;
++}

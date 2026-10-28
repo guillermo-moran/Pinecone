@@ -1,0 +1,312 @@
+--- a/include/render/pixman.h
++++ b/include/render/pixman.h
+@@ -13,6 +13,7 @@
+ };
+ 
+ struct wlr_pixman_buffer;
++struct pinecone_pixman_buffer;
+ 
+ struct wlr_pixman_renderer {
+ 	struct wlr_renderer wlr_renderer;
+@@ -30,6 +31,7 @@
+ 	struct wlr_pixman_renderer *renderer;
+ 
+ 	pixman_image_t *image;
++	struct pinecone_pixman_buffer *pinecone_lease;
+ 
+ 	struct wl_listener buffer_destroy;
+ 	struct wl_list link; // wlr_pixman_renderer.buffers
+@@ -41,6 +43,7 @@
+ 	struct wl_list link; // wlr_pixman_renderer.textures
+ 
+ 	pixman_image_t *image;
++	struct pinecone_pixman_buffer *pinecone_lease;
+ 	pixman_format_code_t format;
+ 	const struct wlr_pixel_format_info *format_info;
+ 
+@@ -63,6 +66,11 @@
+ bool begin_pixman_data_ptr_access(struct wlr_buffer *buffer, pixman_image_t **image_ptr,
+ 	uint32_t flags);
+ 
++bool begin_pixman_renderer_access(struct wlr_buffer *buffer,
++	pixman_image_t **image, uint32_t flags, struct pinecone_pixman_buffer **lease);
++void end_pixman_renderer_access(struct wlr_buffer *buffer,
++	pixman_image_t **image, struct pinecone_pixman_buffer **lease);
++
+ struct wlr_pixman_render_pass *begin_pixman_render_pass(
+ 	struct wlr_pixman_buffer *buffer);
+ 
+--- a/include/wlr/interfaces/wlr_buffer.h
++++ b/include/wlr/interfaces/wlr_buffer.h
+@@ -20,6 +20,10 @@
+ 	bool (*begin_data_ptr_access)(struct wlr_buffer *buffer, uint32_t flags,
+ 		void **data, uint32_t *format, size_t *stride);
+ 	void (*end_data_ptr_access)(struct wlr_buffer *buffer);
++	// Opt-in for compositor-owned storage only: lock pins a stable mapping,
++	// end_data_ptr_access does not unmap/synchronize it, and all CPU users go
++	// through wlr_buffer_begin/end_data_ptr_access. Never set for client imports.
++	bool pinecone_data_ptr_is_stable;
+ };
+ 
+ struct wlr_buffer_resource_interface {
+--- a/render/allocator/drm_dumb.c
++++ b/render/allocator/drm_dumb.c
+@@ -158,6 +158,7 @@
+ 	.get_dmabuf = buffer_get_dmabuf,
+ 	.begin_data_ptr_access = drm_dumb_buffer_begin_data_ptr_access,
+ 	.end_data_ptr_access = drm_dumb_buffer_end_data_ptr_access,
++	.pinecone_data_ptr_is_stable = true,
+ };
+ 
+ static const struct wlr_allocator_interface allocator_impl;
+--- a/render/pixman/pass.c
++++ b/render/pixman/pass.c
+@@ -20,7 +20,8 @@
+ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+ 	struct wlr_pixman_render_pass *pass = get_render_pass(wlr_pass);
+ 
+-	wlr_buffer_end_data_ptr_access(pass->buffer->buffer);
++	end_pixman_renderer_access(pass->buffer->buffer, &pass->buffer->image,
++		&pass->buffer->pinecone_lease);
+ 	wlr_buffer_unlock(pass->buffer->buffer);
+ 	bool ok = !pass->failed;
+ 	free(pass);
+@@ -44,8 +45,8 @@
+ 	struct wlr_pixman_texture *texture = get_texture(options->texture);
+ 	struct wlr_pixman_buffer *buffer = pass->buffer;
+ 
+-	if (texture->buffer != NULL && !begin_pixman_data_ptr_access(texture->buffer,
+-			&texture->image, WLR_BUFFER_DATA_PTR_ACCESS_READ)) {
++	if (texture->buffer != NULL && !begin_pixman_renderer_access(texture->buffer,
++			&texture->image, WLR_BUFFER_DATA_PTR_ACCESS_READ, &texture->pinecone_lease)) {
+ 		pass->failed = true;
+ 		return;
+ 	}
+@@ -194,7 +195,7 @@
+ 	pixman_image_set_clip_region32(buffer->image, NULL);
+ 
+ 	if (texture->buffer != NULL) {
+-		wlr_buffer_end_data_ptr_access(texture->buffer);
++		end_pixman_renderer_access(texture->buffer, &texture->image, &texture->pinecone_lease);
+ 		pass->failed |= !pixman_dmabuf_buffer_ok(texture->buffer);
+ 	}
+ 
+@@ -245,8 +246,9 @@
+ 
+ 	wlr_render_pass_init(&pass->base, &render_pass_impl);
+ 
+-	if (!begin_pixman_data_ptr_access(buffer->buffer, &buffer->image,
+-			WLR_BUFFER_DATA_PTR_ACCESS_READ | WLR_BUFFER_DATA_PTR_ACCESS_WRITE)) {
++	if (!begin_pixman_renderer_access(buffer->buffer, &buffer->image,
++			WLR_BUFFER_DATA_PTR_ACCESS_READ | WLR_BUFFER_DATA_PTR_ACCESS_WRITE,
++			&buffer->pinecone_lease)) {
+ 		free(pass);
+ 		return NULL;
+ 	}
+--- a/render/pixman/renderer.c
++++ b/render/pixman/renderer.c
+@@ -1,9 +1,11 @@
+ #include <assert.h>
+ #include <drm_fourcc.h>
++#include <limits.h>
+ #include <pixman.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <wayland-util.h>
++#include <wlr/interfaces/wlr_buffer.h>
+ #include <wlr/render/interface.h>
+ #include <wlr/util/box.h>
+ #include <wlr/util/log.h>
+@@ -13,6 +15,85 @@
+ #include "types/wlr_buffer.h"
+ 
+ static const struct wlr_renderer_impl renderer_impl;
++
++extern struct pinecone_pixman_buffer *pinecone_pixman_buffer_register(
++	void *, size_t, void *, void (*)(void *)) __attribute__((weak));
++extern void pinecone_pixman_buffer_unregister(
++	struct pinecone_pixman_buffer *) __attribute__((weak));
++extern int pinecone_pixman_image_attach_buffer(pixman_image_t *,
++	struct pinecone_pixman_buffer *) __attribute__((weak));
++
++static void release_pinecone_buffer(void *data) {
++	wlr_buffer_unlock(data);
++}
++
++bool begin_pixman_renderer_access(struct wlr_buffer *buffer,
++		pixman_image_t **image, uint32_t flags, struct pinecone_pixman_buffer **lease) {
++	assert(*lease == NULL);
++	if (!buffer->impl->pinecone_data_ptr_is_stable ||
++			!pinecone_pixman_buffer_register || !pinecone_pixman_buffer_unregister ||
++			!pinecone_pixman_image_attach_buffer) {
++		return begin_pixman_data_ptr_access(buffer, image, flags);
++	}
++
++	// This is a renderer lease, not CPU exposure. In particular, do not call
++	// wlr_buffer_begin_data_ptr_access or pixman_image_get_data here: the base
++	// Pinecone patch wraps those in CPU scopes which must remain real hazards.
++	assert(!buffer->accessing_data_ptr);
++	void *data;
++	uint32_t drm_format;
++	size_t stride;
++	if (!buffer->impl->begin_data_ptr_access(buffer, flags, &data, &drm_format, &stride)) {
++		return false;
++	}
++	pixman_format_code_t format = get_pixman_format_from_drm(drm_format);
++	pixman_image_t *next = NULL;
++	if (format && buffer->height > 0 && stride <= INT_MAX &&
++			stride <= SIZE_MAX / (size_t)buffer->height) {
++		next = pixman_image_create_bits_no_clear(format, buffer->width,
++			buffer->height, data, stride);
++	}
++	if (next) {
++		wlr_buffer_lock(buffer);
++		*lease = pinecone_pixman_buffer_register(data, stride * buffer->height,
++			buffer, release_pinecone_buffer);
++		if (!*lease) {
++			wlr_buffer_unlock(buffer);
++		} else if (!pinecone_pixman_image_attach_buffer(next, *lease)) {
++			pinecone_pixman_buffer_unregister(*lease);
++			*lease = NULL;
++		}
++	}
++	if (!*lease) {
++		if (next) pixman_image_unref(next);
++		buffer->impl->end_data_ptr_access(buffer);
++		// Escaped pointers and failed registration stay on the fenced CPU path.
++		return begin_pixman_data_ptr_access(buffer, image, flags);
++	}
++	if (*image) pixman_image_unref(*image);
++	*image = next;
++	buffer->accessing_data_ptr = true;
++	return true;
++}
++
++void end_pixman_renderer_access(struct wlr_buffer *buffer,
++		pixman_image_t **image, struct pinecone_pixman_buffer **lease) {
++	if (!*lease) {
++		wlr_buffer_end_data_ptr_access(buffer);
++		return;
++	}
++	assert(buffer->accessing_data_ptr);
++	buffer->impl->end_data_ptr_access(buffer);
++	buffer->accessing_data_ptr = false;
++	struct pinecone_pixman_buffer *retired = *lease;
++	pixman_image_t *retained = *image;
++	*lease = NULL;
++	*image = NULL;
++	// Drop the renderer's image reference to avoid a buffer/listener cycle.
++	// Queued commands retain it, and therefore the backing lock, until fenced.
++	pinecone_pixman_buffer_unregister(retired);
++	pixman_image_unref(retained);
++}
+ 
+ bool wlr_renderer_is_pixman(struct wlr_renderer *wlr_renderer) {
+ 	return wlr_renderer->impl == &renderer_impl;
+@@ -39,7 +120,7 @@
+ 
+ 	// If the data pointer has changed, re-create the Pixman image. This can
+ 	// happen if it's a client buffer and the wl_shm_pool has been resized.
+-	if (data != pixman_image_get_data(image)) {
++	if (image == NULL || data != pixman_image_get_data(image)) {
+ 		pixman_format_code_t format = get_pixman_format_from_drm(drm_format);
+ 		assert(format != 0);
+ 
+@@ -50,7 +131,7 @@
+ 			return false;
+ 		}
+ 
+-		pixman_image_unref(image);
++		if (image) pixman_image_unref(image);
+ 		image = new_image;
+ 	}
+ 
+@@ -85,7 +166,7 @@
+ static void texture_destroy(struct wlr_texture *wlr_texture) {
+ 	struct wlr_pixman_texture *texture = get_texture(wlr_texture);
+ 	wl_list_remove(&texture->link);
+-	pixman_image_unref(texture->image);
++	if (texture->image) pixman_image_unref(texture->image);
+ 	wlr_buffer_unlock(texture->buffer);
+ 	free(texture->data);
+ 	free(texture);
+@@ -131,8 +212,7 @@
+ static uint32_t pixman_texture_preferred_read_format(struct wlr_texture *wlr_texture) {
+ 	struct wlr_pixman_texture *texture = get_texture(wlr_texture);
+ 
+-	pixman_format_code_t pixman_format = pixman_image_get_format(texture->image);
+-	return get_drm_format_from_pixman(pixman_format);
++	return get_drm_format_from_pixman(texture->format);
+ }
+ 
+ static const struct wlr_texture_impl texture_impl = {
+@@ -145,7 +225,7 @@
+ 	wl_list_remove(&buffer->link);
+ 	wl_list_remove(&buffer->buffer_destroy.link);
+ 
+-	pixman_image_unref(buffer->image);
++	if (buffer->image) pixman_image_unref(buffer->image);
+ 
+ 	free(buffer);
+ }
+@@ -404,6 +484,11 @@
+ 	}
+ 	if (!buffer) {
+ 		return NULL;
++	}
++	if (!buffer->image) {
++		if (!begin_pixman_data_ptr_access(wlr_buffer, &buffer->image,
++				WLR_BUFFER_DATA_PTR_ACCESS_READ)) return NULL;
++		wlr_buffer_end_data_ptr_access(wlr_buffer);
+ 	}
+ 	return buffer->image;
+ }
+@@ -414,5 +499,10 @@
+ 	if (pixman_dmabuf_buffer_is_imported(texture->buffer)) {
+ 		return NULL;
+ 	}
++	if (!texture->image && texture->buffer) {
++		if (!begin_pixman_data_ptr_access(texture->buffer, &texture->image,
++				WLR_BUFFER_DATA_PTR_ACCESS_READ)) return NULL;
++		wlr_buffer_end_data_ptr_access(texture->buffer);
++	}
+ 	return texture->image;
+ }
+--- a/types/output/output.c
++++ b/types/output/output.c
+@@ -1,5 +1,6 @@
+ #include <assert.h>
+ extern void pinecone_pixman_output_commit(void) __attribute__((weak));
++extern int pinecone_pixman_prepare_output_commit(void) __attribute__((weak));
+ #include <drm_fourcc.h>
+ #include <stdlib.h>
+ #include <wlr/backend.h>
+@@ -812,6 +813,19 @@
+ 
+ 	if (!output_prepare_commit(output, &pending)) {
+ 		return false;
++	}
++
++	// Submit rendering before KMS sees the buffer, even when the allocator and
++	// backend use different DRM files. Failed submission must not present it.
++	if (pinecone_pixman_prepare_output_commit) {
++		if (!pinecone_pixman_prepare_output_commit()) {
++			if (new_back_buffer) {
++				wlr_buffer_unlock(pending.buffer);
++			}
++			return false;
++		}
++	} else if (pinecone_pixman_output_commit) {
++		pinecone_pixman_output_commit();
+ 	}
+ 
+ 	if (!output->impl->commit(output, &pending)) {
+@@ -821,8 +835,6 @@
+ 		return false;
+ 	}
+ 
+-	if (pinecone_pixman_output_commit)
+-		pinecone_pixman_output_commit();
+ 	output_apply_commit(output, &pending);
+ 	output_send_commit_event(output, &pending);
+ 

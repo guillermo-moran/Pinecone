@@ -68,7 +68,11 @@ struct AVZGuestMemory {
     size_t page_count;
     _Atomic uint64_t current_epoch;
     _Atomic uint64_t current_write_generation;
+    /* Isolate read-mostly code validation from write tickets and TLBI traffic.
+     * Padding works for cache lines <=128 bytes without over-aligning calloc. */
+    unsigned char code_epoch_pad_before[128];
     _Atomic uint64_t code_mutation_epoch;
+    unsigned char code_epoch_pad_after[128];
     _Atomic uint64_t translation_epoch;
     atomic_flag translation_lock;
     AVZNativeTLBI translation_journal[AVZ_TLBI_JOURNAL_COUNT];
@@ -79,6 +83,13 @@ struct AVZGuestMemory {
     atomic_flag *page_locks;
     _Atomic uint8_t *code_page_bits;
 };
+
+_Static_assert(offsetof(struct AVZGuestMemory, code_mutation_epoch) -
+    offsetof(struct AVZGuestMemory, current_write_generation) >= 128,
+    "code epoch must be isolated from write tickets");
+_Static_assert(offsetof(struct AVZGuestMemory, translation_epoch) -
+    offsetof(struct AVZGuestMemory, code_mutation_epoch) >= 128,
+    "code epoch must be isolated from translation writes");
 
 struct AVZNativeMemoryFastPath {
     uint8_t *ram;

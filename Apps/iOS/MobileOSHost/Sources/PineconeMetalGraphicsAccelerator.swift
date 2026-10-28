@@ -47,6 +47,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         var rectangles: [PineconeGraphicsRectangle]
         let surface: PineconeGraphicsSurface
         let packedA8: Bool
+        let buffer: MTLBuffer
     }
 
     private let device: MTLDevice
@@ -59,9 +60,19 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     private let pendingWrites = DispatchGroup()
     private let diagnosticsLock = NSLock()
     private var cachedBuffers: [UInt32: CachedBuffer] = [:]
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+    private var inFlightCopyBuffers = Set<ObjectIdentifier>()
+#endif
     private var completedCommandCount: UInt64 = 0
     private var completedBatchCount: UInt64 = 0
     private var completedPixelCount: UInt64 = 0
+    private var rejectedEligibilityChecks: [String: (checks: UInt64, pixels: UInt64)] = [:]
+    private var preparationNanoseconds: UInt64 = 0
+    private var gpuExecutionNanoseconds: UInt64 = 0
+    private var inputCopyBytes: UInt64 = 0
+    private var outputCopyBytes: UInt64 = 0
+    private var inputCopyNanoseconds: UInt64 = 0
+    private var outputCopyNanoseconds: UInt64 = 0
     private var commandNanoseconds: [UInt64] = []
     private var gpuWaitNanoseconds: [UInt64] = []
     private var initializationNanoseconds: UInt64 = 0
@@ -90,10 +101,16 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     var performanceCounters: [String: Double] {
         diagnosticsLock.lock()
         defer { diagnosticsLock.unlock() }
-        return [
+        var counters: [String: Double] = [
             "completedCommands": Double(completedCommandCount),
             "completedBatches": Double(completedBatchCount),
             "completedPixels": Double(completedPixelCount),
+            "preparationMilliseconds": Self.milliseconds(preparationNanoseconds),
+            "gpuExecutionMilliseconds": Self.milliseconds(gpuExecutionNanoseconds),
+            "inputCopyBytes": Double(inputCopyBytes),
+            "outputCopyBytes": Double(outputCopyBytes),
+            "inputCopyMilliseconds": Self.milliseconds(inputCopyNanoseconds),
+            "outputCopyMilliseconds": Self.milliseconds(outputCopyNanoseconds),
             "commandP95Milliseconds": Self.percentileMilliseconds(commandNanoseconds),
             "synchronousWaitP95Milliseconds": Self.percentileMilliseconds(
                 gpuWaitNanoseconds
@@ -114,6 +131,13 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                 firstGuestCompletionNanoseconds
             ),
         ]
+        // These are eligibility checks, not unique guest operations. No guest
+        // Pixman rejection or instruction-interpreter work reaches this layer.
+        for (reason, cost) in rejectedEligibilityChecks {
+            counters["rejectedEligibility.\(reason).checks"] = Double(cost.checks)
+            counters["rejectedEligibility.\(reason).pixels"] = Double(cost.pixels)
+        }
+        return counters
     }
 
     init?(device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
@@ -192,9 +216,11 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
 
     func acceptsBatch(_ workItems: [PineconeGraphicsWorkItem]) -> Bool {
         guard !workItems.isEmpty,
-              workItems.count <= PineconeGraphicsProtocol.maximumBatchCommandCount,
-              workItems.count == 1 || enabledCapabilities.contains(.orderedBatch) else {
-            return false
+              workItems.count <= PineconeGraphicsProtocol.maximumBatchCommandCount else {
+            return rejectEligibility("invalidBatch", workItems)
+        }
+        guard workItems.count == 1 || enabledCapabilities.contains(.orderedBatch) else {
+            return rejectEligibility("orderedBatchDisabled", workItems)
         }
         var pixels = 0
         var packedFormats: [UInt32: Bool] = [:]
@@ -209,21 +235,46 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             let rectangle = command.destinationRectangle
             let count = rectangle.width.multipliedReportingOverflow(by: rectangle.height)
             guard rectangle.width > 0, rectangle.height > 0, !count.overflow,
-                  pixels <= Int.max - count.partialValue,
-                  enabledOperatorMask & (1 << UInt64(command.blendOperator.rawValue)) != 0,
-                  !command.componentAlphaMask || enabledCapabilities.contains(.componentAlphaMask),
+                  pixels <= Int.max - count.partialValue else {
+                return rejectEligibility("invalidGeometry", workItems)
+            }
+            guard enabledOperatorMask & (1 << UInt64(command.blendOperator.rawValue)) != 0 else {
+                return rejectEligibility("operatorDisabled", workItems)
+            }
+            guard !command.componentAlphaMask || enabledCapabilities.contains(.componentAlphaMask),
                   !command.sourceIsPackedA8 || enabledCapabilities.contains(.packedA8Source),
                   !command.maskIsPackedA8 || enabledCapabilities.contains(.packedA8Mask),
                   !command.destinationIsPackedA8 || enabledCapabilities.contains(.packedA8Destination),
-                  !command.usesBilinearFiltering || enabledCapabilities.contains(.bilinearScaling),
-                  acceptFormat(item.destination, packed: command.destinationIsPackedA8),
+                  !command.usesBilinearFiltering || enabledCapabilities.contains(.bilinearScaling) else {
+                return rejectEligibility("capabilityDisabled", workItems)
+            }
+            guard acceptFormat(item.destination, packed: command.destinationIsPackedA8),
                   acceptFormat(command.sourceIsSolid ? nil : item.source, packed: command.sourceIsPackedA8),
                   acceptFormat(item.mask, packed: command.maskIsPackedA8) else {
-                return false
+                return rejectEligibility("mixedPackedFormats", workItems)
             }
             pixels += count.partialValue
         }
-        return pixels >= minimumMetalPixelCount
+        return pixels >= minimumMetalPixelCount || rejectEligibility("belowThreshold", workItems)
+    }
+
+    private func rejectEligibility(_ reason: String, _ workItems: [PineconeGraphicsWorkItem]) -> Bool {
+        var pixels: UInt64 = 0
+        for item in workItems.prefix(PineconeGraphicsProtocol.maximumBatchCommandCount) {
+            let rect = item.command.destinationRectangle
+            let count = rect.width.multipliedReportingOverflow(by: rect.height)
+            if rect.width > 0, rect.height > 0, !count.overflow {
+                let sum = pixels.addingReportingOverflow(UInt64(count.partialValue))
+                pixels = sum.overflow ? UInt64.max : sum.partialValue
+            }
+        }
+        diagnosticsLock.lock()
+        var cost = rejectedEligibilityChecks[reason] ?? (0, 0)
+        cost.checks &+= 1
+        cost.pixels &+= pixels
+        rejectedEligibilityChecks[reason] = cost
+        diagnosticsLock.unlock()
+        return false
     }
 
     private func executeBatch(
@@ -309,6 +360,9 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
 #if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
         var dirtyDestinations: [UInt32: DirtyDestination] = [:]
         var synchronizedInputs: [UInt32: [PineconeGraphicsRectangle]] = [:]
+        var submissionBuffers: [ObjectIdentifier: MTLBuffer] = [:]
+        var copiedInputBytes: UInt64 = 0
+        var copiedInputNanoseconds: UInt64 = 0
 #endif
 
         encoder.setComputePipelineState(pipeline)
@@ -330,8 +384,12 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             }
 
 #if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+            let copyStarted = DispatchTime.now().uptimeNanoseconds
+            for buffer in [sourceBuffer, maskBuffer, destinationBuffer] {
+                submissionBuffers[ObjectIdentifier(buffer)] = buffer
+            }
             if let source, !command.sourceIsSolid {
-                synchronizeMissing(
+                copiedInputBytes &+= synchronizeMissing(
                     source, to: sourceBuffer,
                     x: command.sourceX, y: command.sourceY,
                     width: command.sourceWidth, height: command.sourceHeight,
@@ -341,7 +399,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             }
             if command.blendOperator != .clear &&
                 command.blendOperator != .source {
-                synchronizeMissing(
+                copiedInputBytes &+= synchronizeMissing(
                     destination, to: destinationBuffer,
                     x: rectangle.x, y: rectangle.y,
                     width: rectangle.width, height: rectangle.height,
@@ -350,7 +408,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                 )
             }
             if let mask {
-                synchronizeMissing(
+                copiedInputBytes &+= synchronizeMissing(
                     mask, to: maskBuffer,
                     x: 0, y: 0,
                     width: rectangle.width, height: rectangle.height,
@@ -358,6 +416,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                     synchronized: &synchronizedInputs
                 )
             }
+            copiedInputNanoseconds &+= DispatchTime.now().uptimeNanoseconds &- copyStarted
 #endif
 
             let hasGPUDependency = gpuWrittenResources.contains(destination.resourceID) ||
@@ -430,12 +489,28 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                 dirtyDestinations[destination.resourceID] = DirtyDestination(
                     rectangles: [rectangle],
                     surface: destination,
-                    packedA8: command.destinationIsPackedA8
+                    packedA8: command.destinationIsPackedA8,
+                    buffer: destinationBuffer
                 )
             }
 #endif
         }
         encoder.endEncoding()
+        diagnosticsLock.lock()
+        preparationNanoseconds &+= DispatchTime.now().uptimeNanoseconds &- commandStarted
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+        inputCopyBytes &+= copiedInputBytes
+        inputCopyNanoseconds &+= copiedInputNanoseconds
+#endif
+        diagnosticsLock.unlock()
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+        let retainedCopyBuffers = Array(submissionBuffers.values)
+        cacheLock.lock()
+        for buffer in retainedCopyBuffers {
+            inFlightCopyBuffers.insert(ObjectIdentifier(buffer))
+        }
+        cacheLock.unlock()
+#endif
         if let completion {
             pendingWrites.enter()
             let commandCount = workItems.count
@@ -448,8 +523,10 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                         dirtyDestinations
                     )
                 }
+                releaseCopyBuffers(retainedCopyBuffers)
 #endif
                 diagnosticsLock.lock()
+                gpuExecutionNanoseconds &+= Self.gpuNanoseconds(completedBuffer)
                 Self.append(completedAt &- commandStarted, to: &commandNanoseconds)
                 completedCommandCount &+= UInt64(commandCount)
                 completedBatchCount &+= 1
@@ -471,6 +548,9 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             commandBuffer.commit()
             return true
         }
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+        defer { releaseCopyBuffers(retainedCopyBuffers) }
+#endif
         if isFirstGuestSubmission {
             recordFirstGuestPreparation(
                 DispatchTime.now().uptimeNanoseconds &- commandStarted
@@ -481,6 +561,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         commandBuffer.waitUntilCompleted()
         let completedAt = DispatchTime.now().uptimeNanoseconds
         diagnosticsLock.lock()
+        gpuExecutionNanoseconds &+= Self.gpuNanoseconds(commandBuffer)
         Self.append(completedAt &- commandStarted, to: &commandNanoseconds)
         Self.append(completedAt &- waitStarted, to: &gpuWaitNanoseconds)
         completedCommandCount &+= UInt64(workItems.count)
@@ -506,15 +587,34 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         cacheLock.unlock()
     }
 
+#if PINECONE_TEST_SIMULATOR_COPY
+    func enqueueTestWait(for event: MTLSharedEvent, value: UInt64) -> Bool {
+        guard let buffer = commandQueue.makeCommandBuffer() else { return false }
+        buffer.encodeWaitForEvent(event, value: value)
+        buffer.commit()
+        return true
+    }
+#endif
+
     func reset() {
         pendingWrites.wait()
         cacheLock.lock()
         cachedBuffers.removeAll(keepingCapacity: true)
+#if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+        inFlightCopyBuffers.removeAll(keepingCapacity: true)
+#endif
         cacheLock.unlock()
         diagnosticsLock.lock()
         completedCommandCount = 0
         completedBatchCount = 0
         completedPixelCount = 0
+        rejectedEligibilityChecks.removeAll(keepingCapacity: true)
+        preparationNanoseconds = 0
+        gpuExecutionNanoseconds = 0
+        inputCopyBytes = 0
+        outputCopyBytes = 0
+        inputCopyNanoseconds = 0
+        outputCopyNanoseconds = 0
         commandNanoseconds.removeAll(keepingCapacity: true)
         gpuWaitNanoseconds.removeAll(keepingCapacity: true)
         diagnosticsLock.unlock()
@@ -553,6 +653,12 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
 
     private static func milliseconds(_ nanoseconds: UInt64) -> Double {
         Double(nanoseconds) / 1_000_000
+    }
+
+    private static func gpuNanoseconds(_ buffer: MTLCommandBuffer) -> UInt64 {
+        let seconds = buffer.gpuEndTime - buffer.gpuStartTime
+        guard seconds.isFinite, seconds > 0, seconds < Double(UInt64.max) / 1_000_000_000 else { return 0 }
+        return UInt64(seconds * 1_000_000_000)
     }
 
     private func claimFirstGuestSubmission() -> Bool {
@@ -693,7 +799,8 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         defer { cacheLock.unlock() }
         if let cached = cachedBuffers[surface.resourceID],
            cached.address == address,
-           cached.allocationByteCount == surface.allocationByteCount {
+           cached.allocationByteCount == surface.allocationByteCount,
+           !inFlightCopyBuffers.contains(ObjectIdentifier(cached.buffer)) {
             return cached.buffer
         }
         guard let buffer = device.makeBuffer(
@@ -735,22 +842,38 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
     }
 
 #if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
+    private func releaseCopyBuffers(_ buffers: [MTLBuffer]) {
+        cacheLock.lock()
+        for buffer in buffers { inFlightCopyBuffers.remove(ObjectIdentifier(buffer)) }
+        cacheLock.unlock()
+    }
+
     /// Simulator Metal buffers cannot alias the package's guest-memory
     /// allocation. Copy only GPU-written rectangles back before completing the
     /// virtio fence; physical devices use bytesNoCopy and skip this path.
     private func synchronizeDestinationsToGuest(
         _ dirtyDestinations: [UInt32: DirtyDestination]
     ) -> Bool {
+        let started = DispatchTime.now().uptimeNanoseconds
+        var copiedBytes: UInt64 = 0
+        defer {
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- started
+            diagnosticsLock.lock()
+            outputCopyBytes &+= copiedBytes
+            outputCopyNanoseconds &+= elapsed
+            diagnosticsLock.unlock()
+        }
         for (resourceID, dirty) in dirtyDestinations {
             let destination = dirty.surface
             guard destination.resourceID == resourceID,
-                  let destinationBuffer = buffer(for: destination),
                   let destinationBytes = destination.bytes.baseAddress else {
                 return false
             }
+            let destinationBuffer = dirty.buffer
             let bytesPerPixel = dirty.packedA8 ? 1 : 4
             for rectangle in dirty.rectangles {
                 let rowBytes = rectangle.width * bytesPerPixel
+                copiedBytes &+= UInt64(rowBytes * rectangle.height)
                 if rectangle.x == 0 && rowBytes == destination.stride {
                     let offset = rectangle.y * destination.stride
                     memcpy(
@@ -783,7 +906,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         height: Int,
         packedA8: Bool,
         synchronized: inout [UInt32: [PineconeGraphicsRectangle]]
-    ) {
+    ) -> UInt64 {
         let requested = PineconeGraphicsRectangle(x: x, y: y, width: width, height: height)
         let existing = synchronized[surface.resourceID] ?? []
         let missing = existing.reduce([requested]) { rectangles, covered in
@@ -803,6 +926,9 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         var updated = existing
         Self.appendDamage(requested, to: &updated)
         synchronized[surface.resourceID] = updated
+        return missing.reduce(UInt64(0)) {
+            $0 + UInt64($1.width * $1.height * (packedA8 ? 1 : 4))
+        }
     }
 
     private static func appendDamage(

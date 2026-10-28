@@ -44,7 +44,7 @@ class StagingTests(unittest.TestCase):
         self.dest = self.work / "rootfs"
         self.selection = self.cache / "selected-graphical-packages-phosh.txt"
         aliases = (
-            "cage evtest foot seatd font-dejavu at-spi2-core dbus dbus-daemon-launch-helper elogind phoc "
+            "cage evtest foot seatd font-dejavu apk-tools alpine-keys busybox busybox-binsh at-spi2-core dbus dbus-daemon-launch-helper elogind phoc "
             "phosh polkit-elogind util-linux-login weston-clients portfolio "
             "gnome-calculator gnome-calendar gnome-clocks gnome-text-editor networkmanager networkmanager-cli"
         )
@@ -64,9 +64,14 @@ class StagingTests(unittest.TestCase):
         ))
         write(self.cache / "community-APKINDEX", (
             "P:netsurf\nV:3.11-r1\nD:so:libexisting.so.1 so:libnew.so.1\n\n"
+            "P:firefox\nV:154.0-r0\nD:so:libexisting.so.1\n\n"
         ))
+        write(self.cache / "browser-APKINDEX", "P:firefox\nV:154.0-r0\nD:so:libexisting.so.1\n\n")
         apk(self.cache, "netsurf", "3.11-r1", files={
             "usr/bin/netsurf-gtk3": ("#!/bin/sh\nexit 0\n", 0o755),
+        })
+        apk(self.cache, "firefox", "154.0-r0", files={
+            "usr/bin/firefox": ("#!/bin/sh\nexit 0\n", 0o755),
         })
         apk(self.cache, "ca-certificates", "1-r0")
         apk(self.cache, "ca-certificates-bundle", "1-r0", files={
@@ -94,6 +99,10 @@ class StagingTests(unittest.TestCase):
         selected = self.selection.read_text()
         self.assertTrue(selected.startswith(self.pin))
         self.assertIn("community|netsurf|3.11-r1\n", selected)
+        self.assertIn("browser|firefox|154.0-r0\n", selected)
+        self.assertTrue(os.access(self.dest / "usr/local/bin/pinecone-launch-firefox", os.X_OK))
+        self.assertIn("pinecone-launch-firefox %u",
+                      (self.dest / "usr/share/applications/firefox.desktop").read_text())
         self.assertIn("main|new-lib|1-r0\n", selected)
         self.assertNotIn("|2-r0", selected)
         self.assertTrue(os.access(self.dest / "usr/local/bin/pinecone-launch-browser", os.X_OK))
@@ -243,6 +252,103 @@ class LauncherTests(unittest.TestCase):
         result = self.run_launcher("--ca_bundle=/tmp/untrusted")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.capture.exists())
+
+
+class FirefoxLauncherTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="firefox-launcher-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        self.home = self.work / "home"
+        self.home.mkdir()
+        self.namespace = self.work / "userns"
+        self.status = self.work / "status"
+        self.ca = self.work / "ca.crt"
+        write(self.namespace, "namespace")
+        write(self.status, "Seccomp:\t0\n")
+        write(self.ca, "test CA")
+        self.capture = self.work / "args"
+        write(self.work / "bin/firefox", '#!/bin/sh\nprintf "%s\\n" "$MOZ_ENABLE_WAYLAND" "$GDK_BACKEND" "$GTK_IM_MODULE" "$@" > "$TEST_CAPTURE"\n', 0o755)
+        source = (ASSETS / "pinecone-launch-firefox").read_text()
+        for old, new in {
+            "/proc/self/ns/user": self.namespace,
+            "/proc/self/status": self.status,
+            "/etc/ssl/certs/ca-certificates.crt": self.ca,
+            "/usr/share/pinecone/browser/firefox-user.js": ASSETS / "pinecone-firefox-user.js",
+        }.items():
+            source = source.replace(old, str(new))
+        self.launcher = self.work / "launcher"
+        write(self.launcher, source, 0o755)
+        self.env = {**os.environ, "HOME": str(self.home), "WAYLAND_DISPLAY": "wayland-0",
+                    "XDG_RUNTIME_DIR": str(self.work), "TEST_CAPTURE": str(self.capture),
+                    "PATH": str(self.work / "bin") + os.pathsep + os.environ["PATH"]}
+        self.env.pop("WAYLAND_SOCKET", None)
+
+    def run_launcher(self, *args):
+        return subprocess.run(["sh", str(self.launcher), *args], env=self.env,
+                              capture_output=True, text=True)
+
+    def test_wayland_profile_and_url(self):
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.capture.read_text().splitlines(),
+                         ["1", "wayland", "wayland", "--profile",
+                          str(self.home / ".mozilla/pinecone"), "https://example.com/"])
+        prefs = self.home / ".mozilla/pinecone/user.js"
+        prefs.write_text('// User settings\n')
+        self.assertEqual(self.run_launcher("https://example.com/a b").returncode, 0)
+        self.assertEqual(prefs.read_text(), '// User settings\n')
+        self.assertEqual(self.capture.read_text().splitlines()[-1], "https://example.com/a b")
+
+    def test_missing_kernel_support_fails_closed(self):
+        self.namespace.unlink()
+        self.assertNotEqual(self.run_launcher().returncode, 0)
+        write(self.namespace, "namespace")
+        self.status.write_text("Name:\tsh\n")
+        self.assertNotEqual(self.run_launcher().returncode, 0)
+        self.assertFalse(self.capture.exists())
+
+    def test_no_option_injection(self):
+        self.assertNotEqual(self.run_launcher("--no-sandbox").returncode, 0)
+        self.assertFalse(self.capture.exists())
+
+
+class RootHomeOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        def tool(name):
+            candidate = shutil.which(name) or f"/opt/homebrew/opt/e2fsprogs/sbin/{name}"
+            if not os.access(candidate, os.X_OK):
+                self.skipTest("optional e2fsprogs tools are absent")
+            return candidate
+        self.mkfs = tool("mke2fs")
+        self.debugfs = tool("debugfs")
+        self.fsck = tool("e2fsck")
+        self.temp = tempfile.TemporaryDirectory(prefix="firefox-root-owner-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+
+    def test_corrects_host_uid_and_preserves_home_contents(self):
+        staging = self.work / "staging"
+        write(staging / "root/keep", "existing user data\n")
+        image = self.work / "root.ext4"
+        with image.open("wb") as stream:
+            stream.truncate(32 * 1024 * 1024)
+        subprocess.run([self.mkfs, "-q", "-t", "ext4", "-d", str(staging), str(image)], check=True)
+        for field, value in (("uid", "501"), ("gid", "20")):
+            subprocess.run([self.debugfs, "-w", "-R", f"set_inode_field /root {field} {value}", str(image)], check=True, capture_output=True)
+        result = subprocess.run(["bash", str(ROOT / "scripts/fix-rootfs-home-owner.sh"), str(image)],
+                                env={**os.environ, "DEBUGFS": self.debugfs}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        contents = subprocess.check_output([self.debugfs, "-R", "cat /root/keep", str(image)], text=True)
+        self.assertEqual(contents, "existing user data\n")
+        subprocess.run([self.fsck, "-fn", str(image)], check=True, capture_output=True)
+
+    def test_rejects_non_filesystem(self):
+        image = self.work / "invalid.ext4"
+        image.write_bytes(b"not ext4")
+        result = subprocess.run(["bash", str(ROOT / "scripts/fix-rootfs-home-owner.sh"), str(image)],
+                                env={**os.environ, "DEBUGFS": self.debugfs}, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
 
 
 class RealCacheAuditTests(unittest.TestCase):

@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+fail() { echo "pinecone-firefox: $*" >&2; exit 1; }
+command -v firefox >/dev/null 2>&1 || fail 'Firefox is not installed'
+[ -n "${WAYLAND_DISPLAY:-}${WAYLAND_SOCKET:-}" ] || fail 'launch from the Phosh Wayland session'
+[ -n "${XDG_RUNTIME_DIR:-}" ] || fail 'XDG_RUNTIME_DIR is missing'
+[ -e /proc/self/ns/user ] || fail 'guest kernel needs user namespaces; rebuild the bundled kernel'
+grep -q '^Seccomp:' /proc/self/status || fail 'guest kernel needs seccomp; rebuild the bundled kernel'
+[ -s /etc/ssl/certs/ca-certificates.crt ] || fail 'CA certificate bundle is missing'
+
+for url do
+  case "$url" in
+    http://*|https://*|file://*|about:*) ;;
+    *) fail "expected an HTTP(S), file, or about URL: $url" ;;
+  esac
+done
+[ "$#" -gt 0 ] || set -- https://example.com/
+
+umask 077
+profile="${HOME:?HOME is required}/.mozilla/pinecone"
+mkdir -p "$profile"
+# Seed once, preserving later user preferences. Never turn off sandboxing or
+# site isolation to reduce resource usage.
+if [ ! -e "$profile/user.js" ]; then
+  cp /usr/share/pinecone/browser/firefox-user.js "$profile/user.js"
+fi
+export MOZ_ENABLE_WAYLAND=1
+export GDK_BACKEND=wayland
+export GTK_IM_MODULE=wayland
+exec firefox --profile "$profile" "$@"

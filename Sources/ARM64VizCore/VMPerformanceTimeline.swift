@@ -55,6 +55,10 @@ public struct VMPerformanceTimelineSnapshot: Codable, Equatable, Sendable {
     public let framePipeline: VMFramePipelineSnapshot
     public var interactions: [VMInteractionSample] = []
     public var guestGraphics: [GuestGraphicsTraceEvent] = []
+    public var inputAttribution: [VMInputAttributionSample] = []
+    public var guestFrameStages: [GuestFrameStageSample] = []
+    public var attributionCounts: [String: UInt64] = [:]
+    public var inputFrameCorrelation: String = "unavailable: no shared input/frame identity"
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -67,6 +71,11 @@ public struct VMPerformanceTimelineSnapshot: Codable, Equatable, Sendable {
         framePipeline = try values.decode(VMFramePipelineSnapshot.self, forKey: .framePipeline)
         interactions = try values.decodeIfPresent([VMInteractionSample].self, forKey: .interactions) ?? []
         guestGraphics = try values.decodeIfPresent([GuestGraphicsTraceEvent].self, forKey: .guestGraphics) ?? []
+        inputAttribution = try values.decodeIfPresent([VMInputAttributionSample].self, forKey: .inputAttribution) ?? []
+        guestFrameStages = try values.decodeIfPresent([GuestFrameStageSample].self, forKey: .guestFrameStages) ?? []
+        attributionCounts = try values.decodeIfPresent([String: UInt64].self, forKey: .attributionCounts) ?? [:]
+        inputFrameCorrelation = try values.decodeIfPresent(String.self, forKey: .inputFrameCorrelation)
+            ?? "unknown: historical report"
     }
 
     public init(
@@ -84,6 +93,15 @@ public struct VMPerformanceTimelineSnapshot: Codable, Equatable, Sendable {
         self.touchSampleCount = touchSampleCount
         self.framePipeline = framePipeline
     }
+}
+
+public struct VMInputAttributionSample: Codable, Equatable, Sendable {
+    public let identity: TouchTraceIdentity
+    public let phase: TouchPhase?
+    public let captureNanoseconds: UInt64?
+    public let queuedNanoseconds: UInt64
+    public var injectedNanoseconds: UInt64?
+    public var disposition: String
 }
 
 public final class VMPerformanceTimeline: @unchecked Sendable {
@@ -110,14 +128,95 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
     private var interactions: [VMInteractionSample] = []
     private var guestGraphics: [GuestGraphicsTraceEvent] = []
     private var pendingInteractions: [UInt64: (queued: UInt64, delivered: UInt64)] = [:]
+    private let attributionEnabled: Bool
+    private var inputEpoch: UInt64 = 1
+    private var inputSequence: UInt64 = 0
+    private var inputAttribution: [VMInputAttributionSample] = []
+    private var attributionCounts: [String: UInt64] = [:]
+    // Independent of scheduling boost deadlines. Expiry is not success/failure.
+    private static let attributionLifetimeNanoseconds: UInt64 = 10_000_000_000
+
+    public func beginInputTrace(_ event: TimestampedTouchEvent, queuedAt: UInt64) -> TouchTraceIdentity? {
+        guard attributionEnabled else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        expireInputs(at: queuedAt)
+        if inputSequence == UInt64.max { resetInputTraceLocked(reason: "sequenceWrap") }
+        inputSequence += 1
+        let identity = TouchTraceIdentity(epoch: inputEpoch, sequence: inputSequence)
+        if inputAttribution.count == Self.maximumTouchSamples {
+            let removed = inputAttribution.removeFirst()
+            if Self.isPending(removed) { attributionCounts["capacityEvicted", default: 0] &+= 1 }
+        }
+        inputAttribution.append(.init(identity: identity, phase: event.phase,
+            captureNanoseconds: event.timestampNanoseconds, queuedNanoseconds: queuedAt,
+            disposition: "queued"))
+        attributionCounts["queued", default: 0] &+= 1
+        return identity
+    }
+
+    public func recordInputDisposition(_ identity: TouchTraceIdentity?, reason: String,
+                                       atNanoseconds timestamp: UInt64) {
+        guard attributionEnabled, let identity else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        expireInputs(at: timestamp)
+        guard identity.epoch == inputEpoch,
+              let index = inputAttribution.firstIndex(where: { $0.identity == identity }),
+              Self.isPending(inputAttribution[index]),
+              timestamp >= inputAttribution[index].queuedNanoseconds,
+              ["injectedUncorrelated", "coalesced", "droppedMotion", "rejected"].contains(reason)
+        else { return }
+        if inputAttribution[index].disposition == reason { return }
+        inputAttribution[index].disposition = reason
+        if reason == "injectedUncorrelated" { inputAttribution[index].injectedNanoseconds = timestamp }
+        attributionCounts[reason, default: 0] &+= 1
+    }
+
+    public func resetInputTrace() {
+        lock.lock()
+        resetInputTraceLocked(reason: "reset")
+        publishedFrames.removeAll()
+        pendingInteractions.removeAll()
+        interactionStartedNanoseconds = nil
+        lastPresentationNanoseconds = nil
+        guestGraphics.removeAll()
+        lock.unlock()
+    }
+
+    private func resetInputTraceLocked(reason: String) {
+        for index in inputAttribution.indices where Self.isPending(inputAttribution[index]) {
+            inputAttribution[index].disposition = reason
+            attributionCounts[reason, default: 0] &+= 1
+        }
+        inputEpoch &+= 1
+        if inputEpoch == 0 { inputEpoch = 1 }
+        inputSequence = 0
+    }
+
+    private static func isPending(_ input: VMInputAttributionSample) -> Bool {
+        input.disposition == "queued" || input.disposition == "injectedUncorrelated"
+    }
+
+    private func expireInputs(at now: UInt64) {
+        for index in inputAttribution.indices where Self.isPending(inputAttribution[index]) {
+            let queued = inputAttribution[index].queuedNanoseconds
+            if now >= queued, now - queued > Self.attributionLifetimeNanoseconds {
+                inputAttribution[index].disposition = "expiredUncorrelated"
+                attributionCounts["expiredUncorrelated", default: 0] &+= 1
+            }
+        }
+    }
 
     public func recordGuestGraphics(_ event: GuestGraphicsTraceEvent) {
+        guard attributionEnabled else { return }
         lock.lock()
         if guestGraphics.count == Self.maximumTouchSamples { guestGraphics.removeFirst() }
         guestGraphics.append(event)
         lock.unlock()
     }
 
+    /// Compatibility-only temporal diagnostic. Never establishes input causality.
     public func recordTouchFrame(generation: UInt64, queued: UInt64, delivered: UInt64) {
         guard delivered >= queued else { return }
         lock.lock()
@@ -129,11 +228,13 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
 
     public init(
         startNanoseconds: UInt64? = nil,
+        attributionEnabled: Bool = false,
         clock: @escaping @Sendable () -> UInt64 = {
             DispatchTime.now().uptimeNanoseconds
         }
     ) {
         self.clock = clock
+        self.attributionEnabled = attributionEnabled
         self.startNanoseconds = startNanoseconds ?? clock()
         milestones[.guestExecutionStarted] = self.startNanoseconds
     }
@@ -204,7 +305,8 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
         if let frame = publishedFrames.removeValue(forKey: generation) {
             if let input = pendingInteractions.removeValue(forKey: generation),
                frame.commit >= input.delivered, frame.publish >= frame.commit,
-               presentedAtNanoseconds >= frame.publish {
+               presentedAtNanoseconds >= frame.publish,
+               presentedAtNanoseconds - input.queued <= Self.attributionLifetimeNanoseconds {
                 if interactions.count == Self.maximumTouchSamples { interactions.removeFirst() }
                 interactions.append(VMInteractionSample(
                     generation: generation,
@@ -212,10 +314,14 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
                     deviceToCommitMilliseconds: Double(frame.commit - input.delivered) / 1e6,
                     commitToPublishMilliseconds: Double(frame.publish - frame.commit) / 1e6,
                     publishToPresentMilliseconds: Double(presentedAtNanoseconds - frame.publish) / 1e6,
-                    totalMilliseconds: Double(presentedAtNanoseconds - input.queued) / 1e6))
+                    totalMilliseconds: Double(presentedAtNanoseconds - input.queued) / 1e6,
+                    attribution: "temporalOnly"))
                 recordedInteraction = true
             }
-            presentsInteraction = interactionStartedNanoseconds.map { frame.commit >= $0 } ?? false
+            presentsInteraction = interactionStartedNanoseconds.map {
+                frame.commit >= $0 && presentedAtNanoseconds >= $0 &&
+                presentedAtNanoseconds - $0 <= Self.attributionLifetimeNanoseconds
+            } ?? false
             if presentedAtNanoseconds >= frame.publish {
                 Self.append(
                     presentedAtNanoseconds - frame.publish,
@@ -251,11 +357,14 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
 
     public func snapshot() -> VMPerformanceTimelineSnapshot {
         lock.lock()
+        expireInputs(at: clock())
         let milestoneCopy = milestones
         let executionCopy = executionAtMilestones
         let touchCopy = touchLatencyNanoseconds
         let interactionCopy = interactions
         let guestCopy = guestGraphics
+        let inputCopy = inputAttribution
+        let attributionCountsCopy = attributionCounts
         let framePipeline = VMFramePipelineSnapshot(
             frameSampleCount: commitToPresentNanoseconds.count,
             commitToPublishP50Milliseconds: Self.percentile(commitToPublishNanoseconds, fraction: 0.50),
@@ -285,6 +394,9 @@ public final class VMPerformanceTimeline: @unchecked Sendable {
         )
         result.interactions = interactionCopy
         result.guestGraphics = guestCopy
+        result.inputAttribution = inputCopy
+        result.attributionCounts = attributionCountsCopy
+        result.guestFrameStages = GuestFrameStageSample.samples(from: guestCopy)
         return result
     }
 

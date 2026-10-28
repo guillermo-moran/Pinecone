@@ -1,4 +1,9 @@
 import ARM64VizNative
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Dispatch
 import XCTest
 
@@ -3371,6 +3376,153 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         XCTAssertEqual(statistics.code_page_generation_bumps, 3)
     }
 
+    func testGenericCachedChainDoesNotDereferenceOpaqueMemoryContext() throws {
+        try assertGenericChainPreservesOpaqueMemoryContext(checkpointed: false)
+    }
+
+    func testGenericCheckpointedChainDoesNotDereferenceOpaqueMemoryContext() throws {
+        try assertGenericChainPreservesOpaqueMemoryContext(checkpointed: true)
+    }
+
+    private func assertGenericChainPreservesOpaqueMemoryContext(checkpointed: Bool) throws {
+        // Cover even distant native-context fields without committing readable memory.
+        let guardSize = 16 * 1024 * 1024
+        let opaqueContext = try XCTUnwrap(mmap(
+            nil, guardSize, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0
+        ))
+        XCTAssertNotEqual(opaqueContext, MAP_FAILED)
+        guard opaqueContext != MAP_FAILED else { return }
+        defer { XCTAssertEqual(munmap(opaqueContext, guardSize), 0) }
+
+        let fetch = NativeBlockFetchContext(words: [
+            0xd503_201f, // nop
+            0x1400_03ff  // b 0x9000
+        ])
+        fetch.words[0x9000] = 0xd503_201f // nop
+        fetch.words[0x9004] = 0x17ff_fbff // b 0x8000
+        let cache = try XCTUnwrap(avz_native_block_cache_create())
+        defer { avz_native_block_cache_destroy(cache) }
+        let execution = try XCTUnwrap(avz_native_execution_context_create())
+        defer { avz_native_execution_context_destroy(execution) }
+        var key = AVZNativeBlockKey(
+            pc: 0, sctlr_el1: 0, tcr_el1: 0,
+            ttbr0_el1: 0, ttbr1_el1: 0, current_el: 1
+        )
+        for _ in 0..<3 {
+            let registers = [UInt64](repeating: 0, count: 31)
+            registers.withUnsafeBufferPointer {
+                avz_native_execution_context_load(
+                    execution, $0.baseAddress, nil, nil,
+                    0x2000, 0x8000, 0x5, 0, 0, 0, 0, 0, 0
+                )
+            }
+            let checkpoint = NativeChainCheckpointContext(stepLimit: 16)
+            let result: AVZNativeChainResult
+            if checkpointed {
+                result = avz_native_execution_context_run_cached_chain_checkpointed(
+                    execution, cache, &key, 16, 16, 16, 16,
+                    nativeChainCheckpoint, Unmanaged.passUnretained(checkpoint).toOpaque(),
+                    nativeBlockFetch, Unmanaged.passUnretained(fetch).toOpaque(),
+                    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, opaqueContext
+                )
+                XCTAssertEqual(checkpoint.calls.reduce(0) { $0 + $1.steps }, 16)
+            } else {
+                result = avz_native_execution_context_run_cached_chain(
+                    execution, cache, &key, 16, 16,
+                    nativeBlockFetch, Unmanaged.passUnretained(fetch).toOpaque(),
+                    nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, opaqueContext
+                )
+            }
+            XCTAssertEqual(result.steps, 16)
+            XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_MAX_STEPS))
+            XCTAssertEqual(avz_native_execution_context_pc(execution), 0x8000)
+        }
+    }
+
+    func testCheckpointedFastMemoryChainPreservesTimerAndIRQAccounting() throws {
+        try assertNativeChainPreservesTimerAndIRQAccounting(checkpointed: true)
+    }
+
+    func testCachedChainWithNativeCallbacksPreservesTimerAndIRQAccounting() throws {
+        try assertNativeChainPreservesTimerAndIRQAccounting(checkpointed: false)
+    }
+
+    private func assertNativeChainPreservesTimerAndIRQAccounting(checkpointed: Bool) throws {
+        let memory = NativeTestMemory()
+        let fetch = NativeBlockFetchContext(words: [
+            0xd503_201f, // nop
+            0x1400_03ff  // b 0x9000
+        ])
+        fetch.words[0x9000] = 0xd503_201f // nop
+        fetch.words[0x9004] = 0x17ff_fbff // b 0x8000
+        let cache = try XCTUnwrap(avz_native_block_cache_create())
+        defer { avz_native_block_cache_destroy(cache) }
+        let execution = try XCTUnwrap(avz_native_execution_context_create())
+        defer { avz_native_execution_context_destroy(execution) }
+        var key = AVZNativeBlockKey(
+            pc: 0, sctlr_el1: 0, tcr_el1: 0,
+            ttbr0_el1: 0, ttbr1_el1: 0, current_el: 1
+        )
+        var ram = [UInt8](repeating: 0, count: 0x1000)
+        try ram.withUnsafeMutableBufferPointer { buffer in
+            let fastPath = try XCTUnwrap(avz_native_memory_fast_path_create(
+                buffer.baseAddress, 0, UInt64(buffer.count), nil,
+                Unmanaged.passUnretained(memory).toOpaque(), nativeIdentityTranslateRAM,
+                nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
+            ))
+            defer { avz_native_memory_fast_path_destroy(fastPath) }
+            // Physical timer, virtual timer, pending IRQ, masked IRQ, then no IRQ.
+            for scenario in 0..<5 {
+                var state = AVZNativeArchitecturalState()
+                state.counter_ticks = 100
+                state.timer_cycles_per_instruction = 2
+                state.cntp_ctl_el0 = scenario == 0 ? 1 : 0
+                state.cntp_cval_el0 = 104
+                state.cntv_ctl_el0 = scenario == 1 ? 1 : 0
+                state.cntv_cval_el0 = 104
+                state.pending_irq = scenario == 2 || scenario == 3 ? 1 : 0
+                avz_native_memory_fast_path_set_architectural_state(fastPath, &state)
+                let registers = [UInt64](repeating: 0, count: 31)
+                registers.withUnsafeBufferPointer {
+                    avz_native_execution_context_load(
+                        execution, $0.baseAddress, nil, nil,
+                        0x2000, 0x8000, scenario == 3 ? 0x85 : 0x5,
+                        0, 0, 0, 0, 0, 0
+                    )
+                }
+                let checkpoint = NativeChainCheckpointContext(stepLimit: 8)
+                let result: AVZNativeChainResult
+                if checkpointed {
+                    result = avz_native_execution_context_run_cached_chain_checkpointed_fast_memory(
+                        execution, cache, &key, 8, 8, 8, 1,
+                        nativeChainCheckpoint, Unmanaged.passUnretained(checkpoint).toOpaque(),
+                        nativeBlockFetch, Unmanaged.passUnretained(fetch).toOpaque(),
+                        avz_native_fast_memory_read, avz_native_fast_memory_write,
+                        avz_native_fast_memory_can_access, avz_native_fast_memory_fill,
+                        nil, nil, nil, nil, nil, nil, UnsafeMutableRawPointer(fastPath)
+                    )
+                    XCTAssertEqual(checkpoint.calls.reduce(0) { $0 + $1.steps }, result.steps)
+                } else {
+                    result = avz_native_execution_context_run_cached_chain(
+                        execution, cache, &key, 8, 8,
+                        nativeBlockFetch, Unmanaged.passUnretained(fetch).toOpaque(),
+                        avz_native_fast_memory_read, avz_native_fast_memory_write,
+                        avz_native_fast_memory_can_access, avz_native_fast_memory_fill,
+                        nil, nil, nil, nil, nil, nil, UnsafeMutableRawPointer(fastPath)
+                    )
+                }
+                let shouldYield = scenario < 3
+                XCTAssertEqual(result.status, UInt32(
+                    shouldYield ? AVZ_NATIVE_STATUS_YIELDED : AVZ_NATIVE_STATUS_MAX_STEPS
+                ), "scenario \(scenario)")
+                XCTAssertEqual(result.steps, shouldYield ? 2 : 8, "scenario \(scenario)")
+                XCTAssertEqual(avz_native_execution_context_pc(execution), shouldYield ? 0x9000 : 0x8000)
+                avz_native_memory_fast_path_get_architectural_state(fastPath, &state)
+                XCTAssertEqual(state.counter_ticks, 100 + result.steps * 2, "scenario \(scenario)")
+            }
+        }
+    }
+
     func testNativeExecutionContextChainsCachedBlocksWithoutStateCopies() throws {
         let fetch = NativeBlockFetchContext(words: [
             0x9100_0400, // add x0, x0, #1
@@ -3739,42 +3891,142 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
             ttbr0_el1: 0, ttbr1_el1: 0, current_el: 1
         )
 
-        func loadAndRun() -> AVZNativeChainResult {
-            let checkpoint = NativeChainCheckpointContext(stepLimit: 512)
-            var registers = [UInt64](repeating: 0, count: 31)
-            registers[0] = 0x10_000
-            registers[1] = 0x1122_3344_5566_7788
-            registers[2] = 64
-            registers.withUnsafeBufferPointer {
-                avz_native_execution_context_load(
-                    execution, $0.baseAddress, nil, nil,
-                    0x20_000, 0x7ff8, 0x5, 0, 0, 0, 0, 0, 0
+        var ram = [UInt8](repeating: 0, count: 0x20_000)
+        try ram.withUnsafeMutableBufferPointer { ramBuffer in
+            let fastPath = try XCTUnwrap(avz_native_memory_fast_path_create(
+                ramBuffer.baseAddress, 0, UInt64(ramBuffer.count), nil,
+                Unmanaged.passUnretained(memory).toOpaque(), nativeIdentityTranslateRAM,
+                nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
+            ))
+            defer { avz_native_memory_fast_path_destroy(fastPath) }
+            for run in 0..<3 {
+                for offset in 0..<64 {
+                    ramBuffer[0x10_000 - 64 + offset] = 0xa5
+                    ramBuffer[0x10_400 + offset] = 0x5a
+                }
+                for offset in 0..<1_024 { ramBuffer[0x10_000 + offset] = 0 }
+                let checkpoint = NativeChainCheckpointContext(stepLimit: 512)
+                var registers = [UInt64](repeating: 0, count: 31)
+                registers[0] = 0x10_000
+                registers[1] = 0x1122_3344_5566_7788
+                registers[2] = 64
+                registers.withUnsafeBufferPointer {
+                    avz_native_execution_context_load(
+                        execution, $0.baseAddress, nil, nil,
+                        0x20_000, 0x7ff8, 0x5, 0, 0, 0, 0, 0, 0
+                    )
+                }
+                let result = avz_native_execution_context_run_cached_chain_checkpointed(
+                    execution, cache, &key, 512, 512, 16, 16,
+                    nativeChainCheckpoint,
+                    Unmanaged.passUnretained(checkpoint).toOpaque(),
+                    nativeBlockFetch,
+                    Unmanaged.passUnretained(fetch).toOpaque(),
+                    avz_native_fast_memory_read, avz_native_fast_memory_write,
+                    avz_native_fast_memory_can_access, avz_native_fast_memory_fill,
+                    nil, nil, nil, nil, nil, nil,
+                    UnsafeMutableRawPointer(fastPath)
                 )
+
+                if run > 0 { XCTAssertGreaterThan(result.superblock_dispatches, 0) }
+                XCTAssertEqual(result.fast_path_hits, 1)
+                XCTAssertEqual(result.fast_path_steps, 192)
+                XCTAssertEqual(avz_native_execution_context_pc(execution), 0x800c)
+                let changedLeadingBytes = (0..<64).filter { ramBuffer[0xffc0 + $0] != 0xa5 }
+                let changedTrailingBytes = (0..<64).filter { ramBuffer[0x10_400 + $0] != 0x5a }
+                XCTAssertEqual(changedLeadingBytes, [], "run \(run): writes before store-pair fill destination")
+                XCTAssertEqual(changedTrailingBytes, [], "run \(run): writes beyond store-pair fill destination")
+                let pattern: [UInt8] = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
+                for offset in 0..<1_024 {
+                    XCTAssertEqual(ramBuffer[0x10_000 + offset], pattern[offset % pattern.count])
+                }
             }
-            return avz_native_execution_context_run_cached_chain_checkpointed(
-                execution, cache, &key, 512, 512, 16, 16,
-                nativeChainCheckpoint,
-                Unmanaged.passUnretained(checkpoint).toOpaque(),
-                nativeBlockFetch,
-                Unmanaged.passUnretained(fetch).toOpaque(),
-                nil, nil, nil, nativeTestMemoryFill,
-                nil, nil, nil, nil, nil, nil,
-                Unmanaged.passUnretained(memory).toOpaque()
-            )
         }
+    }
 
-        _ = loadAndRun()
-        let mapped = loadAndRun()
+    func testMappedSuperblockKernelMemsetPreservesCanariesAfterInternalFillExit() throws {
+        let fetch = NativeBlockFetchContext(words: [], virtualBase: 0x7ff8)
+        fetch.words[0x7ff8] = 0x1400_0002 // b 0x8000: fill is not the trace entry
+        // Linux __pi_memset_generic's aligned, nonzero 64-byte fill loop.
+        let loopWords: [UInt32] = [
+            0xa901_1d07, // stp x7, x7, [x8, #16]
+            0xa902_1d07, // stp x7, x7, [x8, #32]
+            0xa903_1d07, // stp x7, x7, [x8, #48]
+            0xa984_1d07, // stp x7, x7, [x8, #64]!
+            0xf101_0042, // subs x2, x2, #64
+            0x54ff_ff6a  // b.ge 0x8000
+        ]
+        for (index, word) in loopWords.enumerated() {
+            fetch.words[0x8000 + UInt64(index * 4)] = word
+        }
+        fetch.words[0x8018] = 0xd440_0000 // hlt #0
+        let cache = try XCTUnwrap(avz_native_block_cache_create())
+        defer { avz_native_block_cache_destroy(cache) }
+        let execution = try XCTUnwrap(avz_native_execution_context_create())
+        defer { avz_native_execution_context_destroy(execution) }
+        let memory = NativeTestMemory()
+        let destination: UInt64 = 0x10_000
+        let byteCount: UInt64 = 4096
+        var key = AVZNativeBlockKey(
+            pc: 0, sctlr_el1: 1, tcr_el1: 0,
+            ttbr0_el1: 0, ttbr1_el1: 0, current_el: 1
+        )
 
-        XCTAssertGreaterThan(mapped.superblock_dispatches, 0)
-        XCTAssertEqual(mapped.fast_path_hits, 1)
-        XCTAssertEqual(mapped.fast_path_steps, 192)
-        XCTAssertEqual(avz_native_execution_context_pc(execution), 0x800c)
-        for offset in stride(from: UInt64(0), to: 1_024, by: 8) {
-            XCTAssertEqual(
-                memory.read(at: 0x10_000 + offset, width: 8),
-                0x1122_3344_5566_7788
-            )
+        var ram = [UInt8](repeating: 0, count: 0x20_000)
+        try ram.withUnsafeMutableBufferPointer { ramBuffer in
+            let fastPath = try XCTUnwrap(avz_native_memory_fast_path_create(
+                ramBuffer.baseAddress, 0, UInt64(ramBuffer.count), nil,
+                Unmanaged.passUnretained(memory).toOpaque(), nativeIdentityTranslateRAM,
+                nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
+            ))
+            defer { avz_native_memory_fast_path_destroy(fastPath) }
+            // Reuse the execution context/cache to exercise the trained mapped trace.
+            for run in 0..<3 {
+                for offset in 0..<128 {
+                    ramBuffer[Int(destination) - 128 + offset] = 0xa5
+                    ramBuffer[Int(destination + byteCount) + offset] = 0x5a
+                }
+                for offset in 0..<Int(byteCount) {
+                    ramBuffer[Int(destination) + offset] = 0
+                }
+                let checkpoint = NativeChainCheckpointContext(stepLimit: 512)
+                var registers = [UInt64](repeating: 0, count: 31)
+                registers[2] = byteCount - 64
+                registers[7] = UInt64.max
+                registers[8] = destination - 16
+                registers.withUnsafeBufferPointer {
+                    avz_native_execution_context_load(
+                        execution, $0.baseAddress, nil, nil,
+                        0x20_000, 0x7ff8, 0x5, 0, 0, 0, 0, 0, 0
+                    )
+                }
+                let result = avz_native_execution_context_run_cached_chain_checkpointed(
+                    execution, cache, &key, 512, 512, 16, 16,
+                    nativeChainCheckpoint,
+                    Unmanaged.passUnretained(checkpoint).toOpaque(),
+                    nativeBlockFetch,
+                    Unmanaged.passUnretained(fetch).toOpaque(),
+                    avz_native_fast_memory_read, avz_native_fast_memory_write,
+                    avz_native_fast_memory_can_access, avz_native_fast_memory_fill,
+                    nil, nil, nil, nil, nil, nil,
+                    UnsafeMutableRawPointer(fastPath)
+                )
+
+                if run > 0 { XCTAssertGreaterThan(result.superblock_dispatches, 0) }
+                XCTAssertEqual(result.fast_path_hits, 1)
+                XCTAssertEqual(result.fast_path_steps, 384)
+                XCTAssertEqual(avz_native_execution_context_pc(execution), 0x8018)
+                XCTAssertTrue(ramBuffer[Int(destination)..<Int(destination + byteCount)]
+                    .allSatisfy { $0 == 0xff })
+                let changedLeadingBytes = (0..<128).filter {
+                    ramBuffer[Int(destination) - 128 + $0] != 0xa5
+                }
+                let changedTrailingBytes = (0..<128).filter {
+                    ramBuffer[Int(destination + byteCount) + $0] != 0x5a
+                }
+                XCTAssertEqual(changedLeadingBytes, [], "run \(run): writes before memset destination")
+                XCTAssertEqual(changedTrailingBytes, [], "run \(run): writes beyond memset destination")
+            }
         }
     }
 
@@ -3795,53 +4047,69 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
             ttbr0_el1: 0, ttbr1_el1: 0, current_el: 1
         )
 
-        func loadAndRun() -> AVZNativeChainResult {
-            let checkpoint = NativeChainCheckpointContext(stepLimit: 512)
-            var registers = [UInt64](repeating: 0, count: 31)
-            var vectorLows = [UInt64](repeating: 0, count: 32)
-            let vectorHighs = [UInt64](repeating: 0, count: 32)
-            registers[2] = 0x20_000
-            registers[3] = 64
-            for vector in 0..<4 {
-                vectorLows[vector] = 0xaabb_ccdd_aabb_ccdd
-            }
-            registers.withUnsafeBufferPointer { registerBuffer in
-                vectorLows.withUnsafeBufferPointer { lowBuffer in
-                    vectorHighs.withUnsafeBufferPointer { highBuffer in
-                        avz_native_execution_context_load(
-                            execution,
-                            registerBuffer.baseAddress,
-                            lowBuffer.baseAddress,
-                            highBuffer.baseAddress,
-                            0x30_000, 0x8ff8, 0x5, 0, 0, 0, 0, 0, 0
-                        )
+        var ram = [UInt8](repeating: 0, count: 0x30_000)
+        try ram.withUnsafeMutableBufferPointer { ramBuffer in
+            let fastPath = try XCTUnwrap(avz_native_memory_fast_path_create(
+                ramBuffer.baseAddress, 0, UInt64(ramBuffer.count), nil,
+                Unmanaged.passUnretained(memory).toOpaque(), nativeIdentityTranslateRAM,
+                nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
+            ))
+            defer { avz_native_memory_fast_path_destroy(fastPath) }
+            func loadAndRun() -> AVZNativeChainResult {
+                let checkpoint = NativeChainCheckpointContext(stepLimit: 512)
+                var registers = [UInt64](repeating: 0, count: 31)
+                var vectorLows = [UInt64](repeating: 0, count: 32)
+                let vectorHighs = [UInt64](repeating: 0, count: 32)
+                registers[2] = 0x20_000
+                registers[3] = 64
+                for offset in 0..<64 {
+                    ramBuffer[0x20_000 - 64 + offset] = 0x5a
+                    ramBuffer[0x20_800 + offset] = 0x5a
+                }
+                for offset in 0..<2_048 { ramBuffer[0x20_000 + offset] = 0 }
+                for vector in 0..<4 {
+                    vectorLows[vector] = 0xaabb_ccdd_aabb_ccdd
+                }
+                registers.withUnsafeBufferPointer { registerBuffer in
+                    vectorLows.withUnsafeBufferPointer { lowBuffer in
+                        vectorHighs.withUnsafeBufferPointer { highBuffer in
+                            avz_native_execution_context_load(
+                                execution,
+                                registerBuffer.baseAddress,
+                                lowBuffer.baseAddress,
+                                highBuffer.baseAddress,
+                                0x30_000, 0x8ff8, 0x5, 0, 0, 0, 0, 0, 0
+                            )
+                        }
                     }
                 }
+                return avz_native_execution_context_run_cached_chain_checkpointed(
+                    execution, cache, &key, 512, 512, 16, 16,
+                    nativeChainCheckpoint,
+                    Unmanaged.passUnretained(checkpoint).toOpaque(),
+                    nativeBlockFetch,
+                    Unmanaged.passUnretained(fetch).toOpaque(),
+                    avz_native_fast_memory_read, avz_native_fast_memory_write,
+                    avz_native_fast_memory_can_access, avz_native_fast_memory_fill,
+                    nil, nil, nil, nil, nil, nil,
+                    UnsafeMutableRawPointer(fastPath)
+                )
             }
-            return avz_native_execution_context_run_cached_chain_checkpointed(
-                execution, cache, &key, 512, 512, 16, 16,
-                nativeChainCheckpoint,
-                Unmanaged.passUnretained(checkpoint).toOpaque(),
-                nativeBlockFetch,
-                Unmanaged.passUnretained(fetch).toOpaque(),
-                nil, nil, nil, nativeTestMemoryFill,
-                nil, nil, nil, nil, nil, nil,
-                Unmanaged.passUnretained(memory).toOpaque()
-            )
-        }
 
-        _ = loadAndRun()
-        let mapped = loadAndRun()
+            _ = loadAndRun()
+            let mapped = loadAndRun()
 
-        XCTAssertGreaterThan(mapped.superblock_dispatches, 0)
-        XCTAssertEqual(mapped.fast_path_hits, 1)
-        XCTAssertEqual(mapped.fast_path_steps, 192)
-        XCTAssertEqual(avz_native_execution_context_pc(execution), 0x900c)
-        for offset in stride(from: UInt64(0), to: 2_048, by: 8) {
-            XCTAssertEqual(
-                memory.read(at: 0x20_000 + offset, width: 8),
-                0xaabb_ccdd_aabb_ccdd
-            )
+            XCTAssertGreaterThan(mapped.superblock_dispatches, 0)
+            XCTAssertEqual(mapped.fast_path_hits, 1)
+            XCTAssertEqual(mapped.fast_path_steps, 192)
+            XCTAssertEqual(avz_native_execution_context_pc(execution), 0x900c)
+            XCTAssertTrue(ramBuffer[0x1_ffc0..<0x20_000].allSatisfy { $0 == 0x5a })
+            let changedTrailingBytes = (0..<64).filter { ramBuffer[0x20_800 + $0] != 0x5a }
+            XCTAssertEqual(changedTrailingBytes, [], "writes beyond SIMD fill destination")
+            let pattern: [UInt8] = [0xdd, 0xcc, 0xbb, 0xaa]
+            for offset in 0..<2_048 {
+                XCTAssertEqual(ramBuffer[0x20_000 + offset], pattern[offset % pattern.count])
+            }
         }
     }
 
@@ -8035,6 +8303,108 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         XCTAssertEqual(vectorHighs[15], 0)
     }
 
+    func testScalarFPPairwiseAddCoversFirefoxAliasingAndBothPrecisions() {
+        for wide in [false, true] {
+            for source: UInt32 in [1, 31] {
+                for destination in [UInt32(0), source] {
+                    let word: UInt32 = (wide ? 0x7e70_d800 : 0x7e30_d800)
+                        | (source << 5) | destination
+                    var decoded = decode([word, 0xd440_0000])
+                    XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_FP_SCALAR_ARITHMETIC)
+                    var registers = [UInt64](repeating: 0, count: 31)
+                    var lows = [UInt64](repeating: UInt64.max, count: 32)
+                    var highs = [UInt64](repeating: UInt64.max, count: 32)
+                    lows[Int(source)] = wide ? Double(1.5).bitPattern
+                        : UInt64(Float(1.5).bitPattern) | (UInt64(Float(-4).bitPattern) << 32)
+                    highs[Int(source)] = wide ? Double(-4).bitPattern : UInt64.max
+                    var sp: UInt64 = 0x1234
+                    var pc: UInt64 = 0x16_200
+                    var pstate: UInt64 = 0
+                    var fpcr: UInt64 = 0
+                    var fpsr: UInt64 = 0
+                    var halted: UInt8 = 0
+                    let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                        registers.withUnsafeMutableBufferPointer { x in
+                            lows.withUnsafeMutableBufferPointer { lo in
+                                highs.withUnsafeMutableBufferPointer { hi in
+                                    avz_native_run_threaded_decoded_block_full_registers(
+                                        instructions.baseAddress, instructions.count, pc, 2,
+                                        x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                        &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                        nil, nil, nil, nil, nil)
+                                }
+                            }
+                        }
+                    }
+                    XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                    XCTAssertEqual(result.steps, 2)
+                    XCTAssertEqual(lows[Int(destination)], wide ? Double(-2.5).bitPattern
+                        : UInt64(Float(-2.5).bitPattern))
+                    XCTAssertEqual(highs[Int(destination)], 0)
+                    XCTAssertEqual(sp, 0x1234)
+                }
+            }
+        }
+    }
+
+    func testScalarByElementFPMultiplyCoversFirefoxAndEverySourceLane() {
+        let cases: [(UInt32, UInt64)] = [
+            (0x5fc3_9963, Double(4.5).bitPattern), // Firefox: fmul d3, d11, v3.d[1]
+            (0x5f82_9020, UInt64(Float(6).bitPattern)),
+            (0x5fa2_9020, UInt64(Float(8).bitPattern)),
+            (0x5f82_9820, UInt64(Float(10).bitPattern)),
+            (0x5fa2_9820, UInt64(Float(12).bitPattern)),
+            (0x5fbf_9bff, UInt64(Float(14).bitPattern)), // all operands alias v31
+            (0x5fc5_9080, Double(-6).bitPattern), // fmul d0, d4, v5.d[0]
+        ]
+        for (word, expected) in cases {
+            var decoded = decode([word, 0xd440_0000])
+            XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_FP_SCALAR_ARITHMETIC)
+            XCTAssertEqual(decoded[0].flags & 8, 0)
+            XCTAssertNotEqual(decoded[0].flags & 32, 0)
+            var registers = [UInt64](repeating: 0, count: 31)
+            var lows = [UInt64](repeating: UInt64.max, count: 32)
+            var highs = [UInt64](repeating: UInt64.max, count: 32)
+            lows[1] = UInt64(Float(2).bitPattern)
+            lows[2] = UInt64(Float(3).bitPattern) | (UInt64(Float(4).bitPattern) << 32)
+            highs[2] = UInt64(Float(5).bitPattern) | (UInt64(Float(6).bitPattern) << 32)
+            lows[11] = Double(1.5).bitPattern
+            highs[3] = Double(3).bitPattern
+            lows[31] = UInt64(Float(2).bitPattern)
+            highs[31] = UInt64(Float(7).bitPattern) << 32
+            lows[4] = Double(-2).bitPattern
+            lows[5] = Double(3).bitPattern
+            var sp: UInt64 = 0
+            var pc: UInt64 = 0x16_200
+            var pstate: UInt64 = 0
+            var fpcr: UInt64 = 0
+            var fpsr: UInt64 = 0
+            var halted: UInt8 = 0
+            let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                registers.withUnsafeMutableBufferPointer { x in
+                    lows.withUnsafeMutableBufferPointer { lo in
+                        highs.withUnsafeMutableBufferPointer { hi in
+                            avz_native_run_threaded_decoded_block_full_registers(
+                                instructions.baseAddress, instructions.count, pc, 2,
+                                x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                nil, nil, nil, nil, nil)
+                        }
+                    }
+                }
+            }
+            XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+            XCTAssertEqual(result.steps, 2)
+            let destination = Int(word & 31)
+            XCTAssertEqual(lows[destination], expected, String(format: "%08x", word))
+            XCTAssertEqual(highs[destination], 0)
+        }
+        for word: UInt32 in [0x5fe3_9963, 0x5fc3_9d63] { // reserved L and bit 10
+            var instruction = AVZNativeInstruction()
+            XCTAssertEqual(avz_native_decode_instruction(word, &instruction), 0)
+        }
+    }
+
     func testFullRegisterRunnerExecutesVectorByElementFPMultiply() {
         let program: [UInt32] = [
             0x0fa2_9820, // fmul v0.2s, v1.2s, v2.s[3]
@@ -9022,6 +9392,75 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         XCTAssertEqual(vectorHighs[29], 0)
     }
 
+    func testPairwiseWideningAccumulateAllWidthsAndAliasing() {
+        for q: UInt32 in 0...1 {
+            for unsigned: UInt32 in 0...1 {
+                for size: UInt32 in 0...2 {
+                    for alias in [false, true] {
+                        let source = alias ? 0 : 1
+                        let word: UInt32 = 0x0e20_6800 | (q << 30) | (unsigned << 29) |
+                            (size << 22) | (UInt32(source) << 5)
+                        var decoded = decode([word, 0xd440_0000])
+                        XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_SIMD_PAIRWISE_ADD_LONG)
+                        XCTAssertNotEqual(decoded[0].flags & 4, 0)
+                        var x = [UInt64](repeating: 0, count: 31)
+                        var lows = [UInt64](repeating: 0, count: 32)
+                        var highs = lows
+                        lows[0] = UInt64.max
+                        highs[0] = 0x8000_ffff_ffff_fffe
+                        lows[1] = 0x8000_7fff_fffe_0001
+                        highs[1] = 0xffff_ffff_8000_0000
+                        let bits = 8 << Int(size)
+                        let resultBits = bits * 2
+                        func mask(_ width: Int) -> UInt64 {
+                            width == 64 ? UInt64.max : (UInt64(1) << width) - 1
+                        }
+                        func lane(_ register: Int, _ index: Int, _ width: Int) -> UInt64 {
+                            let offset = index * width
+                            return ((offset < 64 ? lows[register] : highs[register]) >> (offset % 64)) & mask(width)
+                        }
+                        var expected = [UInt64](repeating: 0, count: 2)
+                        for index in 0..<(q == 1 ? 128 : 64) / resultBits {
+                            func extend(_ value: UInt64) -> UInt64 {
+                                unsigned == 1 ? value : UInt64(bitPattern:
+                                    Int64(bitPattern: value << (64 - bits)) >> (64 - bits))
+                            }
+                            let sum = (extend(lane(source, index * 2, bits)) &+
+                                extend(lane(source, index * 2 + 1, bits)) &+
+                                lane(0, index, resultBits)) & mask(resultBits)
+                            let offset = index * resultBits
+                            expected[offset / 64] |= sum << (offset % 64)
+                        }
+                        var sp: UInt64 = 0
+                        var pc: UInt64 = 0xc000
+                        var pstate: UInt64 = 0
+                        var fpcr: UInt64 = 0
+                        var fpsr: UInt64 = 0
+                        var halted: UInt8 = 0
+                        let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                            x.withUnsafeMutableBufferPointer { registers in
+                                lows.withUnsafeMutableBufferPointer { lo in
+                                    highs.withUnsafeMutableBufferPointer { hi in
+                                        avz_native_run_threaded_decoded_block_full_registers(
+                                            instructions.baseAddress, instructions.count, pc, 2,
+                                            registers.baseAddress, lo.baseAddress, hi.baseAddress,
+                                            &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                            nil, nil, nil, nil, nil)
+                                    }
+                                }
+                            }
+                        }
+                        XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                        XCTAssertEqual(lows[0], expected[0], String(format: "%08x", word))
+                        XCTAssertEqual(highs[0], expected[1])
+                    }
+                }
+            }
+        }
+        var reserved = AVZNativeInstruction()
+        XCTAssertEqual(avz_native_decode_instruction(0x6ee0_6820, &reserved), 0)
+    }
+
     func testFullRegisterRunnerExecutesSIMDPairwiseAddLongFamily() {
         let program: [UInt32] = [
             0x2e20_2820, // uaddlp v0.4h, v1.8b
@@ -9101,6 +9540,368 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         XCTAssertEqual(vectorHighs[14], 1)
         XCTAssertEqual(vectorLows[31], 0x000f_000b_0007_0003)
         XCTAssertEqual(vectorHighs[31], 0x001f_001b_0017_0013)
+    }
+
+    func testSIMDIntegerAbsoluteAllWidthsAndMinimumSignedValue() {
+        for size in 0...3 {
+            let bits = 8 << size
+            let mask = bits == 64 ? UInt64.max : (UInt64(1) << bits) - 1
+            let minimum = UInt64(1) << (bits - 1)
+            for q: UInt32 in [0, 1] where size < 3 || q == 1 {
+                for value in [UInt64(0), 3, mask - 2, minimum] {
+                    for scalar in [false, true] where !scalar || (size == 3 && q == 1) {
+                        let word: UInt32 = scalar ? 0x5ee0_bbff
+                            : 0x0e20_bbff | (UInt32(size) << 22) | (q << 30)
+                        var decoded = decode([word, 0xd440_0000])
+                        XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_SIMD_INTEGER_NEGATE)
+                        var source: UInt64 = 0
+                        var expected: UInt64 = 0
+                        let magnitude = value & minimum == 0 ? value : (0 &- value) & mask
+                        for lane in 0..<(64 / bits) {
+                            source |= value << (lane * bits)
+                            expected |= magnitude << (lane * bits)
+                        }
+                        var registers = [UInt64](repeating: 0, count: 31)
+                        var lows = [UInt64](repeating: source, count: 32)
+                        var highs = [UInt64](repeating: source, count: 32)
+                        var sp: UInt64 = 0x1234
+                        var pc: UInt64 = 0x16_200
+                        var pstate: UInt64 = 0
+                        var fpcr: UInt64 = 0
+                        var fpsr: UInt64 = 0
+                        var halted: UInt8 = 0
+                        let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                            registers.withUnsafeMutableBufferPointer { x in
+                                lows.withUnsafeMutableBufferPointer { lo in
+                                    highs.withUnsafeMutableBufferPointer { hi in
+                                        avz_native_run_threaded_decoded_block_full_registers(
+                                            instructions.baseAddress, instructions.count, pc, 2,
+                                            x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                            &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                            nil, nil, nil, nil, nil)
+                                    }
+                                }
+                            }
+                        }
+                        XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                        XCTAssertEqual(lows[31], expected)
+                        XCTAssertEqual(highs[31], q == 1 && !scalar ? expected : 0)
+                        XCTAssertEqual(sp, 0x1234)
+                    }
+                }
+            }
+        }
+        var invalid = AVZNativeInstruction()
+        XCTAssertEqual(avz_native_decode_instruction(0x0ee0_b800, &invalid), 0)
+    }
+
+    func testSIMDAbsoluteDifferenceSignedUnsignedAccumulationAndAliases() {
+        for size: UInt32 in 0...2 {
+            let bits = 8 << Int(size)
+            let mask = (UInt64(1) << bits) - 1
+            let minimum = UInt64(1) << (bits - 1)
+            for q: UInt32 in [0, 1] {
+                for unsigned: UInt32 in [0, 1] {
+                    for accumulate: UInt32 in [0, 1] {
+                        for destination: UInt32 in [0, 1, 2] {
+                            let word: UInt32 = 0x0e21_7440 | (size << 22) | (q << 30)
+                                | (unsigned << 29) | (accumulate << 11) | destination
+                            var decoded = decode([word, 0xd440_0000])
+                            XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_SIMD_ADD_VECTOR)
+                            var lhs: UInt64 = 0
+                            var rhs: UInt64 = 0
+                            var initial: UInt64 = 0
+                            var expected: UInt64 = 0
+                            let oldLane = destination == 2 ? minimum
+                                : destination == 1 ? minimum - 1 : 3
+                            let difference = unsigned == 1 ? UInt64(1) : mask
+                            let value = (difference + (accumulate == 1 ? oldLane : 0)) & mask
+                            for lane in 0..<(64 / bits) {
+                                lhs |= minimum << (lane * bits)
+                                rhs |= (minimum - 1) << (lane * bits)
+                                initial |= UInt64(3) << (lane * bits)
+                                expected |= value << (lane * bits)
+                            }
+                            var registers = [UInt64](repeating: 0, count: 31)
+                            var lows = [UInt64](repeating: initial, count: 32)
+                            lows[2] = lhs
+                            lows[1] = rhs
+                            var highs = lows
+                            var sp: UInt64 = 0
+                            var pc: UInt64 = 0x16_200
+                            var pstate: UInt64 = 0
+                            var fpcr: UInt64 = 0
+                            var fpsr: UInt64 = 0
+                            var halted: UInt8 = 0
+                            let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                                registers.withUnsafeMutableBufferPointer { x in
+                                    lows.withUnsafeMutableBufferPointer { lo in
+                                        highs.withUnsafeMutableBufferPointer { hi in
+                                            avz_native_run_threaded_decoded_block_full_registers(
+                                                instructions.baseAddress, instructions.count, pc, 2,
+                                                x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                                &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                                nil, nil, nil, nil, nil)
+                                        }
+                                    }
+                                }
+                            }
+                            XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                            XCTAssertEqual(lows[Int(destination)], expected)
+                            XCTAssertEqual(highs[Int(destination)], q == 1 ? expected : 0)
+                        }
+                    }
+                }
+            }
+        }
+        var invalid = AVZNativeInstruction()
+        XCTAssertEqual(avz_native_decode_instruction(0x4ee1_7441, &invalid), 0)
+    }
+
+    func testSignedVariableShiftWidthsBoundariesAndLowByteCounts() {
+        for size: UInt32 in 0...3 {
+            let bits = 8 << Int(size)
+            let mask = bits == 64 ? UInt64.max : (UInt64(1) << bits) - 1
+            for q: UInt32 in [0, 1] where size < 3 || q == 1 {
+                for shift in [-128, -65, -64, -33, -32, -16, -8, -1, 0, 1, 7, 8, 16, 32, 64, 127] {
+                    for negative in [false, true] {
+                        for scalar in [false, true] where !scalar || (size == 3 && q == 1) {
+                            let word: UInt32 = scalar ? 0x5ee7_4484
+                                : 0x0e27_4484 | (size << 22) | (q << 30)
+                            var decoded = decode([word, 0xd440_0000])
+                            XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_SIMD_UNSIGNED_SHIFT_REGISTER)
+                            let signedValue: Int64 = negative ? -7 : 7
+                            let value = UInt64(bitPattern: signedValue) & mask
+                            let expectedLane: UInt64
+                            if shift >= 0 {
+                                expectedLane = shift < bits ? (value << shift) & mask : 0
+                            } else {
+                                expectedLane = UInt64(bitPattern: signedValue >> min(-shift, 63)) & mask
+                            }
+                            var source: UInt64 = 0
+                            var counts: UInt64 = 0
+                            var expected: UInt64 = 0
+                            // Upper count bits deliberately disagree: only the low byte is signed.
+                            let count = (UInt64(UInt8(bitPattern: Int8(shift))) | 0x5a00) & mask
+                            for lane in 0..<(64 / bits) {
+                                source |= value << (lane * bits)
+                                counts |= count << (lane * bits)
+                                expected |= expectedLane << (lane * bits)
+                            }
+                            var registers = [UInt64](repeating: 0, count: 31)
+                            var lows = [UInt64](repeating: source, count: 32)
+                            lows[7] = counts
+                            var highs = lows
+                            var sp: UInt64 = 0
+                            var pc: UInt64 = 0x16_200
+                            var pstate: UInt64 = 0
+                            var fpcr: UInt64 = 0
+                            var fpsr: UInt64 = 0
+                            var halted: UInt8 = 0
+                            let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                                registers.withUnsafeMutableBufferPointer { x in
+                                    lows.withUnsafeMutableBufferPointer { lo in
+                                        highs.withUnsafeMutableBufferPointer { hi in
+                                            avz_native_run_threaded_decoded_block_full_registers(
+                                                instructions.baseAddress, instructions.count, pc, 2,
+                                                x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                                &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                                nil, nil, nil, nil, nil)
+                                        }
+                                    }
+                                }
+                            }
+                            XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                            XCTAssertEqual(lows[4], expected)
+                            XCTAssertEqual(highs[4], q == 1 && !scalar ? expected : 0)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testFloatingAbsoluteDifferenceScalarVectorAndAliases() {
+        let forms: [(UInt32, Bool, Int)] = [
+            (0x7ea6_d4a0, false, 1), (0x7ee6_d4a0, true, 1),
+            (0x2ea6_d4a0, false, 2), (0x6ea6_d4a0, false, 4),
+            (0x6ee6_d4a0, true, 2),
+        ]
+        for (base, wide, lanes) in forms {
+            for destination: UInt32 in [0, 5, 6] {
+                var decoded = decode([base | destination, 0xd440_0000])
+                XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_SIMD_SCALAR_FP_ABSOLUTE_DIFFERENCE)
+                var registers = [UInt64](repeating: 0, count: 31)
+                var lows = [UInt64](repeating: UInt64.max, count: 32)
+                var highs = lows
+                lows[5] = wide ? Double(-3).bitPattern
+                    : UInt64(Float(-3).bitPattern) | (UInt64(Float(7).bitPattern) << 32)
+                lows[6] = wide ? Double(1.5).bitPattern
+                    : UInt64(Float(1.5).bitPattern) | (UInt64(Float(5).bitPattern) << 32)
+                highs[5] = wide ? Double(-0.0).bitPattern
+                    : UInt64(Float(-0.0).bitPattern) | (UInt64(Float.infinity.bitPattern) << 32)
+                highs[6] = wide ? Double(0).bitPattern : 0
+                var sp: UInt64 = 0
+                var pc: UInt64 = 0x16_200
+                var pstate: UInt64 = 0
+                var fpcr: UInt64 = 0
+                var fpsr: UInt64 = 0
+                var halted: UInt8 = 0
+                let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                    registers.withUnsafeMutableBufferPointer { x in
+                        lows.withUnsafeMutableBufferPointer { lo in
+                            highs.withUnsafeMutableBufferPointer { hi in
+                                avz_native_run_threaded_decoded_block_full_registers(
+                                    instructions.baseAddress, instructions.count, pc, 2,
+                                    x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                    &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                    nil, nil, nil, nil, nil)
+                            }
+                        }
+                    }
+                }
+                XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                let expectedLow = wide ? Double(4.5).bitPattern
+                    : UInt64(Float(4.5).bitPattern) | (lanes > 1 ? UInt64(Float(2).bitPattern) << 32 : 0)
+                XCTAssertEqual(lows[Int(destination)], expectedLow)
+                XCTAssertEqual(highs[Int(destination)], !wide && lanes == 4
+                    ? UInt64(Float.infinity.bitPattern) << 32 : 0)
+            }
+        }
+        var invalid = AVZNativeInstruction()
+        XCTAssertEqual(avz_native_decode_instruction(0x2ee6_d4a5, &invalid), 0)
+    }
+
+    func testSaturatingNarrowWidthsAliasesUpperHalfAndStickyQC() {
+        let bases: [UInt32] = [0x2e21_2800, 0x0e21_4800, 0x2e21_4800]
+        for size: UInt32 in 0...2 {
+            let bits = 16 << Int(size)
+            let destinationBits = bits / 2
+            let sourceMask = bits == 64 ? UInt64.max : (UInt64(1) << bits) - 1
+            let destinationMask = (UInt64(1) << destinationBits) - 1
+            for mode in 0...2 {
+                let maximum = mode == 1 ? destinationMask >> 1 : destinationMask
+                let minimum: Int64 = mode == 1 ? -(Int64(1) << (destinationBits - 1)) : 0
+                for scalar in [false, true] {
+                    for upper: UInt32 in [0, 1] where !scalar || upper == 0 {
+                        for value in [UInt64(0), 3, maximum, maximum + 1, sourceMask] {
+                            let word = bases[mode] | (size << 22)
+                                | (scalar ? 0x5000_0000 : upper << 30)
+                            var decoded = decode([word, 0xd440_0000])
+                            XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_SIMD_NARROW_HIGH)
+                            let signedValue = Int64(bitPattern: value << (64 - bits)) >> (64 - bits)
+                            let clamped = mode == 2 ? min(value, maximum)
+                                : UInt64(bitPattern: min(max(signedValue, minimum), Int64(maximum)))
+                            let saturated = mode == 2 ? value > maximum
+                                : signedValue < minimum || signedValue > Int64(maximum)
+                            var source: UInt64 = 0
+                            var expected: UInt64 = 0
+                            for lane in 0..<(64 / bits) { source |= value << (lane * bits) }
+                            for lane in 0..<(scalar ? 1 : 128 / bits) {
+                                expected |= (clamped & destinationMask) << (lane * destinationBits)
+                            }
+                            var registers = [UInt64](repeating: 0, count: 31)
+                            var lows = [UInt64](repeating: source, count: 32)
+                            var highs = lows
+                            var sp: UInt64 = 0
+                            var pc: UInt64 = 0x16_200
+                            var pstate: UInt64 = 0
+                            var fpcr: UInt64 = 0
+                            var fpsr: UInt64 = 0x10
+                            var halted: UInt8 = 0
+                            let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                                registers.withUnsafeMutableBufferPointer { x in
+                                    lows.withUnsafeMutableBufferPointer { lo in
+                                        highs.withUnsafeMutableBufferPointer { hi in
+                                            avz_native_run_threaded_decoded_block_full_registers(
+                                                instructions.baseAddress, instructions.count, pc, 2,
+                                                x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                                &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                                nil, nil, nil, nil, nil)
+                                        }
+                                    }
+                                }
+                            }
+                            XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                            XCTAssertEqual(lows[0], upper == 1 ? source : expected)
+                            XCTAssertEqual(highs[0], upper == 1 ? expected : 0)
+                            XCTAssertEqual(fpsr, 0x10 | (saturated ? UInt64(1) << 27 : 0))
+                        }
+                    }
+                }
+            }
+        }
+        for word: UInt32 in [0x2ee1_2800, 0x3e61_2800] {
+            var invalid = AVZNativeInstruction()
+            XCTAssertEqual(avz_native_decode_instruction(word, &invalid), 0)
+        }
+    }
+
+    func testShiftedSaturatingNarrowRoundingOverflowAndAliases() {
+        let bases: [UInt32] = [0x2f00_8400, 0x0f00_9400, 0x2f00_9400]
+        for bits in [16, 32, 64] {
+            let destinationBits = bits / 2
+            let sourceMask = bits == 64 ? UInt64.max : (UInt64(1) << bits) - 1
+            let destinationMask = (UInt64(1) << destinationBits) - 1
+            for shift in Set([1, destinationBits, min(14, destinationBits)]) {
+                for mode in 0...2 {
+                    let maximum = mode == 1 ? destinationMask >> 1 : destinationMask
+                    let minimum: Int64 = mode == 1 ? -(Int64(1) << (destinationBits - 1)) : 0
+                    for round in [false, true] {
+                        for form: UInt32 in [0, 0x4000_0000, 0x5000_0000] {
+                            for value in [UInt64(0), 3, sourceMask, sourceMask >> 1, UInt64(1) << (bits - 1)] {
+                                let word = bases[mode] | (UInt32(bits - shift) << 16)
+                                    | (round ? 0x800 : 0) | form
+                                var decoded = decode([word, 0xd440_0000])
+                                XCTAssertEqual(Int(decoded[0].kind), AVZ_NATIVE_OP_SIMD_NARROW_HIGH)
+                                let rounding = round ? (value >> (shift - 1)) & 1 : 0
+                                let signedValue = Int64(bitPattern: value << (64 - bits)) >> (64 - bits)
+                                let signedShifted = (signedValue >> shift) + Int64(rounding)
+                                let unsignedShifted = (value >> shift) + rounding
+                                let clamped = mode == 2 ? min(unsignedShifted, maximum)
+                                    : UInt64(bitPattern: min(max(signedShifted, minimum), Int64(maximum)))
+                                let saturated = mode == 2 ? unsignedShifted > maximum
+                                    : signedShifted < minimum || signedShifted > Int64(maximum)
+                                let scalar = form == 0x5000_0000
+                                let upper = form == 0x4000_0000
+                                var source: UInt64 = 0
+                                var expected: UInt64 = 0
+                                for lane in 0..<(64 / bits) { source |= value << (lane * bits) }
+                                for lane in 0..<(scalar ? 1 : 128 / bits) {
+                                    expected |= (clamped & destinationMask) << (lane * destinationBits)
+                                }
+                                var registers = [UInt64](repeating: 0, count: 31)
+                                var lows = [UInt64](repeating: source, count: 32)
+                                var highs = lows
+                                var sp: UInt64 = 0
+                                var pc: UInt64 = 0x16_200
+                                var pstate: UInt64 = 0
+                                var fpcr: UInt64 = 0
+                                var fpsr: UInt64 = 0x10
+                                var halted: UInt8 = 0
+                                let result = decoded.withUnsafeMutableBufferPointer { instructions in
+                                    registers.withUnsafeMutableBufferPointer { x in
+                                        lows.withUnsafeMutableBufferPointer { lo in
+                                            highs.withUnsafeMutableBufferPointer { hi in
+                                                avz_native_run_threaded_decoded_block_full_registers(
+                                                    instructions.baseAddress, instructions.count, pc, 2,
+                                                    x.baseAddress, lo.baseAddress, hi.baseAddress,
+                                                    &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                                                    nil, nil, nil, nil, nil)
+                                            }
+                                        }
+                                    }
+                                }
+                                XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+                                XCTAssertEqual(lows[0], upper ? source : expected)
+                                XCTAssertEqual(highs[0], upper ? expected : 0)
+                                XCTAssertEqual(fpsr, 0x10 | (saturated ? UInt64(1) << 27 : 0))
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     func testFullRegisterRunnerExecutesSIMDIntegerNegate() {
@@ -9215,10 +10016,27 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
     }
 
     func testFullRegisterRunnerExecutesSIMDLogicalWordImmediateFamily() {
+        for q: UInt32 in [0, 1] {
+            for op: UInt32 in [0, 1] {
+                for cmode: UInt32 in [1, 3, 5, 7, 9, 11] {
+                    for immediate: UInt32 in 0...255 {
+                        let word = UInt32(0x0f00_0401) | (q << 30) | (op << 29)
+                            | (cmode << 12) | ((immediate >> 5) << 16) | ((immediate & 31) << 5)
+                        var instruction = AVZNativeInstruction()
+                        XCTAssertEqual(avz_native_decode_instruction(word, &instruction), 1)
+                        XCTAssertEqual(Int(instruction.kind), AVZ_NATIVE_OP_SIMD_MOVI_WORD_IMMEDIATE)
+                        let shift = cmode < 8 ? (cmode >> 1) * 8 : (cmode == 9 ? 0 : 8)
+                        XCTAssertEqual(UInt64(bitPattern: instruction.immediate), UInt64(immediate) << shift)
+                    }
+                }
+            }
+        }
         let program: [UInt32] = [
             0x4f04_741f, // orr v31.4s, #0x80, lsl #24 (live Phosh instruction)
             0x0f00_1640, // orr v0.2s, #0x12
             0x6f05_7785, // bic v5.4s, #0xbc, lsl #24
+            0x4f07_57e1, // orr v1.4s, #255, lsl #16 (Firefox)
+            0x2f07_57e2, // bic v2.2s, #255, lsl #16
             0xd440_0000
         ]
         var decoded = decode(program)
@@ -9243,6 +10061,8 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         vectorHighs[0] = UInt64.max
         vectorLows[5] = UInt64.max
         vectorHighs[5] = UInt64.max
+        vectorLows[2] = UInt64.max
+        vectorHighs[2] = UInt64.max
 
         let result = decoded.withUnsafeMutableBufferPointer { instructionBuffer in
             registers.withUnsafeMutableBufferPointer { registerBuffer in
@@ -9266,6 +10086,10 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         XCTAssertEqual(vectorHighs[0], 0)
         XCTAssertEqual(vectorLows[5], 0x43ff_ffff_43ff_ffff)
         XCTAssertEqual(vectorHighs[5], 0x43ff_ffff_43ff_ffff)
+        XCTAssertEqual(vectorLows[1], 0x00ff_0000_00ff_0000)
+        XCTAssertEqual(vectorHighs[1], 0x00ff_0000_00ff_0000)
+        XCTAssertEqual(vectorLows[2], 0xff00_ffff_ff00_ffff)
+        XCTAssertEqual(vectorHighs[2], 0)
     }
 
     func testFullRegisterRunnerSeparatesRenderingSIMDEncodingFamilies() {
@@ -12380,6 +13204,59 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
         XCTAssertEqual(result.steps, 2)
         XCTAssertEqual(vectorLows[31], 0x1111_bbbb_3333_dddd)
         XCTAssertEqual(vectorHighs[31], 0xaaaa_aaaa_aaaa_aaaa)
+    }
+
+    func testSignedVectorElementMovesExtendToDestinationWidth() {
+        let program: [UInt32] = [
+            0x0e1e_2ee7, // Firefox: smov w7, v23.h[7]
+            0x0e1e_2c48, // smov w8, v2.h[7]
+            0x0e1f_2c40, // smov w0, v2.b[15]
+            0x4e01_2c41, // smov x1, v2.b[0]
+            0x4e1e_2c43, // smov x3, v2.h[7]
+            0x4e1c_2c44, // smov x4, v2.s[3]
+            0x0e01_2c5f, // smov wzr, v2.b[0]
+            0xd440_0000
+        ]
+        var decoded = decode(program)
+        var registers = [UInt64](repeating: UInt64.max, count: 31)
+        var lows = [UInt64](repeating: 0, count: 32)
+        var highs = [UInt64](repeating: 0, count: 32)
+        lows[2] = 0x80
+        highs[2] = 0x8000_0000_0000_0000
+        highs[23] = 0x7fff_0000_0000_0000
+        var sp: UInt64 = 0x1234
+        var pc: UInt64 = 0xc000
+        var pstate: UInt64 = 0
+        var fpcr: UInt64 = 0
+        var fpsr: UInt64 = 0
+        var halted: UInt8 = 0
+        let result = decoded.withUnsafeMutableBufferPointer { instructions in
+            registers.withUnsafeMutableBufferPointer { x in
+                lows.withUnsafeMutableBufferPointer { lo in
+                    highs.withUnsafeMutableBufferPointer { hi in
+                        avz_native_run_threaded_decoded_block_full_registers(
+                            instructions.baseAddress, instructions.count, pc, 9,
+                            x.baseAddress, lo.baseAddress, hi.baseAddress,
+                            &sp, &pc, &pstate, &fpcr, &fpsr, &halted,
+                            nil, nil, nil, nil, nil)
+                    }
+                }
+            }
+        }
+        XCTAssertEqual(result.status, UInt32(AVZ_NATIVE_STATUS_HALTED))
+        XCTAssertEqual(result.steps, 8)
+        XCTAssertEqual(registers[7], 0x7fff)
+        XCTAssertEqual(registers[8], 0x0000_0000_ffff_8000)
+        XCTAssertEqual(registers[0], 0x0000_0000_ffff_ff80)
+        XCTAssertEqual(registers[1], 0xffff_ffff_ffff_ff80)
+        XCTAssertEqual(registers[3], 0xffff_ffff_ffff_8000)
+        XCTAssertEqual(registers[4], 0xffff_ffff_8000_0000)
+        XCTAssertEqual(sp, 0x1234)
+        XCTAssertEqual(highs[2], 0x8000_0000_0000_0000)
+        for word: UInt32 in [0x0e00_2c40, 0x0e04_2c40, 0x4e08_2c40] {
+            var instruction = AVZNativeInstruction()
+            XCTAssertEqual(avz_native_decode_instruction(word, &instruction), 0)
+        }
     }
 
     func testFullRegisterRunnerExecutesSIMDMoveVectorElementToGeneralWithoutFallback() {

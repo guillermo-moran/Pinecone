@@ -1,0 +1,905 @@
+--- a/include/render/pixman.h
++++ b/include/render/pixman.h
+@@ -21,6 +21,8 @@
+ 	struct wl_list textures; // wlr_pixman_texture.link
+ 
+ 	struct wlr_drm_format_set drm_formats;
++	struct wlr_drm_format_set dmabuf_formats;
++	int drm_fd;
+ };
+ 
+ struct wlr_pixman_buffer {
+@@ -49,8 +51,11 @@
+ struct wlr_pixman_render_pass {
+ 	struct wlr_render_pass base;
+ 	struct wlr_pixman_buffer *buffer;
++	bool failed;
+ };
+ 
++struct wlr_renderer *pixman_renderer_create_with_drm_fd(int drm_fd);
++
+ pixman_format_code_t get_pixman_format_from_drm(uint32_t fmt);
+ uint32_t get_drm_format_from_pixman(pixman_format_code_t fmt);
+ const uint32_t *get_pixman_drm_formats(size_t *len);
+--- a/include/render/pixman_dmabuf.h
++++ b/include/render/pixman_dmabuf.h
+@@ -0,0 +1,20 @@
++#ifndef RENDER_PIXMAN_DMABUF_H
++#define RENDER_PIXMAN_DMABUF_H
++
++#include <wlr/interfaces/wlr_buffer.h>
++#include <wlr/render/drm_format_set.h>
++
++bool pixman_dmabuf_add_formats(struct wlr_drm_format_set *formats);
++int pixman_dmabuf_open_device(int drm_fd);
++bool pixman_dmabuf_check_import(int drm_fd, const struct wlr_dmabuf_attributes *a);
++struct wlr_buffer *pixman_dmabuf_import(int drm_fd, struct wlr_buffer *source);
++bool pixman_dmabuf_buffer_ok(struct wlr_buffer *buffer);
++bool pixman_dmabuf_buffer_is_imported(struct wlr_buffer *buffer);
++
++// Only for constructing an image; pixel reads still require begin/end access.
++void pixman_dmabuf_get_mapping(struct wlr_buffer *buffer,
++	void **data, uint32_t *format, size_t *stride);
++struct wlr_surface;
++bool pixman_dmabuf_lock_surface(struct wlr_surface *surface);
++
++#endif
+--- a/render/pixman/dmabuf.c
++++ b/render/pixman/dmabuf.c
+@@ -0,0 +1,333 @@
++#include <assert.h>
++#include <drm_fourcc.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <linux/dma-buf.h>
++#include <poll.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <wlr/util/log.h>
++#include <xf86drm.h>
++#include <xf86drmMode.h>
++#include "render/pixman_dmabuf.h"
++
++static const uint32_t import_formats[] = {
++	DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888,
++};
++
++struct pixman_dmabuf_buffer {
++	struct wlr_buffer base;
++	struct wlr_buffer *source;
++	int drm_fd, prime_fd;
++	uint32_t handle, format, stride, offset;
++	void *mapping;
++	size_t length;
++	bool accessing, failed;
++};
++
++static const struct wlr_buffer_impl dmabuf_impl;
++
++bool pixman_dmabuf_add_formats(struct wlr_drm_format_set *formats) {
++	for (size_t i = 0; i < sizeof(import_formats) / sizeof(import_formats[0]); i++) {
++		if (!wlr_drm_format_set_add(formats, import_formats[i], DRM_FORMAT_MOD_LINEAR)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool validate_attributes(const struct wlr_dmabuf_attributes *a,
++		size_t *length) {
++	bool supported = false;
++	for (size_t i = 0; i < sizeof(import_formats) / sizeof(import_formats[0]); i++) {
++		supported |= a->format == import_formats[i];
++	}
++	// INVALID is an unknown vendor layout, not a synonym for LINEAR.
++	if (!supported || a->modifier != DRM_FORMAT_MOD_LINEAR || a->n_planes != 1 ||
++			a->fd[0] < 0 || a->width <= 0 || a->height <= 0 ||
++			a->width > INT16_MAX || a->height > INT16_MAX ||
++			a->stride[0] > INT32_MAX || (a->stride[0] & 3) || (a->offset[0] & 3) ||
++			a->stride[0] < (uint32_t)a->width * 4) {
++		return false;
++	}
++	// Include the last row's padding: the bridge registers stride * height.
++	uint64_t end = (uint64_t)a->offset[0] + (uint64_t)a->stride[0] * a->height;
++	if (end > SIZE_MAX || end > PTRDIFF_MAX) {
++		return false;
++	}
++	*length = (size_t)end;
++	return true;
++}
++
++static int reopen_device(int fd) {
++	// MAP_DUMB is a primary-node ioctl. Do not advertise it on a render node.
++	if (fd < 0 || drmGetNodeTypeFromFd(fd) != DRM_NODE_PRIMARY) {
++		return -1;
++	}
++	char *name = drmGetDeviceNameFromFd2(fd);
++	if (name == NULL) {
++		return -1;
++	}
++	// A dup shares GEM handles without reference counts. Each import needs a
++	// new DRM file so closing its handle cannot invalidate another import.
++	int new_fd = open(name, O_RDWR | O_CLOEXEC);
++	free(name);
++	if (new_fd < 0) {
++		return -1;
++	}
++	struct stat old_stat, new_stat;
++	if (fstat(fd, &old_stat) < 0 || fstat(new_fd, &new_stat) < 0 ||
++			!S_ISCHR(new_stat.st_mode) || old_stat.st_rdev != new_stat.st_rdev) {
++		close(new_fd);
++		return -1;
++	}
++	return new_fd;
++}
++
++static bool sync_read(struct pixman_dmabuf_buffer *buffer, uint64_t phase) {
++	struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_READ | phase };
++	// A bad exporter must not spin the compositor indefinitely on EAGAIN.
++	for (unsigned int attempt = 0; attempt < 8; attempt++) {
++		if (ioctl(buffer->prime_fd, DMA_BUF_IOCTL_SYNC, &sync) == 0) {
++			return true;
++		}
++		if (errno != EINTR && errno != EAGAIN) {
++			return false;
++		}
++	}
++	return false;
++}
++
++static bool begin_read(struct pixman_dmabuf_buffer *buffer) {
++	if (buffer->failed || buffer->accessing) {
++		return false;
++	}
++	// SYNC provides cache coherency, not a producer completion guarantee.
++	struct pollfd pfd = { .fd = buffer->prime_fd, .events = POLLIN };
++	int ret = -1;
++	for (unsigned int attempt = 0; attempt < 8; attempt++) {
++		// Never block the Wayland event loop on a client-controlled fence.
++		ret = poll(&pfd, 1, 0);
++		if (ret >= 0 || (errno != EINTR && errno != EAGAIN)) {
++			break;
++		}
++	}
++	if (ret == 0 || (ret < 0 && (errno == EINTR || errno == EAGAIN))) {
++		return false; // Retry on a later access; never expose unready pixels.
++	}
++	if (ret != 1 || !(pfd.revents & POLLIN) ||
++			(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
++		buffer->failed = true;
++		return false;
++	}
++	if (!sync_read(buffer, DMA_BUF_SYNC_START)) {
++		buffer->failed = errno != EINTR && errno != EAGAIN;
++		return false;
++	}
++	buffer->accessing = true;
++	return true;
++}
++
++static bool end_read(struct pixman_dmabuf_buffer *buffer) {
++	assert(buffer->accessing);
++	buffer->accessing = false;
++	if (!sync_read(buffer, DMA_BUF_SYNC_END)) {
++		buffer->failed = true;
++		wlr_log_errno(WLR_ERROR, "Pixman DMA-BUF END READ failed");
++	}
++	return !buffer->failed;
++}
++
++static bool finish_mapping(struct pixman_dmabuf_buffer *buffer) {
++	if (buffer->accessing) {
++		end_read(buffer);
++	}
++	// The bridge can reject unmapping after a failed completion fence. Retain
++	// all backing resources in that case, rather than release a live buffer.
++	if (buffer->mapping != MAP_FAILED &&
++			munmap(buffer->mapping, buffer->length) < 0) {
++		wlr_log_errno(WLR_ERROR, "Retaining DMA-BUF after failed unmap fence");
++		return false;
++	}
++	if (buffer->handle != 0) {
++		drmCloseBufferHandle(buffer->drm_fd, buffer->handle);
++	}
++	if (buffer->drm_fd >= 0) {
++		close(buffer->drm_fd);
++	}
++	if (buffer->prime_fd >= 0) {
++		close(buffer->prime_fd);
++	}
++	wlr_buffer_unlock(buffer->source);
++	free(buffer);
++	return true;
++}
++
++static struct pixman_dmabuf_buffer *map_attributes(int drm_fd,
++		const struct wlr_dmabuf_attributes *a) {
++	size_t length;
++	if (!validate_attributes(a, &length)) {
++		return NULL;
++	}
++	struct pixman_dmabuf_buffer *buffer = calloc(1, sizeof(*buffer));
++	if (buffer == NULL) {
++		return NULL;
++	}
++	buffer->prime_fd = -1;
++	buffer->drm_fd = -1;
++	buffer->mapping = MAP_FAILED;
++	buffer->length = length;
++	buffer->format = a->format;
++	buffer->stride = a->stride[0];
++	buffer->offset = a->offset[0];
++	buffer->prime_fd = fcntl(a->fd[0], F_DUPFD_CLOEXEC, 0);
++	if (buffer->prime_fd < 0) {
++		goto error;
++	}
++	off_t size = lseek(buffer->prime_fd, 0, SEEK_END);
++	if (size < 0 || lseek(buffer->prime_fd, 0, SEEK_SET) < 0 ||
++			(uint64_t)size < length) {
++		goto error;
++	}
++	buffer->drm_fd = reopen_device(drm_fd);
++	if (buffer->drm_fd < 0 ||
++			drmPrimeFDToHandle(buffer->drm_fd, buffer->prime_fd, &buffer->handle) != 0) {
++		goto error;
++	}
++	uint64_t offset;
++	if (drmModeMapDumbBuffer(buffer->drm_fd, buffer->handle, &offset) != 0 ||
++			offset > INT64_MAX || (uint64_t)(off_t)offset != offset) {
++		goto error;
++	}
++	buffer->mapping = mmap(NULL, length, PROT_READ, MAP_SHARED, buffer->drm_fd, offset);
++	if (buffer->mapping == MAP_FAILED) {
++		goto error;
++	}
++	return buffer;
++
++error:
++	finish_mapping(buffer);
++	return NULL;
++}
++
++static void buffer_destroy(struct wlr_buffer *base) {
++	struct pixman_dmabuf_buffer *buffer = wl_container_of(base, buffer, base);
++	wlr_buffer_finish(base);
++	finish_mapping(buffer);
++}
++
++bool pixman_dmabuf_check_import(int drm_fd, const struct wlr_dmabuf_attributes *a) {
++	// Protocol creation checks layout and mapping, not producer readiness. It
++	// must not wait for client fences or touch pixels before an actual read.
++	struct pixman_dmabuf_buffer *buffer = map_attributes(drm_fd, a);
++	return buffer != NULL && finish_mapping(buffer);
++}
++
++static bool buffer_begin_access(struct wlr_buffer *base, uint32_t flags,
++		void **data, uint32_t *format, size_t *stride) {
++	struct pixman_dmabuf_buffer *buffer = wl_container_of(base, buffer, base);
++	if (flags != WLR_BUFFER_DATA_PTR_ACCESS_READ || !begin_read(buffer)) {
++		return false;
++	}
++	*data = (char *)buffer->mapping + buffer->offset;
++	*format = buffer->format;
++	*stride = buffer->stride;
++	return true;
++}
++
++static void buffer_end_access(struct wlr_buffer *base) {
++	struct pixman_dmabuf_buffer *buffer = wl_container_of(base, buffer, base);
++	end_read(buffer);
++}
++
++static const struct wlr_buffer_impl dmabuf_impl = {
++	.destroy = buffer_destroy,
++	.begin_data_ptr_access = buffer_begin_access,
++	.end_data_ptr_access = buffer_end_access,
++};
++
++bool pixman_dmabuf_buffer_is_imported(struct wlr_buffer *buffer) {
++	return buffer != NULL && buffer->impl == &dmabuf_impl;
++}
++
++void pixman_dmabuf_get_mapping(struct wlr_buffer *base,
++		void **data, uint32_t *format, size_t *stride) {
++	assert(pixman_dmabuf_buffer_is_imported(base));
++	struct pixman_dmabuf_buffer *buffer = wl_container_of(base, buffer, base);
++	*data = (char *)buffer->mapping + buffer->offset;
++	*format = buffer->format;
++	*stride = buffer->stride;
++}
++
++bool pixman_dmabuf_buffer_ok(struct wlr_buffer *base) {
++	if (!pixman_dmabuf_buffer_is_imported(base)) {
++		return true;
++	}
++	struct pixman_dmabuf_buffer *buffer = wl_container_of(base, buffer, base);
++	return !buffer->failed;
++}
++
++struct wlr_buffer *pixman_dmabuf_import(int drm_fd, struct wlr_buffer *source) {
++	struct wlr_dmabuf_attributes a;
++	if (drm_fd < 0 || !wlr_buffer_get_dmabuf(source, &a) ||
++			a.width != source->width || a.height != source->height) {
++		return NULL;
++	}
++	struct pixman_dmabuf_buffer *buffer = map_attributes(drm_fd, &a);
++	if (buffer == NULL) {
++		return NULL;
++	}
++	wlr_buffer_init(&buffer->base, &dmabuf_impl, a.width, a.height);
++	buffer->source = wlr_buffer_lock(source);
++	return &buffer->base;
++}
++
++int pixman_dmabuf_open_device(int drm_fd) {
++	int fd = reopen_device(drm_fd);
++	if (fd < 0) {
++		return -1;
++	}
++	uint64_t caps = 0;
++	if (drmGetCap(fd, DRM_CAP_PRIME, &caps) < 0 || !(caps & DRM_PRIME_CAP_IMPORT)) {
++		close(fd);
++		return -1;
++	}
++	// Prove the selected node's complete import path before advertising it.
++	uint32_t handle = 0, stride;
++	uint64_t size;
++	int prime_fd = -1;
++	bool ok = false;
++	if (drmModeCreateDumbBuffer(fd, 1, 1, 32, 0, &handle, &stride, &size) == 0 &&
++			drmPrimeHandleToFD(fd, handle, DRM_CLOEXEC, &prime_fd) == 0) {
++		struct wlr_dmabuf_attributes a = {
++			.width = 1, .height = 1, .format = DRM_FORMAT_XRGB8888,
++			.modifier = DRM_FORMAT_MOD_LINEAR, .n_planes = 1,
++			.fd = { prime_fd }, .stride = { stride },
++		};
++		struct pixman_dmabuf_buffer *buffer = map_attributes(fd, &a);
++		if (buffer != NULL) {
++			ok = begin_read(buffer);
++			if (ok) {
++				ok = end_read(buffer);
++			}
++			ok = finish_mapping(buffer) && ok;
++		}
++	}
++	if (prime_fd >= 0) {
++		close(prime_fd);
++	}
++	if (handle != 0) {
++		drmModeDestroyDumbBuffer(fd, handle);
++	}
++	if (!ok) {
++		close(fd);
++		return -1;
++	}
++	return fd;
++}
+--- a/render/pixman/dmabuf_wait.c
++++ b/render/pixman/dmabuf_wait.c
+@@ -0,0 +1,188 @@
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <wayland-server-core.h>
++#include <wlr/interfaces/wlr_buffer.h>
++#include <wlr/render/pixman.h>
++#include <wlr/types/wlr_compositor.h>
++#include "render/pixman_dmabuf.h"
++
++struct pixman_dmabuf_wait {
++	struct wlr_surface *surface;
++	struct wlr_renderer *renderer;
++	struct wl_event_loop *loop;
++	struct wl_event_source *fd_source, *timer;
++	struct wl_listener surface_destroy, renderer_destroy, renderer_lost;
++	uint32_t seq;
++	int fd, retry_ms;
++};
++
++// -2 is an interrupted check, not readiness. Retrying it is timer-paced so a
++// readable fd plus repeated EINTR/EAGAIN cannot spin the Wayland event loop.
++static int dmabuf_read_ready(int fd) {
++	struct pollfd pfd = { .fd = fd, .events = POLLIN };
++	int ret = poll(&pfd, 1, 0);
++	if (ret < 0) {
++		return errno == EINTR || errno == EAGAIN ? -2 : -1;
++	}
++	if (ret == 0) {
++		return 0;
++	}
++	if (ret != 1 || !(pfd.revents & POLLIN) ||
++			(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
++		return -1;
++	}
++	return 1;
++}
++
++static void dmabuf_wait_destroy(struct pixman_dmabuf_wait *wait) {
++	if (wait->fd_source != NULL) {
++		wl_event_source_remove(wait->fd_source);
++	}
++	if (wait->timer != NULL) {
++		wl_event_source_remove(wait->timer);
++	}
++	wl_list_remove(&wait->surface_destroy.link);
++	wl_list_remove(&wait->renderer_destroy.link);
++	wl_list_remove(&wait->renderer_lost.link);
++	close(wait->fd);
++	free(wait);
++}
++
++static void dmabuf_wait_fail(struct pixman_dmabuf_wait *wait) {
++	wl_client_post_implementation_error(wl_resource_get_client(wait->surface->resource),
++		"Pixman DMA-BUF producer fence failed or renderer was reset");
++	// Do not unlock an unsignaled commit. Client teardown destroys its cached
++	// states and releases their buffers without importing or presenting them.
++	dmabuf_wait_destroy(wait);
++}
++
++static void dmabuf_wait_surface_destroy(struct wl_listener *listener, void *data) {
++	(void)data;
++	struct pixman_dmabuf_wait *wait = wl_container_of(listener, wait, surface_destroy);
++	// In particular, don't call unlock_cached here: it may apply cached states
++	// and emit commit callbacks while the surface is being destroyed.
++	dmabuf_wait_destroy(wait);
++}
++
++static void dmabuf_wait_renderer_destroy(struct wl_listener *listener, void *data) {
++	(void)data;
++	struct pixman_dmabuf_wait *wait = wl_container_of(listener, wait, renderer_destroy);
++	dmabuf_wait_fail(wait);
++}
++
++static void dmabuf_wait_renderer_lost(struct wl_listener *listener, void *data) {
++	(void)data;
++	struct pixman_dmabuf_wait *wait = wl_container_of(listener, wait, renderer_lost);
++	dmabuf_wait_fail(wait);
++}
++
++static int dmabuf_wait_fd(int fd, uint32_t mask, void *data);
++static int dmabuf_wait_timer(void *data);
++
++static bool dmabuf_wait_arm(struct pixman_dmabuf_wait *wait, int ready) {
++	if (ready == 0) {
++		wait->retry_ms = 0;
++		if (wait->fd_source == NULL) {
++			wait->fd_source = wl_event_loop_add_fd(wait->loop, wait->fd,
++				WL_EVENT_READABLE, dmabuf_wait_fd, wait);
++		}
++		return wait->fd_source != NULL;
++	}
++	if (wait->fd_source != NULL) {
++		wl_event_source_remove(wait->fd_source);
++		wait->fd_source = NULL;
++	}
++	if (wait->timer == NULL) {
++		wait->timer = wl_event_loop_add_timer(wait->loop, dmabuf_wait_timer, wait);
++	}
++	wait->retry_ms = wait->retry_ms == 0 ? 16 : wait->retry_ms * 2;
++	if (wait->retry_ms > 250) {
++		wait->retry_ms = 250;
++	}
++	return wait->timer != NULL && wl_event_source_timer_update(wait->timer, wait->retry_ms) == 0;
++}
++
++static void dmabuf_wait_check(struct pixman_dmabuf_wait *wait, bool failed) {
++	int ready = failed ? -1 : dmabuf_read_ready(wait->fd);
++	if (ready == -1 || wait->surface->compositor->renderer != wait->renderer) {
++		dmabuf_wait_fail(wait);
++	} else if (ready == 1) {
++		struct wlr_surface *surface = wait->surface;
++		uint32_t seq = wait->seq;
++		// Remove all callbacks before unlocking, which can synchronously emit
++		// commit/damage callbacks and destroy the renderer or surface.
++		dmabuf_wait_destroy(wait);
++		wlr_surface_unlock_cached(surface, seq);
++	} else if (!dmabuf_wait_arm(wait, ready)) {
++		dmabuf_wait_fail(wait);
++	}
++}
++
++static int dmabuf_wait_fd(int fd, uint32_t mask, void *data) {
++	(void)fd;
++	dmabuf_wait_check(data, mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP));
++	return 0;
++}
++
++static int dmabuf_wait_timer(void *data) {
++	dmabuf_wait_check(data, false);
++	return 0;
++}
++
++bool pixman_dmabuf_lock_surface(struct wlr_surface *surface) {
++	struct wlr_renderer *renderer = surface->compositor->renderer;
++	struct wlr_buffer *buffer = surface->pending.buffer;
++	if (renderer == NULL || !wlr_renderer_is_pixman(renderer) ||
++			!(surface->pending.committed & WLR_SURFACE_STATE_BUFFER) ||
++			buffer == NULL || buffer->impl->begin_data_ptr_access != NULL) {
++		return true;
++	}
++	struct wlr_dmabuf_attributes a;
++	if (!wlr_buffer_get_dmabuf(buffer, &a) || a.n_planes != 1 || a.fd[0] < 0) {
++		return false;
++	}
++	int ready = dmabuf_read_ready(a.fd[0]);
++	if (ready == 1 || ready == -1) {
++		return ready == 1;
++	}
++	// Bound waiter descriptors per surface, including clients that submit new
++	// commits while an earlier producer remains busy. Never drop their ordering.
++	size_t count = 0;
++	struct wl_listener *listener;
++	wl_list_for_each(listener, &surface->events.destroy.listener_list, link) {
++		count += listener->notify == dmabuf_wait_surface_destroy;
++	}
++	if (count >= 64) {
++		return false;
++	}
++	struct pixman_dmabuf_wait *wait = calloc(1, sizeof(*wait));
++	if (wait == NULL) {
++		return false;
++	}
++	wait->fd = fcntl(a.fd[0], F_DUPFD_CLOEXEC, 0);
++	if (wait->fd < 0) {
++		free(wait);
++		return false;
++	}
++	wait->surface = surface;
++	wait->renderer = renderer;
++	wait->loop = wl_display_get_event_loop(wl_client_get_display(
++		wl_resource_get_client(surface->resource)));
++	wait->surface_destroy.notify = dmabuf_wait_surface_destroy;
++	wait->renderer_destroy.notify = dmabuf_wait_renderer_destroy;
++	wait->renderer_lost.notify = dmabuf_wait_renderer_lost;
++	wl_signal_add(&surface->events.destroy, &wait->surface_destroy);
++	wl_signal_add(&renderer->events.destroy, &wait->renderer_destroy);
++	wl_signal_add(&renderer->events.lost, &wait->renderer_lost);
++	if (!dmabuf_wait_arm(wait, ready)) {
++		dmabuf_wait_destroy(wait);
++		return false;
++	}
++	// The pending/cached state owns the buffer lock. Our duplicate keeps the fd
++	// valid even if the client destroys wl_buffer while this commit is queued.
++	wait->seq = wlr_surface_lock_pending(surface);
++	return true;
++}
+--- a/render/pixman/meson.build
++++ b/render/pixman/meson.build
+@@ -3,6 +3,8 @@
+ wlr_deps += pixman
+ 
+ wlr_files += files(
++	'dmabuf.c',
++	'dmabuf_wait.c',
+ 	'pass.c',
+ 	'pixel_format.c',
+ 	'renderer.c',
+--- a/render/pixman/pass.c
++++ b/render/pixman/pass.c
+@@ -1,6 +1,7 @@
+ #include <assert.h>
+ #include <stdlib.h>
+ #include "render/pixman.h"
++#include "render/pixman_dmabuf.h"
+ 
+ static const struct wlr_render_pass_impl render_pass_impl;
+ 
+@@ -21,9 +22,10 @@
+ 
+ 	wlr_buffer_end_data_ptr_access(pass->buffer->buffer);
+ 	wlr_buffer_unlock(pass->buffer->buffer);
++	bool ok = !pass->failed;
+ 	free(pass);
+ 
+-	return true;
++	return ok;
+ }
+ 
+ static pixman_op_t get_pixman_blending(enum wlr_render_blend_mode mode) {
+@@ -44,6 +46,7 @@
+ 
+ 	if (texture->buffer != NULL && !begin_pixman_data_ptr_access(texture->buffer,
+ 			&texture->image, WLR_BUFFER_DATA_PTR_ACCESS_READ)) {
++		pass->failed = true;
+ 		return;
+ 	}
+ 
+@@ -192,6 +195,7 @@
+ 
+ 	if (texture->buffer != NULL) {
+ 		wlr_buffer_end_data_ptr_access(texture->buffer);
++		pass->failed |= !pixman_dmabuf_buffer_ok(texture->buffer);
+ 	}
+ 
+ 	if (mask != NULL) {
+--- a/render/pixman/renderer.c
++++ b/render/pixman/renderer.c
+@@ -2,12 +2,14 @@
+ #include <drm_fourcc.h>
+ #include <pixman.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <wayland-util.h>
+ #include <wlr/render/interface.h>
+ #include <wlr/util/box.h>
+ #include <wlr/util/log.h>
+ 
+ #include "render/pixman.h"
++#include "render/pixman_dmabuf.h"
+ #include "types/wlr_buffer.h"
+ 
+ static const struct wlr_renderer_impl renderer_impl;
+@@ -106,13 +108,24 @@
+ 
+ 	pixman_image_t *dst = pixman_image_create_bits_no_clear(fmt,
+ 			src.width, src.height, p, options->stride);
++	if (dst == NULL) {
++		return false;
++	}
++	if (texture->buffer != NULL && !begin_pixman_data_ptr_access(texture->buffer,
++			&texture->image, WLR_BUFFER_DATA_PTR_ACCESS_READ)) {
++		pixman_image_unref(dst);
++		return false;
++	}
+ 
+ 	pixman_image_composite32(PIXMAN_OP_SRC, texture->image, NULL, dst,
+ 			src.x, src.y, 0, 0, 0, 0, src.width, src.height);
+ 
+ 	pixman_image_unref(dst);
+ 
+-	return true;
++	if (texture->buffer != NULL) {
++		wlr_buffer_end_data_ptr_access(texture->buffer);
++	}
++	return pixman_dmabuf_buffer_ok(texture->buffer);
+ }
+ 
+ static uint32_t pixman_texture_preferred_read_format(struct wlr_texture *wlr_texture) {
+@@ -198,6 +211,8 @@
+ 	struct wlr_pixman_renderer *renderer = get_renderer(wlr_renderer);
+ 	if (buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
+ 		return &renderer->drm_formats;
++	} else if ((buffer_caps & WLR_BUFFER_CAP_DMABUF) && renderer->drm_fd >= 0) {
++		return &renderer->dmabuf_formats;
+ 	} else {
+ 		return NULL;
+ 	}
+@@ -244,20 +259,36 @@
+ static struct wlr_texture *pixman_texture_from_buffer(
+ 		struct wlr_renderer *wlr_renderer, struct wlr_buffer *buffer) {
+ 	struct wlr_pixman_renderer *renderer = get_renderer(wlr_renderer);
++	struct wlr_buffer *imported = NULL;
++	// SHM and compositor-owned DRM dumb buffers retain their DATA_PTR path.
++	if (buffer->impl->begin_data_ptr_access == NULL) {
++		imported = pixman_dmabuf_import(renderer->drm_fd, buffer);
++		if (imported == NULL) {
++			return NULL;
++		}
++		buffer = imported;
++	}
+ 
+ 	void *data = NULL;
+ 	uint32_t drm_format;
+ 	size_t stride;
+-	if (!wlr_buffer_begin_data_ptr_access(buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ,
+-			&data, &drm_format, &stride)) {
+-		return NULL;
++	if (imported != NULL) {
++		// Creating a Pixman image does not read pixels. Do not acquire a CPU
++		// scope here: surface commits wait asynchronously for producer fences,
++		// and rendering/readback acquire READ scopes around actual access.
++		pixman_dmabuf_get_mapping(buffer, &data, &drm_format, &stride);
++	} else {
++		if (!wlr_buffer_begin_data_ptr_access(buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ,
++				&data, &drm_format, &stride)) {
++			goto error;
++		}
++		wlr_buffer_end_data_ptr_access(buffer);
+ 	}
+-	wlr_buffer_end_data_ptr_access(buffer);
+ 
+ 	struct wlr_pixman_texture *texture = pixman_texture_create(renderer,
+ 		drm_format, buffer->width, buffer->height);
+ 	if (texture == NULL) {
+-		return NULL;
++		goto error;
+ 	}
+ 
+ 	texture->image = pixman_image_create_bits_no_clear(texture->format,
+@@ -266,12 +297,17 @@
+ 		wlr_log(WLR_ERROR, "Failed to create pixman image");
+ 		wl_list_remove(&texture->link);
+ 		free(texture);
+-		return NULL;
++		goto error;
+ 	}
+ 
+ 	texture->buffer = wlr_buffer_lock(buffer);
++	wlr_buffer_drop(imported);
+ 
+ 	return &texture->wlr_texture;
++
++error:
++	wlr_buffer_drop(imported);
++	return NULL;
+ }
+ 
+ static void pixman_destroy(struct wlr_renderer *wlr_renderer) {
+@@ -288,6 +324,10 @@
+ 	}
+ 
+ 	wlr_drm_format_set_finish(&renderer->drm_formats);
++	wlr_drm_format_set_finish(&renderer->dmabuf_formats);
++	if (renderer->drm_fd >= 0) {
++		close(renderer->drm_fd);
++	}
+ 
+ 	free(renderer);
+ }
+@@ -311,7 +351,12 @@
+ 	return &pass->base;
+ }
+ 
++static int pixman_get_drm_fd(struct wlr_renderer *wlr_renderer) {
++	return get_renderer(wlr_renderer)->drm_fd;
++}
++
+ static const struct wlr_renderer_impl renderer_impl = {
++	.get_drm_fd = pixman_get_drm_fd,
+ 	.get_texture_formats = pixman_get_texture_formats,
+ 	.get_render_formats = pixman_get_render_formats,
+ 	.texture_from_buffer = pixman_texture_from_buffer,
+@@ -319,7 +364,7 @@
+ 	.begin_buffer_pass = pixman_begin_buffer_pass,
+ };
+ 
+-struct wlr_renderer *wlr_pixman_renderer_create(void) {
++struct wlr_renderer *pixman_renderer_create_with_drm_fd(int drm_fd) {
+ 	struct wlr_pixman_renderer *renderer = calloc(1, sizeof(*renderer));
+ 	if (renderer == NULL) {
+ 		return NULL;
+@@ -330,6 +375,12 @@
+ 	renderer->wlr_renderer.features.output_color_transform = false;
+ 	wl_list_init(&renderer->buffers);
+ 	wl_list_init(&renderer->textures);
++	renderer->drm_fd = pixman_dmabuf_open_device(drm_fd);
++	if (renderer->drm_fd >= 0 &&
++			!pixman_dmabuf_add_formats(&renderer->dmabuf_formats)) {
++		pixman_destroy(&renderer->wlr_renderer);
++		return NULL;
++	}
+ 
+ 	size_t len = 0;
+ 	const uint32_t *formats = get_pixman_drm_formats(&len);
+@@ -344,6 +395,10 @@
+ 	return &renderer->wlr_renderer;
+ }
+ 
++struct wlr_renderer *wlr_pixman_renderer_create(void) {
++	return pixman_renderer_create_with_drm_fd(-1);
++}
++
+ pixman_image_t *wlr_pixman_renderer_get_buffer_image(
+ 		struct wlr_renderer *wlr_renderer, struct wlr_buffer *wlr_buffer) {
+ 	struct wlr_pixman_renderer *renderer = get_renderer(wlr_renderer);
+@@ -359,5 +414,9 @@
+ 
+ pixman_image_t *wlr_pixman_texture_get_image(struct wlr_texture *wlr_texture) {
+ 	struct wlr_pixman_texture *texture = get_texture(wlr_texture);
++	// This API cannot bracket the caller's reads with DMA-BUF synchronization.
++	if (pixman_dmabuf_buffer_is_imported(texture->buffer)) {
++		return NULL;
++	}
+ 	return texture->image;
+ }
+--- a/render/wlr_renderer.c
++++ b/render/wlr_renderer.c
+@@ -26,6 +26,7 @@
+ #endif // WLR_HAS_VULKAN_RENDERER
+ 
+ #include "render/wlr_renderer.h"
++#include "render/pixman.h"
+ #include "util/env.h"
+ 
+ extern void pinecone_pixman_begin_render_pass(void) __attribute__((weak));
+@@ -269,7 +270,12 @@
+ 	}
+ 
+ 	if ((is_auto && !has_render_node(backend)) || strcmp(renderer_name, "pixman") == 0) {
+-		renderer = wlr_pixman_renderer_create();
++		int pixman_fd = drm_fd;
++		if (pixman_fd < 0 && backend != NULL &&
++				!env_parse_bool("WLR_RENDERER_FORCE_SOFTWARE")) {
++			pixman_fd = wlr_backend_get_drm_fd(backend);
++		}
++		renderer = pixman_renderer_create_with_drm_fd(pixman_fd);
+ 		if (renderer) {
+ 			goto out;
+ 		} else {
+--- a/types/wlr_compositor.c
++++ b/types/wlr_compositor.c
+@@ -11,6 +11,7 @@
+ #include <wlr/util/region.h>
+ #include <wlr/util/transform.h>
+ #include "types/wlr_buffer.h"
++#include "render/pixman_dmabuf.h"
+ #include "types/wlr_region.h"
+ #include "types/wlr_subcompositor.h"
+ #include "util/array.h"
+@@ -585,6 +586,11 @@
+ 	}
+ 
+ 	wl_signal_emit_mutable(&surface->events.client_commit, NULL);
++	if (!surface->pending_rejected && !pixman_dmabuf_lock_surface(surface)) {
++		// No state, geometry or buffer replacement is applied on fence failure.
++		surface->pending_rejected = true;
++		wl_client_post_implementation_error(client, "Cannot wait for Pixman DMA-BUF producer");
++	}
+ 
+ 	surface->handling_commit = false;
+ 	if (surface->pending_rejected) {
+--- a/types/wlr_linux_dmabuf_v1.c
++++ b/types/wlr_linux_dmabuf_v1.c
+@@ -1,4 +1,6 @@
+ #include <assert.h>
++#include <wlr/render/pixman.h>
++#include "render/pixman_dmabuf.h"
+ #include <drm_fourcc.h>
+ #include <fcntl.h>
+ #include <stdlib.h>
+@@ -990,7 +992,24 @@
+ 	free(linux_dmabuf);
+ 	return NULL;
+ }
++
++struct pixman_import_check {
++	int drm_fd;
++	struct wl_listener destroy;
++};
+ 
++static bool check_import_pixman(struct wlr_dmabuf_attributes *attribs, void *data) {
++	struct pixman_import_check *check = data;
++	return pixman_dmabuf_check_import(check->drm_fd, attribs);
++}
++
++static void handle_pixman_check_destroy(struct wl_listener *listener, void *data) {
++	struct pixman_import_check *check = wl_container_of(listener, check, destroy);
++	wl_list_remove(&check->destroy.link);
++	close(check->drm_fd);
++	free(check);
++}
++
+ struct wlr_linux_dmabuf_v1 *wlr_linux_dmabuf_v1_create_with_renderer(struct wl_display *display,
+ 		uint32_t version, struct wlr_renderer *renderer) {
+ 	const struct wlr_linux_dmabuf_feedback_v1_init_options options = {
+@@ -1003,6 +1022,22 @@
+ 	struct wlr_linux_dmabuf_v1 *linux_dmabuf =
+ 		wlr_linux_dmabuf_v1_create(display, version, &feedback);
+ 	wlr_linux_dmabuf_feedback_v1_finish(&feedback);
++	if (linux_dmabuf != NULL && wlr_renderer_is_pixman(renderer)) {
++		struct pixman_import_check *check = calloc(1, sizeof(*check));
++		if (check == NULL) {
++			linux_dmabuf_v1_destroy(linux_dmabuf);
++			return NULL;
++		}
++		check->drm_fd = fcntl(wlr_renderer_get_drm_fd(renderer), F_DUPFD_CLOEXEC, 0);
++		if (check->drm_fd < 0) {
++			free(check);
++			linux_dmabuf_v1_destroy(linux_dmabuf);
++			return NULL;
++		}
++		check->destroy.notify = handle_pixman_check_destroy;
++		wl_signal_add(&linux_dmabuf->events.destroy, &check->destroy);
++		wlr_linux_dmabuf_v1_set_check_dmabuf_callback(linux_dmabuf, check_import_pixman, check);
++	}
+ 	return linux_dmabuf;
+ }
+ 

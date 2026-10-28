@@ -407,6 +407,127 @@ func runScaling(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
     return nil
 }
 
+#if PINECONE_TEST_SIMULATOR_COPY
+func runOverlappingReadSnapshots(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
+    final class Results {
+        let lock = NSLock()
+        var succeeded = true
+        func record(_ value: Bool) {
+            lock.lock()
+            succeeded = succeeded && value
+            lock.unlock()
+        }
+    }
+    guard let device = MTLCreateSystemDefaultDevice(), let event = device.makeSharedEvent(),
+          accelerator.enqueueTestWait(for: event, value: 1) else {
+        return "cannot gate overlapping staging regression"
+    }
+    defer { event.signaledValue = 1 }
+    let source = Allocation(byteCount: 16)
+    let first = Allocation(byteCount: 16)
+    let second = Allocation(byteCount: 16)
+    let sourceSurface = source.surface(id: 940_001, width: 1, height: 1, stride: 16, format: .argb)
+    let group = DispatchGroup()
+    let results = Results()
+    func submit(_ destination: Allocation, id: UInt32) -> Bool {
+        let target = destination.surface(id: id, width: 1, height: 1, stride: 16, format: .argb)
+        let command = PineconeGraphicsCommand(
+            operation: .source, sourceResourceID: sourceSurface.resourceID,
+            destinationResourceID: id, sourceX: 0, sourceY: 0, sourceWidth: 1, sourceHeight: 1,
+            destinationRectangle: PineconeGraphicsRectangle(x: 0, y: 0, width: 1, height: 1),
+            sourceContainsAlpha: true, blendOperator: .source)
+        group.enter()
+        let accepted = accelerator.executeBatchAsync([
+            PineconeGraphicsWorkItem(command: command, source: sourceSurface, mask: nil, destination: target)
+        ]) { succeeded in
+            results.record(succeeded)
+            group.leave()
+        }
+        if !accepted { group.leave() }
+        return accepted
+    }
+    write(0xff123456, format: .argb, x: 0, y: 0, stride: 16, to: source.pointer)
+    let acceptedFirst = submit(first, id: 940_002)
+    // The GPU cannot run yet. A second CPU upload must not overwrite its source
+    // staging buffer, even though both commands refer to the same resource ID.
+    write(0xffabcdef, format: .argb, x: 0, y: 0, stride: 16, to: source.pointer)
+    let acceptedSecond = submit(second, id: 940_003)
+    event.signaledValue = 1
+    guard group.wait(timeout: .now() + 10) == .success else {
+        return "overlapping staging completions timed out"
+    }
+    guard acceptedFirst, acceptedSecond, results.succeeded else {
+        return "overlapping staging submission failed"
+    }
+    guard read(format: .argb, x: 0, y: 0, stride: 16, from: first.pointer) == 0xff123456,
+          read(format: .argb, x: 0, y: 0, stride: 16, from: second.pointer) == 0xffabcdef else {
+        return "overlapping read submissions shared a mutable Metal staging buffer"
+    }
+    return nil
+}
+#endif
+
+func runCostTelemetry(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
+    accelerator.reset()
+    let storage = Allocation(byteCount: 128)
+    let target = storage.surface(id: 950_001, width: 8, height: 4, stride: 32, format: .argb)
+    func item(packed: Bool = false) -> PineconeGraphicsWorkItem {
+        PineconeGraphicsWorkItem(command: PineconeGraphicsCommand(
+            operation: .fillOver, sourceResourceID: 0, destinationResourceID: target.resourceID,
+            sourceX: 0, sourceY: 0,
+            destinationRectangle: PineconeGraphicsRectangle(x: 1, y: 1, width: 3, height: 2),
+            color: 0x80402010, destinationIsPackedA8: packed),
+            source: nil, mask: nil, destination: target)
+    }
+    guard accelerator.executeBatch([item()]) else { return "telemetry draw rejected" }
+    let costs = accelerator.performanceCounters
+    guard costs["completedCommands"] == 1, costs["completedPixels"] == 6,
+          (costs["preparationMilliseconds"] ?? 0) > 0 else {
+        return "command preparation cost counters incorrect"
+    }
+#if PINECONE_TEST_SIMULATOR_COPY
+    guard costs["inputCopyBytes"] == 24, costs["outputCopyBytes"] == 24,
+          (costs["inputCopyMilliseconds"] ?? 0) > 0,
+          (costs["outputCopyMilliseconds"] ?? 0) > 0 else {
+        return "Simulator rectangle copy counters incorrect: \(costs)"
+    }
+#else
+    guard costs["inputCopyBytes"] == 0, costs["outputCopyBytes"] == 0 else {
+        return "direct Metal must not report Simulator staging bytes"
+    }
+#endif
+    guard !accelerator.acceptsBatch([item(), item(packed: true)]),
+          accelerator.performanceCounters["rejectedEligibility.mixedPackedFormats.checks"] == 1,
+          accelerator.performanceCounters["rejectedEligibility.mixedPackedFormats.pixels"] == 12 else {
+        return "mixed packed formats rejection counters incorrect"
+    }
+    accelerator.discardSurface(resourceID: target.resourceID)
+    guard accelerator.executeBatch([item()]) else { return "discard/reuse rejected" }
+    accelerator.reset()
+    let reset = accelerator.performanceCounters
+    for key in ["completedCommands", "completedPixels", "preparationMilliseconds",
+                "gpuExecutionMilliseconds", "inputCopyBytes", "outputCopyBytes",
+                "inputCopyMilliseconds", "outputCopyMilliseconds"] {
+        if reset[key] != 0 { return "reset retained \(key)" }
+    }
+    if reset.keys.contains(where: { $0.hasPrefix("rejectedEligibility.") }) {
+        return "reset retained rejection checks"
+    }
+    let savedThreshold = ProcessInfo.processInfo.environment["PINECONE_METAL_MIN_PIXELS"]
+    setenv("PINECONE_METAL_MIN_PIXELS", "100", 1)
+    defer {
+        if let savedThreshold { setenv("PINECONE_METAL_MIN_PIXELS", savedThreshold, 1) }
+        else { unsetenv("PINECONE_METAL_MIN_PIXELS") }
+    }
+    guard let threshold = PineconeMetalGraphicsAccelerator(),
+          !threshold.acceptsBatch([item()]),
+          threshold.performanceCounters["rejectedEligibility.belowThreshold.checks"] == 1,
+          threshold.performanceCounters["rejectedEligibility.belowThreshold.pixels"] == 6 else {
+        return "threshold rejection counters incorrect"
+    }
+    return nil
+}
+
 guard CommandLine.arguments.count == 2 else {
     fputs("usage: metal-differential GOLDEN-CASES\n", stderr)
     exit(2)
@@ -436,8 +557,18 @@ if let failure = runPartialBatch(accelerator: accelerator) {
     fputs(failure + "\n", stderr)
     failures += 1
 }
+#if PINECONE_TEST_SIMULATOR_COPY
+if let failure = runOverlappingReadSnapshots(accelerator: accelerator) {
+    fputs(failure + "\n", stderr)
+    failures += 1
+}
+#endif
+if let failure = runCostTelemetry(accelerator: accelerator) {
+    fputs(failure + "\n", stderr)
+    failures += 1
+}
 guard failures == 0 else {
     fputs("Metal differential failed after \(failures) mismatches\n", stderr)
     exit(1)
 }
-print("Metal compositor matches Pixman for \(cases.count) cases")
+print("Metal compositor matches Pixman for \(cases.count) cases; copy/rejection/reset telemetry passed")

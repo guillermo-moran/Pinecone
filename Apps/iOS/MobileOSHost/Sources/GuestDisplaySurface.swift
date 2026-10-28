@@ -82,36 +82,34 @@ struct GuestDisplaySurface: UIViewRepresentable {
     }
 }
 
+@MainActor
 final class GuestDisplaySurfaceView: UIView {
     private let metalPresenter: MetalFramebufferPresenter?
-    private let fallbackImageView: UIImageView?
-    private var uploadedGeneration: UInt64?
+    private let fallbackImageView = UIImageView()
+    private let scheduler = FramePresentationScheduler()
+    private let stagingQueue = DispatchQueue(label: "pinecone.display-staging", qos: .userInteractive)
+    private var stagedFrame: StagedFramebuffer?
+    private var metalDisabled = false
+    private var displayLink: CADisplayLink?
+    private var lastLayoutSize: CGSize = .zero
     private weak var feed: GuestDisplayFeed?
     private var copyFrame: GuestDisplayFrameSource?
     private var onPresented: GuestDisplayPresentedHandler?
 
     override init(frame: CGRect) {
-        if let device = MTLCreateSystemDefaultDevice(),
-           let presenter = MetalFramebufferPresenter(device: device) {
-            metalPresenter = presenter
-            fallbackImageView = nil
-        } else {
-            metalPresenter = nil
-            fallbackImageView = UIImageView()
-        }
+        metalPresenter = MTLCreateSystemDefaultDevice().flatMap(MetalFramebufferPresenter.init)
         super.init(frame: frame)
-
         backgroundColor = .black
         isOpaque = true
         if let metalPresenter {
+            metalPresenter.view.isHidden = true
             addSubview(metalPresenter.view)
-        } else if let fallbackImageView {
-            fallbackImageView.backgroundColor = .black
-            fallbackImageView.contentMode = .scaleToFill
-            fallbackImageView.layer.magnificationFilter = .nearest
-            fallbackImageView.layer.minificationFilter = .nearest
-            addSubview(fallbackImageView)
         }
+        fallbackImageView.backgroundColor = .black
+        fallbackImageView.contentMode = .scaleToFill
+        fallbackImageView.layer.magnificationFilter = .nearest
+        fallbackImageView.layer.minificationFilter = .nearest
+        addSubview(fallbackImageView)
     }
 
     @available(*, unavailable)
@@ -119,11 +117,24 @@ final class GuestDisplaySurfaceView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        displayLink?.invalidate()
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         metalPresenter?.view.frame = bounds
-        fallbackImageView?.frame = bounds
-        metalPresenter?.requestDraw()
+        fallbackImageView.frame = bounds
+        if lastLayoutSize != bounds.size {
+            lastLayoutSize = bounds.size
+            scheduler.requestRedraw()
+            updateDisplayLink()
+        }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        updateDisplayLink()
     }
 
     func configure(
@@ -133,8 +144,19 @@ final class GuestDisplaySurfaceView: UIView {
     ) {
         self.copyFrame = copyFrame
         self.onPresented = onPresented
+        if displayLink == nil {
+            let target = GuestFramebufferDisplayLinkTarget(owner: self)
+            let link = CADisplayLink(target: target, selector: #selector(
+                GuestFramebufferDisplayLinkTarget.displayRefresh
+            ))
+            link.preferredFramesPerSecond = 60
+            link.isPaused = true
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
         guard self.feed !== feed else { return }
         self.feed?.detach(self)
+        resetFrame()
         self.feed = feed
         feed.attach(self)
     }
@@ -144,114 +166,264 @@ final class GuestDisplaySurfaceView: UIView {
         feed = nil
         copyFrame = nil
         onPresented = nil
+        resetFrame()
+        displayLink?.invalidate()
+        displayLink = nil
     }
 
     func resetFrame() {
-        uploadedGeneration = nil
-        fallbackImageView?.image = nil
-        metalPresenter?.reset()
+        scheduler.reset()
+        stagedFrame = nil
+        metalDisabled = false
+        fallbackImageView.image = nil
+        fallbackImageView.isHidden = false
+        metalPresenter?.view.isHidden = true
+        // A worker/command buffer still owns its slot and lease until completion.
+        updateDisplayLink()
     }
 
     fileprivate func present(advertisedMetadata: VirtualFramebufferFrameMetadata) {
-        guard let copyFrame, let onPresented else { return }
-        guard advertisedMetadata.generation != uploadedGeneration else {
-            metalPresenter?.requestDraw()
-            return
-        }
-
-        if let metalPresenter {
-            guard let lease = copyFrame(uploadedGeneration) else { return }
-            let metadata = lease.metadata
-            let uploadedBytes = lease.withUnsafeBytes {
-                metalPresenter.upload(metadata: metadata, bytes: $0)
-            }
-            let retainedLease = metalPresenter.requiresSourceLease ? lease : nil
-            uploadedGeneration = metadata.generation
-            metalPresenter.submit(
-                generation: metadata.generation,
-                uploadedBytes: uploadedBytes,
-                frameLease: retainedLease,
-                onPresented: onPresented
-            )
-            return
-        }
-
-        guard let lease = copyFrame(uploadedGeneration) else { return }
-        let copiedMetadata = lease.metadata
-        let frameData: Data? = lease.withUnsafeBytes { bytes in
-            guard bytes.count >= copiedMetadata.stride * copiedMetadata.height,
-                  let baseAddress = bytes.baseAddress else {
-                return nil
-            }
-            return Data(
-                bytes: baseAddress,
-                count: copiedMetadata.stride * copiedMetadata.height
-            )
-        }
-        guard let frameData,
-              let image = Self.makeFallbackImage(metadata: copiedMetadata, data: frameData) else {
-            return
-        }
-        uploadedGeneration = copiedMetadata.generation
-        fallbackImageView?.image = UIImage(cgImage: image)
-        onPresented(
-            copiedMetadata.generation,
-            frameData.count,
-            DispatchTime.now().uptimeNanoseconds
-        )
+        scheduler.receive(advertisedMetadata)
+        updateDisplayLink()
     }
 
-    private static func makeFallbackImage(
-        metadata: VirtualFramebufferFrameMetadata,
-        data: Data
-    ) -> CGImage? {
-        guard metadata.bytesPerPixel == 4,
-              metadata.stride >= metadata.width * metadata.bytesPerPixel,
-              data.count >= metadata.stride * metadata.height,
-              let provider = CGDataProvider(data: data as CFData) else {
-            return nil
+    private func updateDisplayLink() {
+        displayLink?.isPaused = window == nil || copyFrame == nil || !scheduler.needsRefresh
+    }
+
+    fileprivate func displayRefresh() {
+        guard window != nil, let copyFrame else {
+            updateDisplayLink()
+            return
         }
-        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
-            CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
-        )
-        return CGImage(
-            width: metadata.width,
-            height: metadata.height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: metadata.stride,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo,
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
+        if scheduler.readyUpload != nil {
+            presentReadyFrame()
+            updateDisplayLink()
+            return
+        }
+        guard let upload = scheduler.beginRefresh(acquireFrame: copyFrame) else {
+            updateDisplayLink()
+            return
+        }
+
+        // This is the only staging dispatch. The scheduler holds the reservation
+        // until upload/presentation retires, so neither reset nor bursts add jobs.
+        let previousFrame = stagedFrame
+        let device = metalDisabled ? nil : metalPresenter?.device
+        stagedFrame = nil
+        stagingQueue.async { [weak self] in
+            let frame = FramebufferStager.prepare(
+                lease: upload.lease, device: device, previousFrame: previousFrame
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let disposition = self.scheduler.finishUpload(upload.ticket, succeeded: frame != nil)
+                if disposition != .discarded {
+                    self.stagedFrame = frame
+                }
+                if disposition == .ready {
+                    // Refresh already paced acquisition; no second display-link delay.
+                    self.presentReadyFrame()
+                }
+                self.updateDisplayLink()
+            }
+        }
+        updateDisplayLink()
+    }
+
+    private func presentReadyFrame() {
+        guard window != nil, let upload = scheduler.readyUpload,
+              let frame = stagedFrame else { return }
+        if let image = frame.image {
+            fallbackImageView.image = UIImage(cgImage: image)
+            fallbackImageView.isHidden = false
+            metalPresenter?.view.isHidden = true
+            guard scheduler.markQueued(upload.ticket),
+                  scheduler.complete(upload.ticket, succeeded: true) else { return }
+            onPresented?(upload.lease.metadata.generation, frame.uploadedBytes,
+                         DispatchTime.now().uptimeNanoseconds)
+            return
+        }
+        guard frame.texture != nil, let metalPresenter else {
+            _ = scheduler.complete(upload.ticket, succeeded: false)
+            stagedFrame = nil
+            return
+        }
+        // Unhide before obtaining a drawable, but leave the CPU fallback visible
+        // until a successful Metal completion.
+        metalPresenter.view.isHidden = false
+        let submission = metalPresenter.present(frame: frame, lease: upload.lease) { [weak self, frame] succeeded, time in
+            guard let self else { return }
+            let current = self.scheduler.isCurrent(upload.ticket)
+            let presented = self.scheduler.complete(upload.ticket, succeeded: succeeded)
+            if presented {
+                self.fallbackImageView.isHidden = true
+                self.onPresented?(upload.lease.metadata.generation, frame.uploadedBytes, time)
+            } else if current && !succeeded {
+                self.metalDisabled = true
+                self.stagedFrame = nil
+            }
+            self.updateDisplayLink()
+        }
+        switch submission {
+        case .submitted:
+            _ = scheduler.markQueued(upload.ticket)
+        case .unavailable:
+            break // Keep the ready slot and retry drawable acquisition next refresh.
+        case .failed:
+            _ = scheduler.complete(upload.ticket, succeeded: false)
+            stagedFrame = nil
+            metalDisabled = true
+        }
     }
 }
 
-private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
-    let view: MTKView
+// Ownership moves to the serial worker only after the GPU reservation retires.
+// Shared textures are immutable and retain their source for the entire slot lifetime.
+private struct StagedFramebuffer: @unchecked Sendable {
+    let texture: MTLTexture?
+    let image: CGImage?
+    let uploadedBytes: Int
+    let sharedBuffer: MTLBuffer?
+    let sourceLease: VirtualFramebufferFrameLease?
+}
 
-    private let commandQueue: MTLCommandQueue
-    private let pipeline: MTLRenderPipelineState
-    private var texture: MTLTexture?
-    private var sharedBuffer: MTLBuffer?
-    private var sharedBufferAddress: UnsafeRawPointer?
-    private var sharedBufferLength = 0
-    private var textureUsesSharedStorage = false
-    private var displayLink: CADisplayLink?
-    private var pendingPresentation: (
-        generation: UInt64,
-        uploadedBytes: Int,
-        frameLease: VirtualFramebufferFrameLease?,
-        handler: GuestDisplayPresentedHandler
-    )?
-
+private enum FramebufferStager {
     private static let directSharedScanoutEnabled =
         ProcessInfo.processInfo.environment["PINECONE_DIRECT_SHARED_SCANOUT"] == "1"
 
-    var requiresSourceLease: Bool { textureUsesSharedStorage }
+    static func prepare(
+        lease: VirtualFramebufferFrameLease,
+        device: MTLDevice?,
+        previousFrame: StagedFramebuffer?
+    ) -> StagedFramebuffer? {
+        if let device, directSharedScanoutEnabled,
+           let frame = bindSharedTexture(lease: lease, device: device) {
+            return frame
+        }
+        // A shared texture is never a replace-region destination.
+        let texture = previousFrame?.sourceLease == nil ? previousFrame?.texture : nil
+        if let device, let frame = upload(lease: lease, device: device, previousTexture: texture) {
+            return frame
+        }
+        return makeFallbackImage(lease: lease)
+    }
+
+    private static func upload(
+        lease: VirtualFramebufferFrameLease,
+        device: MTLDevice,
+        previousTexture: MTLTexture?
+    ) -> StagedFramebuffer? {
+        let metadata = lease.metadata
+        let canReuseTexture = previousTexture?.width == metadata.width &&
+            previousTexture?.height == metadata.height
+        guard let plan = FramePresentationUploadPlan(
+            metadata: metadata, requiresFullUpload: !canReuseTexture
+        ) else { return nil }
+        return lease.withUnsafeBytes { bytes in
+            guard bytes.count >= plan.byteCount, let baseAddress = bytes.baseAddress else { return nil }
+            let texture: MTLTexture
+            if canReuseTexture, let previousTexture {
+                texture = previousTexture
+            } else {
+                let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .bgra8Unorm, width: metadata.width, height: metadata.height,
+                    mipmapped: false
+                )
+                descriptor.storageMode = .shared
+                descriptor.usage = .shaderRead
+                guard let allocated = device.makeTexture(descriptor: descriptor) else { return nil }
+                texture = allocated
+            }
+            var uploadedBytes = 0
+            for rectangle in plan.damage {
+                let offset = rectangle.y * metadata.stride + rectangle.x * metadata.bytesPerPixel
+                texture.replace(
+                    region: MTLRegionMake2D(rectangle.x, rectangle.y, rectangle.width, rectangle.height),
+                    mipmapLevel: 0, withBytes: baseAddress.advanced(by: offset),
+                    bytesPerRow: metadata.stride
+                )
+                uploadedBytes += rectangle.width * rectangle.height * metadata.bytesPerPixel
+            }
+            return StagedFramebuffer(texture: texture, image: nil, uploadedBytes: uploadedBytes,
+                                     sharedBuffer: nil, sourceLease: nil)
+        }
+    }
+
+    private static func bindSharedTexture(
+        lease: VirtualFramebufferFrameLease,
+        device: MTLDevice
+    ) -> StagedFramebuffer? {
+#if targetEnvironment(simulator)
+        // MTLSimDevice cannot wrap external storage through XPC.
+        return nil
+#else
+        let metadata = lease.metadata
+        guard metadata.hasStableStorage,
+              let plan = FramePresentationUploadPlan(metadata: metadata, requiresFullUpload: true) else {
+            return nil
+        }
+        return lease.withUnsafeBytes { bytes in
+            let pageSize = Int(getpagesize())
+            let rowAlignment = device.minimumLinearTextureAlignment(for: .bgra8Unorm)
+            guard let baseAddress = bytes.baseAddress, bytes.count >= plan.byteCount,
+                  pageSize > 0, rowAlignment > 0,
+                  Int(bitPattern: baseAddress) % pageSize == 0,
+                  bytes.count % pageSize == 0,
+                  metadata.stride % rowAlignment == 0,
+                  let buffer = device.makeBuffer(
+                    bytesNoCopy: UnsafeMutableRawPointer(mutating: baseAddress),
+                    length: bytes.count, options: .storageModeShared, deallocator: nil
+                  ) else { return nil }
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: metadata.width, height: metadata.height,
+                mipmapped: false
+            )
+            descriptor.storageMode = .shared
+            descriptor.usage = .shaderRead
+            guard let texture = buffer.makeTexture(
+                descriptor: descriptor, offset: 0, bytesPerRow: metadata.stride
+            ) else { return nil }
+            // No address cache: a binding belongs to this exact immutable lease.
+            return StagedFramebuffer(texture: texture, image: nil, uploadedBytes: 0,
+                                     sharedBuffer: buffer, sourceLease: lease)
+        }
+#endif
+    }
+
+    private static func makeFallbackImage(lease: VirtualFramebufferFrameLease) -> StagedFramebuffer? {
+        let metadata = lease.metadata
+        guard let plan = FramePresentationUploadPlan(metadata: metadata, requiresFullUpload: true) else {
+            return nil
+        }
+        return lease.withUnsafeBytes { bytes in
+            guard bytes.count >= plan.byteCount, let baseAddress = bytes.baseAddress else { return nil }
+            let data = Data(bytes: baseAddress, count: plan.byteCount)
+            guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+            let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+                CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
+            )
+            guard let image = CGImage(
+                width: metadata.width, height: metadata.height,
+                bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: metadata.stride,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo,
+                provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+            ) else { return nil }
+            return StagedFramebuffer(texture: nil, image: image, uploadedBytes: plan.byteCount,
+                                     sharedBuffer: nil, sourceLease: nil)
+        }
+    }
+}
+
+@MainActor
+private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
+    enum Submission { case submitted, unavailable, failed }
+
+    let device: MTLDevice
+    let view: MTKView
+    private let commandQueue: MTLCommandQueue
+    private let pipeline: MTLRenderPipelineState
+    private var drawFrame: (() -> Void)?
 
     init?(device: MTLDevice) {
         guard let commandQueue = device.makeCommandQueue(),
@@ -260,20 +432,16 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
               let fragmentFunction = library.makeFunction(name: "pineconeDisplayFragment") else {
             return nil
         }
-
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.vertexFunction = vertexFunction
         descriptor.fragmentFunction = fragmentFunction
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        guard let pipeline = try? device.makeRenderPipelineState(descriptor: descriptor) else {
-            return nil
-        }
-
+        guard let pipeline = try? device.makeRenderPipelineState(descriptor: descriptor) else { return nil }
+        self.device = device
         self.commandQueue = commandQueue
         self.pipeline = pipeline
         self.view = MTKView(frame: .zero, device: device)
         super.init()
-
         view.delegate = self
         view.colorPixelFormat = .bgra8Unorm
         view.clearColor = MTLClearColorMake(0, 0, 0, 1)
@@ -283,233 +451,47 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
         view.autoResizeDrawable = true
         view.isOpaque = true
         view.backgroundColor = .black
-
-        let target = MetalFramebufferDisplayLinkTarget(owner: self)
-        let displayLink = CADisplayLink(target: target, selector: #selector(
-            MetalFramebufferDisplayLinkTarget.displayRefresh
-        ))
-        displayLink.preferredFramesPerSecond = 60
-        displayLink.isPaused = true
-        displayLink.add(to: .main, forMode: .common)
-        self.displayLink = displayLink
     }
 
-    deinit {
-        displayLink?.invalidate()
-    }
-
-    func upload(
-        metadata: VirtualFramebufferFrameMetadata,
-        bytes: UnsafeRawBufferPointer
-    ) -> Int {
-        guard metadata.bytesPerPixel == 4,
-              metadata.width > 0,
-              metadata.height > 0,
-              metadata.stride >= metadata.width * metadata.bytesPerPixel,
-              bytes.count >= metadata.stride * metadata.height,
-              let baseAddress = bytes.baseAddress,
-              let device = view.device else {
-            return 0
-        }
-
-        if Self.directSharedScanoutEnabled,
-           metadata.hasStableStorage,
-           bindSharedTexture(
-               device: device,
-               metadata: metadata,
-               bytes: bytes,
-               baseAddress: baseAddress
-           ) {
-            return 0
-        }
-
-        sharedBuffer = nil
-        sharedBufferAddress = nil
-        sharedBufferLength = 0
-
-        let textureWasRecreated: Bool
-        if textureUsesSharedStorage ||
-            texture?.width != metadata.width || texture?.height != metadata.height {
-            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm,
-                width: metadata.width,
-                height: metadata.height,
-                mipmapped: false
-            )
-            descriptor.storageMode = .shared
-            descriptor.usage = .shaderRead
-            texture = device.makeTexture(descriptor: descriptor)
-            textureUsesSharedStorage = false
-            textureWasRecreated = true
-        } else {
-            textureWasRecreated = false
-        }
-        guard let texture else { return 0 }
-
-        let damage = textureWasRecreated
-            ? [VirtualFramebufferDamage(
-                x: 0,
-                y: 0,
-                width: metadata.width,
-                height: metadata.height
-            )]
-            : metadata.damage
-        var uploadedBytes = 0
-        for rectangle in damage {
-            guard rectangle.width > 0,
-                  rectangle.height > 0,
-                  rectangle.x >= 0,
-                  rectangle.y >= 0,
-                  rectangle.x + rectangle.width <= metadata.width,
-                  rectangle.y + rectangle.height <= metadata.height else {
-                continue
+    func present(
+        frame: StagedFramebuffer,
+        lease: VirtualFramebufferFrameLease,
+        completion: @escaping @MainActor @Sendable (Bool, UInt64) -> Void
+    ) -> Submission {
+        guard let texture = frame.texture else { return .failed }
+        var submission = Submission.unavailable
+        drawFrame = { [self] in
+            guard let descriptor = view.currentRenderPassDescriptor,
+                  let drawable = view.currentDrawable else { return }
+            guard let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+                submission = .failed
+                return
             }
-            let sourceOffset = rectangle.y * metadata.stride +
-                rectangle.x * metadata.bytesPerPixel
-            texture.replace(
-                region: MTLRegionMake2D(
-                    rectangle.x,
-                    rectangle.y,
-                    rectangle.width,
-                    rectangle.height
-                ),
-                mipmapLevel: 0,
-                withBytes: baseAddress.advanced(by: sourceOffset),
-                bytesPerRow: metadata.stride
-            )
-            uploadedBytes += rectangle.width * rectangle.height * metadata.bytesPerPixel
-        }
-        return uploadedBytes
-    }
-
-    private func bindSharedTexture(
-        device: MTLDevice,
-        metadata: VirtualFramebufferFrameMetadata,
-        bytes: UnsafeRawBufferPointer,
-        baseAddress: UnsafeRawPointer
-    ) -> Bool {
-#if targetEnvironment(simulator)
-        // MTLSimDevice traps while wrapping external storage through XPC.
-        // The simulator keeps the incremental replace-region path below.
-        return false
-#else
-        let pageSize = Int(getpagesize())
-        let rowAlignment = device.minimumLinearTextureAlignment(for: .bgra8Unorm)
-        guard pageSize > 0, rowAlignment > 0,
-              Int(bitPattern: baseAddress) % pageSize == 0,
-              bytes.count % pageSize == 0,
-              metadata.stride % rowAlignment == 0 else {
-            return false
-        }
-
-        if textureUsesSharedStorage,
-           sharedBufferAddress == baseAddress,
-           sharedBufferLength == bytes.count,
-           texture?.width == metadata.width,
-           texture?.height == metadata.height {
-            return true
-        }
-
-        guard let buffer = device.makeBuffer(
-            bytesNoCopy: UnsafeMutableRawPointer(mutating: baseAddress),
-            length: bytes.count,
-            options: .storageModeShared,
-            deallocator: nil
-        ) else {
-            return false
-        }
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
-            width: metadata.width,
-            height: metadata.height,
-            mipmapped: false
-        )
-        descriptor.storageMode = .shared
-        descriptor.usage = .shaderRead
-        guard let sharedTexture = buffer.makeTexture(
-            descriptor: descriptor,
-            offset: 0,
-            bytesPerRow: metadata.stride
-        ) else {
-            return false
-        }
-
-        sharedBuffer = buffer
-        sharedBufferAddress = baseAddress
-        sharedBufferLength = bytes.count
-        texture = sharedTexture
-        textureUsesSharedStorage = true
-        return true
-#endif
-    }
-
-    func submit(
-        generation: UInt64,
-        uploadedBytes: Int,
-        frameLease: VirtualFramebufferFrameLease?,
-        onPresented: @escaping GuestDisplayPresentedHandler
-    ) {
-        let accumulatedBytes = uploadedBytes + (pendingPresentation?.uploadedBytes ?? 0)
-        pendingPresentation = (generation, accumulatedBytes, frameLease, onPresented)
-        requestDraw()
-    }
-
-    func reset() {
-        texture = nil
-        sharedBuffer = nil
-        sharedBufferAddress = nil
-        sharedBufferLength = 0
-        textureUsesSharedStorage = false
-        pendingPresentation = nil
-        displayLink?.isPaused = true
-    }
-
-    func requestDraw() {
-        guard pendingPresentation != nil else { return }
-        displayLink?.isPaused = false
-    }
-
-    fileprivate func displayRefresh() {
-        guard pendingPresentation != nil else {
-            displayLink?.isPaused = true
-            return
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setFragmentTexture(texture, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            encoder.endEncoding()
+            commandBuffer.present(drawable)
+            commandBuffer.addCompletedHandler { [frame, lease] buffer in
+                let succeeded = buffer.status == .completed
+                let time = DispatchTime.now().uptimeNanoseconds
+                DispatchQueue.main.async {
+                    // Explicitly retain both source and destination across reset and
+                    // through GPU completion. No externally mutable scanout binding.
+                    withExtendedLifetime((frame, lease)) { completion(succeeded, time) }
+                }
+            }
+            commandBuffer.commit()
+            submission = .submitted
         }
         view.draw()
+        drawFrame = nil
+        return submission
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
-
-    func draw(in view: MTKView) {
-        guard let texture,
-              let descriptor = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable,
-              let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
-            return
-        }
-
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentTexture(texture, index: 0)
-        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        encoder.endEncoding()
-        commandBuffer.present(drawable)
-        let completedPresentation = pendingPresentation
-        pendingPresentation = nil
-        displayLink?.isPaused = true
-        if let completedPresentation {
-            commandBuffer.addCompletedHandler { _ in
-                let completedAt = DispatchTime.now().uptimeNanoseconds
-                DispatchQueue.main.async {
-                    completedPresentation.handler(
-                        completedPresentation.generation,
-                        completedPresentation.uploadedBytes,
-                        completedAt
-                    )
-                }
-            }
-        }
-        commandBuffer.commit()
-    }
+    func draw(in view: MTKView) { drawFrame?() }
 
     private static let shaderSource = """
     #include <metal_stdlib>
@@ -555,10 +537,11 @@ private final class MetalFramebufferPresenter: NSObject, MTKViewDelegate {
     """
 }
 
-private final class MetalFramebufferDisplayLinkTarget: NSObject {
-    private weak var owner: MetalFramebufferPresenter?
+@MainActor
+private final class GuestFramebufferDisplayLinkTarget: NSObject {
+    private weak var owner: GuestDisplaySurfaceView?
 
-    init(owner: MetalFramebufferPresenter) {
+    init(owner: GuestDisplaySurfaceView) {
         self.owner = owner
     }
 

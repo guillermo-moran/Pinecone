@@ -54,6 +54,17 @@ if [[ "${APPLIED_PINECONE_GPU_PATCH_SHA256}" != "${PINECONE_GPU_PATCH_SHA256}" ]
   printf '%s\n' "${PINECONE_GPU_PATCH_SHA256}" > "${PINECONE_GPU_PATCH_STAMP}"
 fi
 
+PINECONE_INPUT_PATCH="${ROOT_DIR}/scripts/patches/linux-virtio-input-timestamps.patch"
+PINECONE_INPUT_PATCH_STAMP="${SRC_DIR}/.pinecone-input-patch.sha256"
+PINECONE_INPUT_PATCH_SHA256="$(shasum -a 256 "${PINECONE_INPUT_PATCH}" | awk '{print $1}')"
+APPLIED_PINECONE_INPUT_PATCH_SHA256="$(cat "${PINECONE_INPUT_PATCH_STAMP}" 2>/dev/null || true)"
+if [[ "${APPLIED_PINECONE_INPUT_PATCH_SHA256}" != "${PINECONE_INPUT_PATCH_SHA256}" ]]; then
+  tar -xOf "${TARBALL}" "linux-${VERSION}/drivers/virtio/virtio_input.c" \
+    > "${SRC_DIR}/drivers/virtio/virtio_input.c"
+  patch --batch --fuzz=0 -d "${SRC_DIR}" -p1 < "${PINECONE_INPUT_PATCH}"
+  printf '%s\n' "${PINECONE_INPUT_PATCH_SHA256}" > "${PINECONE_INPUT_PATCH_STAMP}"
+fi
+
 perl -0pi -e 's#sed -i '\''s/\\x00\\\+\$\$/\\x00/g'\'' \$@;#perl -0pi -e '\''s/\\x00+\\z/\\x00/'\'' \$@;#' \
   "${SRC_DIR}/scripts/Makefile.vmlinux"
 
@@ -338,7 +349,14 @@ done < "${SRC_DIR}/arch/arm64/configs/virt.config"
   --disable MFD_CORE \
   --disable MMC \
   --disable MODULES \
-  --disable NAMESPACES \
+  --enable NAMESPACES \
+  --enable USER_NS \
+  --enable PID_NS \
+  --enable IPC_NS \
+  --enable UTS_NS \
+  --enable NET_NS \
+  --enable SECCOMP \
+  --enable SECCOMP_FILTER \
   --disable NLS \
   --disable PCI \
   --disable PERF_EVENTS \
@@ -373,6 +391,13 @@ done < "${SRC_DIR}/arch/arm64/configs/virt.config"
   --disable XEN
 
 "${KMAKE[@]}" olddefconfig
+
+for symbol in NAMESPACES USER_NS PID_NS IPC_NS UTS_NS NET_NS SECCOMP SECCOMP_FILTER; do
+  grep -q "^CONFIG_${symbol}=y$" "${BUILD_DIR}/.config" || {
+    echo "Refusing browser-capable kernel without CONFIG_${symbol}=y" >&2
+    exit 1
+  }
+done
 
 for symbol in ATA AUTOFS_FS BTRFS_FS CGROUPS CONFIGFS_FS DEBUG_FS FUSE_FS GENERIC_PHY GPIOLIB HIBERNATION IO_URING IPMI_HANDLER MMC OVERLAY_FS PCI PINCTRL PSTORE SCSI SND SOUND SQUASHFS UBIFS_FS USB XEN; do
   if grep -q "^CONFIG_${symbol}=y" "${BUILD_DIR}/.config"; then

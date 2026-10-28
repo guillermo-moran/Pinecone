@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+[ -n "${WAYLAND_DISPLAY:-}${WAYLAND_SOCKET:-}" ] || {
+  echo 'pinecone-packages: launch from the Phosh session' >&2
+  exit 1
+}
+export GDK_BACKEND=wayland
+export GTK_IM_MODULE=wayland
+umask 077
+mkdir -p /var/log/pinecone
+exec /usr/local/bin/pinecone-packages "$@" >>/var/log/pinecone/packages.log 2>&1

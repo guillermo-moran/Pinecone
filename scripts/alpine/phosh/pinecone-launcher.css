@@ -1,0 +1,157 @@
+phosh-lockscreen label {
+  color: #ffffff;
+  opacity: 1;
+  text-shadow: none;
+}
+
+#phosh-lockscreen-clock {
+  color: #ffffff;
+  font-size: 42px;
+  font-weight: 600;
+  min-width: 240px;
+  margin: 0;
+  padding-top: 0;
+  transition: none;
+}
+
+#phosh-lockscreen-date {
+  color: #ffffff;
+  font-size: 16px;
+  min-width: 240px;
+  margin: 4px 0;
+  transition: none;
+}
+
+.phosh-lockscreen-arrow {
+  animation: none;
+  transition: none;
+}
+
+phosh-lockscreen.pinecone-light-lockscreen * {
+  animation: none;
+  transition: none;
+}
+
+.phosh-lockscreen-arrow + label {
+  color: #ffffff;
+  font-size: 16px;
+  opacity: 1;
+  text-shadow: none;
+}
+
+pinecone-launcher {
+  padding: 8px 12px 12px;
+  background-color: #151719;
+  color: #f6f7f8;
+}
+
+#pinecone-launcher-header {
+  margin: 16px 8px 28px;
+}
+
+#pinecone-launcher-title {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+#pinecone-app-count {
+  color: #a4acb5;
+  font-size: 13px;
+}
+
+#pinecone-home-grid {
+  padding: 0;
+}
+
+#pinecone-home-grid > *,
+#pinecone-dock > * {
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+button.pinecone-app-tile {
+  padding: 4px 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  box-shadow: none;
+  transition: none;
+  animation: none;
+}
+
+button.pinecone-app-tile:hover {
+  background-color: #24282d;
+}
+
+button.pinecone-app-tile:active {
+  background-color: #353d45;
+}
+
+button.pinecone-app-tile:focus {
+  border-color: #8cc8f5;
+}
+
+#pinecone-app-label {
+  color: #f6f7f8;
+  font-size: 13px;
+  font-weight: 500;
+  min-height: 34px;
+  letter-spacing: 0;
+}
+
+#pinecone-empty {
+  color: #a4acb5;
+  margin-top: 40px;
+}
+
+pinecone-launcher label,
+phosh-home phosh-app-grid label {
+  opacity: 1;
+  text-shadow: none;
+}
+
+#pinecone-dock {
+  background-color: #24282d;
+  border: 1px solid #363c43;
+  border-radius: 8px;
+  padding: 10px 2px 4px;
+  margin-top: 20px;
+}
+
+#pinecone-dock #pinecone-app-label {
+  font-size: 11px;
+  min-height: 30px;
+}
+
+#pinecone-navigation {
+  background-color: #151719;
+  color: #a4acb5;
+}
+
+#pinecone-navigation button {
+  padding: 0;
+  border: none;
+  border-top: 2px solid transparent;
+  border-radius: 0;
+  box-shadow: none;
+  background: none;
+  transition: none;
+  animation: none;
+}
+
+#pinecone-navigation label {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+#pinecone-navigation button.selected {
+  color: #8de0bb;
+  border-top-color: #8de0bb;
+}
+
+#pinecone-navigation button:active {
+  background-color: #30373d;
+}

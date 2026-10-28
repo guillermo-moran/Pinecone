@@ -99,7 +99,6 @@ final class MobileOSHostModel: ObservableObject {
     private static let pendingInputRunSliceSteps = 2_000_000
     private static let bootProgressIntervalNanoseconds: UInt64 = 250_000_000
     private static let interactiveProgressIntervalNanoseconds: UInt64 = 2_000_000_000
-    private static let displayPublicationIntervalNanoseconds: UInt64 = 16_666_667
     private static let cursorPositionQuery = Array("\u{001B}[6n".utf8)
     private static let cursorPositionReply = Array("\u{001B}[1;1R".utf8)
 
@@ -327,8 +326,8 @@ final class MobileOSHostModel: ObservableObject {
         sendTerminalBytes([0x03])
     }
 
-    func sendTouch(x: UInt32, y: UInt32, isDown: Bool) {
-        runtime?.queueTouch(TouchEvent(x: x, y: y, isDown: isDown))
+    func sendTouch(_ event: TouchEvent) {
+        runtime?.queueTouch(event)
     }
 
     func withDisplayFrameBytes(
@@ -501,28 +500,18 @@ final class MobileOSHostModel: ObservableObject {
         _ runtime: LinuxConsoleRuntime,
         runIdentifier: UInt64
     ) {
-        let displayPublicationIntervalNanoseconds =
-            Self.displayPublicationIntervalNanoseconds
         displayTask = Task.detached(priority: .userInitiated) { [weak self, runtime] in
             var publishedGeneration: UInt64?
-            var nextPublicationNanoseconds: UInt64 = 0
 
             while !Task.isCancelled {
-                var commit = runtime.displayCommitSnapshot
-                if commit.generation == 0 || commit.generation == publishedGeneration {
+                let commit = runtime.displayCommitSnapshot
+                if commit.generation == publishedGeneration {
                     await runtime.waitForDisplayCommit(after: commit.generation)
                     continue
                 }
 
-                let now = DispatchTime.now().uptimeNanoseconds
-                if nextPublicationNanoseconds > now {
-                    try? await Task.sleep(
-                        nanoseconds: nextPublicationNanoseconds - now
-                    )
-                    guard !Task.isCancelled else { return }
-                    commit = runtime.displayCommitSnapshot
-                }
-
+                // Publish metadata only. The surface refresh owns pixel pacing;
+                // awaiting the main-actor receipt bounds outstanding notifications.
                 guard let metadata = runtime.displayFrameMetadata(
                     afterGeneration: publishedGeneration
                 ) else {
@@ -535,8 +524,6 @@ final class MobileOSHostModel: ObservableObject {
                     publishedAtNanoseconds: publishedAt
                 )
                 publishedGeneration = metadata.generation
-                nextPublicationNanoseconds = publishedAt &+
-                    displayPublicationIntervalNanoseconds
                 await self?.recordDisplayMetadata(
                     runIdentifier: runIdentifier,
                     metadata: metadata
@@ -1094,8 +1081,6 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
         return configured == "1"
     }
-    private static let applicationLaunchBoostNanoseconds: UInt64 = 120_000_000_000
-    private static let touchLatencySampleLimit = 64
 #if targetEnvironment(simulator)
     private static let defaultGuestMemoryMiB = 1024
 #else
@@ -1119,17 +1104,18 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private let hostWakeSignal: HostWakeSignal
     private let inputPreemptionSignal: InputPreemptionSignal
     private let displayCommitSignal: DisplayCommitSignal
-    private let performanceTimeline = VMPerformanceTimeline()
+    private let performanceTimeline = VMPerformanceTimeline(attributionEnabled:
+        ProcessInfo.processInfo.environment["PINECONE_INTERACTION_TRACE"] == "1")
     private let uartOutputBuffer: LockedByteBuffer
     private let onUART: @Sendable ([UInt8]) -> Void
     private let lock = NSLock()
     private let persistenceLock = NSLock()
     private var pendingInput: [UInt8] = []
     private var pendingInputReadIndex = 0
-    private var pendingTouches: [TouchEvent] = []
-    private var pendingTouchMoveIndex: Int?
-    private var hostTouchContactActive = false
-    private var lastAcceptedTouchPoint: (x: UInt32, y: UInt32)?
+    private var pendingTouches = TouchMotionQueue(
+        capacity: maximumPendingTouchEvents,
+        maximumPendingMotionSamplesPerGesture: 2
+    )
     private var queuedTouchEventCount = 0
     private var drainedTouchEventCount = 0
     private var droppedTouchEventCount = 0
@@ -1141,15 +1127,9 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private var lastHostActivityNanoseconds: UInt64?
     private var touchInteractionActive = false
     private var interactionExecutionPolicy = InteractionExecutionPolicy()
-    private var touchAwaitingFrame = false
-    private var touchInputFrameInFlight = false
-    private var latestTouchQueuedNanoseconds: UInt64?
-    private var inFlightTouchQueuedNanoseconds: UInt64?
-    private var latestTouchInjectedNanoseconds: UInt64?
-    private var latestTouchDeliveredNanoseconds: UInt64?
-    private var touchDeliveryTargetFrameCount = 0
     private var touchSchedulingDeliveryTargetFrameCount = 0
-    private var touchBaselineDisplayGeneration: UInt64 = 0
+    // A scheduling hint only; display progress does not establish input causality.
+    private var touchBurstBaselineDisplayGeneration: UInt64 = 0
     private enum ExecutionProfile: UInt8 {
         case normal
         case touchDelivery
@@ -1160,23 +1140,17 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
 
     private var executionProfile = ExecutionProfile.normal
     private var touchDeliverySlicePending = false
-    private var touchQueueToDeviceSamples: [UInt64] = []
-    private var touchDeviceToFrameSamples: [UInt64] = []
-    private var touchFrameToPublishSamples: [UInt64] = []
-    private var touchEndToEndSamples: [UInt64] = []
     private var wrotePresentedFrameMetrics = false
     private var shellPromptSeen = false
     private var lastRunSliceObservedWFI = false
     private var displayContentVisible = false
     private var displayBlankedAfterShell = false
     private var interactiveWorkloadReady = false
-    private var applicationLaunchAwaitingFrame = false
-    private var expectedApplicationIDs: Set<String> = []
+    private var applicationExecutionPolicy = ApplicationExecutionPolicy()
     private var guestTraceDecoder = GuestGraphicsTraceDecoder()
     private var guestControlConsoleFilter = GuestControlConsoleFilter()
     private var latestHotPCProfile: [[String: String]] = []
     private var captureHotPCProfile = false
-    private var applicationLaunchBoostDeadlineNanoseconds: UInt64?
     private var uartPromptTail = ""
 #if targetEnvironment(simulator)
     private var lastFramebufferDumpNanoseconds: UInt64 = 0
@@ -1297,6 +1271,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     func stopExecution() {
         lock.lock()
         stopRequested = true
+        applicationExecutionPolicy.cancelAll()
         lock.unlock()
         machine.parallelVCPUCluster?.stop()
     }
@@ -1335,65 +1310,25 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     func queueTouch(_ event: TouchEvent) {
         lock.lock()
         let now = DispatchTime.now().uptimeNanoseconds
-        var accepted = false
-
-        if event.isDown, hostTouchContactActive {
-            if let moveIndex = pendingTouchMoveIndex,
-               pendingTouches.indices.contains(moveIndex) {
-                pendingTouches[moveIndex] = event
-                lastAcceptedTouchPoint = (event.x, event.y)
-                droppedTouchEventCount += 1
-                accepted = true
-            } else {
-                pendingTouchMoveIndex = pendingTouches.count
-                pendingTouches.append(event)
-                lastAcceptedTouchPoint = (event.x, event.y)
-                accepted = true
-            }
-        } else if event.isDown {
-            hostTouchContactActive = true
-            lastAcceptedTouchPoint = (event.x, event.y)
-            pendingTouchMoveIndex = nil
-            pendingTouches.append(event)
-            accepted = true
-        } else if hostTouchContactActive {
-            hostTouchContactActive = false
-            if lastAcceptedTouchPoint?.x != event.x ||
-                lastAcceptedTouchPoint?.y != event.y {
-                let finalMove = TouchEvent(
-                    x: event.x,
-                    y: event.y,
-                    isDown: true
-                )
-                if let moveIndex = pendingTouchMoveIndex,
-                   pendingTouches.indices.contains(moveIndex) {
-                    pendingTouches[moveIndex] = finalMove
-                } else {
-                    pendingTouches.append(finalMove)
-                }
-            }
-            pendingTouchMoveIndex = nil
-            lastAcceptedTouchPoint = nil
-            pendingTouches.append(event)
-            accepted = true
+        let identity = performanceTimeline.beginInputTrace(event, queuedAt: now)
+        let tracedEvent = TouchEvent(x: event.x, y: event.y, isDown: event.isDown,
+            timestampNanoseconds: event.timestampNanoseconds, phase: event.phase, traceIdentity: identity)
+        let accepted = pendingTouches.enqueue(tracedEvent, nowNanoseconds: now)
+        for disposition in pendingTouches.drainTraceDispositions() {
+            performanceTimeline.recordInputDisposition(disposition.identity,
+                reason: disposition.reason, atNanoseconds: now)
         }
+        droppedTouchEventCount = pendingTouches.discardedMotionCount + pendingTouches.rejectedGestureCount
 
         guard accepted else {
             lock.unlock()
             return
         }
 
-        if pendingTouches.count > Self.maximumPendingTouchEvents {
-            let overflow = pendingTouches.count - Self.maximumPendingTouchEvents
-            pendingTouches.removeFirst(overflow)
-            pendingTouchMoveIndex = nil
-            droppedTouchEventCount += overflow
-        }
         queuedTouchEventCount += 1
         lastHostActivityNanoseconds = now
         touchInteractionActive = event.isDown
         interactionExecutionPolicy.input(at: now, isDown: event.isDown)
-        latestTouchQueuedNanoseconds = now
 
         lock.unlock()
         inputPreemptionSignal.signal()
@@ -1468,24 +1403,14 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     }
 
     private func isApplicationLaunchLatencySensitiveLocked(now: UInt64) -> Bool {
-        guard applicationLaunchAwaitingFrame,
-              let deadline = applicationLaunchBoostDeadlineNanoseconds else {
-            return false
-        }
-        guard now < deadline else {
-            applicationLaunchAwaitingFrame = false
-            expectedApplicationIDs.removeAll(keepingCapacity: true)
-            applicationLaunchBoostDeadlineNanoseconds = nil
-            return false
-        }
-        return true
+        applicationExecutionPolicy.isLatencySensitive(at: now)
     }
 
     var shouldContinueInteractiveBurst: Bool {
         lock.lock()
         let now = DispatchTime.now().uptimeNanoseconds
         let latencySensitive = isTouchLatencySensitiveLocked(now: now)
-        let baseline = touchBaselineDisplayGeneration
+        let baseline = touchBurstBaselineDisplayGeneration
         lock.unlock()
         guard latencySensitive else { return false }
         return (machine.virtioDisplay.displayGeneration ?? 0) <= baseline
@@ -1563,30 +1488,21 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             let injectionTime = DispatchTime.now().uptimeNanoseconds
             let baselineGeneration = machine.virtioDisplay.displayGeneration ?? 0
             lock.lock()
-            let beginsLatencySample = !touchInputFrameInFlight
             touchDeliverySlicePending = true
             touchSchedulingDeliveryTargetFrameCount = Int.max
-            if beginsLatencySample {
-                touchInputFrameInFlight = true
-                touchAwaitingFrame = true
-                inFlightTouchQueuedNanoseconds = latestTouchQueuedNanoseconds
-                latestTouchInjectedNanoseconds = injectionTime
-                latestTouchDeliveredNanoseconds = nil
-                touchDeliveryTargetFrameCount = Int.max
-                touchBaselineDisplayGeneration = baselineGeneration
-            }
+            touchBurstBaselineDisplayGeneration = baselineGeneration
             lock.unlock()
-            for event in touches {
-                machine.touch.enqueue(event)
-            }
             machine.virtioInput.enqueueTouches(touches)
+            // Identity is retained through host admission, not across evdev.
+            // Injection is not guest delivery, handling, or a frame response.
+            for touch in touches {
+                performanceTimeline.recordInputDisposition(touch.traceIdentity,
+                    reason: "injectedUncorrelated", atNanoseconds: injectionTime)
+            }
             let deliveryProgress =
                 machine.virtioInput.inputFrameDeliveryProgress
             lock.lock()
             touchSchedulingDeliveryTargetFrameCount = deliveryProgress.target
-            if beginsLatencySample {
-                touchDeliveryTargetFrameCount = deliveryProgress.target
-            }
             lock.unlock()
             noteTouchDeliveredIfNeeded()
         }
@@ -2008,42 +1924,10 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         )
 
         lock.lock()
-        let baselineGeneration = touchBaselineDisplayGeneration
         interactionExecutionPolicy.frame(at: publishedAtNanoseconds)
-        let deliveredNanoseconds = latestTouchDeliveredNanoseconds
-        // Scheduling boost expiry must not discard the slowest measurements.
-        guard touchAwaitingFrame,
-              let deliveredNanoseconds,
-              metadata.commitTimestampNanoseconds >= deliveredNanoseconds,
-              metadata.generation > baselineGeneration else {
-            lock.unlock()
-            return
-        }
-        touchAwaitingFrame = false
-        touchInputFrameInFlight = false
-        touchDeliveryTargetFrameCount = 0
-        Self.appendLatencySampleLocked(
-            metadata.commitTimestampNanoseconds - deliveredNanoseconds,
-            to: &touchDeviceToFrameSamples
-        )
-        Self.appendLatencySampleLocked(
-            publishedAtNanoseconds &- metadata.commitTimestampNanoseconds,
-            to: &touchFrameToPublishSamples
-        )
-        if let queued = inFlightTouchQueuedNanoseconds {
-            performanceTimeline.recordTouchFrame(generation: metadata.generation,
-                queued: queued, delivered: deliveredNanoseconds)
-            let endToEnd = publishedAtNanoseconds &- queued
-            Self.appendLatencySampleLocked(
-                endToEnd,
-                to: &touchEndToEndSamples
-            )
-            performanceTimeline.recordTouchLatency(nanoseconds: endToEnd)
-        }
-        inFlightTouchQueuedNanoseconds = nil
         lock.unlock()
+        // Publishing still wakes execution; attribution never controls boosts or wakes.
         hostWakeSignal.signal()
-        writePerformanceMetricsIfRequested()
     }
 
     func recordDisplayPresented(
@@ -2223,12 +2107,11 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     }
 
     private func drainTouches() -> [TouchEvent] {
+        let capacity = machine.virtioInput.availableTouchSampleCapacity
         lock.lock()
         defer { lock.unlock() }
 
-        var events: [TouchEvent] = []
-        swap(&events, &pendingTouches)
-        pendingTouchMoveIndex = nil
+        let events = pendingTouches.drain(maxCount: capacity)
         drainedTouchEventCount += events.count
         return events
     }
@@ -2321,31 +2204,6 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             touchDeliverySlicePending = false
             touchSchedulingDeliveryTargetFrameCount = 0
         }
-        guard touchAwaitingFrame,
-              latestTouchInjectedNanoseconds != nil,
-              latestTouchDeliveredNanoseconds == nil,
-              touchDeliveryTargetFrameCount > 0,
-              deliveryProgress.delivered >=
-                touchDeliveryTargetFrameCount else {
-            lock.unlock()
-            return
-        }
-        let targetFrame = touchDeliveryTargetFrameCount
-        lock.unlock()
-        guard let now = machine.virtioInput.inputFrameDeliveryTimestamp(for: targetFrame) else {
-            return
-        }
-        lock.lock()
-        guard touchAwaitingFrame, latestTouchDeliveredNanoseconds == nil,
-              touchDeliveryTargetFrameCount == targetFrame else {
-            lock.unlock()
-            return
-        }
-        latestTouchDeliveredNanoseconds = now
-        performanceTimeline.recordInteractionStarted(atNanoseconds: now)
-        if let queued = inFlightTouchQueuedNanoseconds {
-            Self.appendLatencySampleLocked(now &- queued, to: &touchQueueToDeviceSamples)
-        }
         lock.unlock()
     }
 
@@ -2353,43 +2211,17 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         interactionExecutionPolicy.isLatencySensitive(at: now)
     }
 
-    private static func appendLatencySampleLocked(_ value: UInt64, to samples: inout [UInt64]) {
-        if samples.count == Self.touchLatencySampleLimit {
-            samples.removeFirst()
-        }
-        samples.append(value)
-    }
-
-    private static func latencyPercentileMilliseconds(_ samples: [UInt64], percentile: Double) -> Double? {
-        guard !samples.isEmpty else {
-            return nil
-        }
-        let sorted = samples.sorted()
-        let index = min(
-            sorted.count - 1,
-            Int((Double(sorted.count - 1) * percentile).rounded(.up))
-        )
-        return Double(sorted[index]) / 1_000_000
-    }
-
     private func touchPipelineDiagnostics() -> String {
         lock.lock()
         let queued = queuedTouchEventCount
         let drained = drainedTouchEventCount
         let dropped = droppedTouchEventCount
-        let queueP95 = Self.latencyPercentileMilliseconds(touchQueueToDeviceSamples, percentile: 0.95)
-        let renderP95 = Self.latencyPercentileMilliseconds(touchDeviceToFrameSamples, percentile: 0.95)
-        let publishP95 = Self.latencyPercentileMilliseconds(touchFrameToPublishSamples, percentile: 0.95)
-        let totalP95 = Self.latencyPercentileMilliseconds(touchEndToEndSamples, percentile: 0.95)
         lock.unlock()
         guard queued > 0 else {
             return ""
         }
-        let latency = [queueP95, renderP95, publishP95, totalP95].map {
-            $0.map { String(format: "%.1f", $0) } ?? "-"
-        }.joined(separator: "/")
         return " hosttouch=\(queued)/\(drained)/\(dropped)" +
-            " touchp95=\(latency)ms \(machine.virtioInput.inputDiagnostics)"
+            " inputFrameCorrelation=unavailable \(machine.virtioInput.inputDiagnostics)"
     }
 
     private func drainKeyboardEvents() -> [GuestKeyboardEvent] {
@@ -2462,16 +2294,18 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
         lock.unlock()
         for record in guestRecords {
-            if case .applicationLaunch(let name) = record {
-                let now = DispatchTime.now().uptimeNanoseconds
-                lock.lock()
-                applicationLaunchAwaitingFrame = true
-                expectedApplicationIDs = name == "settings"
-                    ? ["org.gnome.Settings", "gnome-control-center"] : []
-                applicationLaunchBoostDeadlineNanoseconds = now &+
-                    Self.applicationLaunchBoostNanoseconds
+            if case .graphics(let event) = record {
+                performanceTimeline.recordGuestGraphics(event)
+                continue
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            lock.lock()
+            let effect = stopRequested ? .ignored : applicationExecutionPolicy.handle(record, at: now)
+            if effect == .requested {
                 lastHostActivityNanoseconds = now
-                lock.unlock()
+            }
+            lock.unlock()
+            if effect == .requested {
                 if performanceTimeline.mark(.applicationLaunchRequested,
                     execution: executionMilestoneSnapshot()) {
 #if targetEnvironment(simulator)
@@ -2480,23 +2314,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
                     }
 #endif
                 }
-                continue
-            }
-            if case .graphics(let event) = record {
-                performanceTimeline.recordGuestGraphics(event)
-                continue
-            }
-            guard case .applicationPresented(let appID) = record else { continue }
-            lock.lock()
-            let applicationPresented = applicationLaunchAwaitingFrame &&
-                expectedApplicationIDs.contains(appID)
-            if applicationPresented {
-                applicationLaunchAwaitingFrame = false
-                expectedApplicationIDs.removeAll(keepingCapacity: true)
-                applicationLaunchBoostDeadlineNanoseconds = nil
-            }
-            lock.unlock()
-            if applicationPresented {
+            } else if effect == .presented {
                 _ = performanceTimeline.mark(.applicationSurfacePresented,
                     execution: executionMilestoneSnapshot())
             }
@@ -2591,6 +2409,8 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             "virtioGPU": machine.virtioDisplay.displayPerformanceCounters,
             "metal": graphicsAccelerator?.performanceCounters ?? [:],
         ]
+        report["threadedPrototypePrimary"] =
+            (machine.vm.backend as? SoftwareARM64Backend)?.nativeThreadedPrototypeStatistics
         lock.lock()
         report["hotPCs"] = latestHotPCProfile
         lock.unlock()

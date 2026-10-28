@@ -39,10 +39,13 @@ write_network_config() {
 127.0.1.1 arm64viz.local arm64viz
 ::1 localhost ip6-localhost
 EOF
+	# Preserve user configuration across reboots. Only seed new/unconfigured roots.
+	if [ ! -s /etc/apk/repositories ]; then
 	cat >/etc/apk/repositories <<'EOF'
 http://10.0.2.2/alpine/edge/main
 http://10.0.2.2/alpine/edge/community
 EOF
+	fi
 }
 
 ensure_node() {

@@ -1,9 +1,22 @@
 #include "ARM64VizNative.h"
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+#include "ARM64VizThreadedPrototype.h"
+#endif
 
 #include <limits.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
+
+/* Compile-time opt-in: no counters or counter branches in ordinary builds. */
+#ifndef AVZ_THREADED_CACHE_DIAGNOSTICS
+#define AVZ_THREADED_CACHE_DIAGNOSTICS 0
+#endif
+#if AVZ_THREADED_CACHE_DIAGNOSTICS && AVZ_THREADED_PROTOTYPE_ENABLE
+#define AVZ_TC_COUNT(cache, field) ((cache)->threaded_statistics.field++)
+#else
+#define AVZ_TC_COUNT(cache, field) ((void)0)
+#endif
 
 enum {
     AVZ_BLOCK_CACHE_SET_COUNT = 8192,
@@ -139,6 +152,11 @@ typedef struct {
     uint64_t last_used;
     uint8_t valid;
     uint8_t prefetched;
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+    /* Decoded-entry lifetime, not auxiliary-slot lifetime. Fits tail padding. */
+    uint8_t threaded_eligibility; /* 0 unknown, 1 registers, 2 unsupported, 3 OOM, 4 memory */
+    uint16_t threaded_slot; /* One-based; zero means no owned program. */
+#endif
 } AVZBlockCacheEntry;
 
 typedef struct {
@@ -148,6 +166,21 @@ typedef struct {
 } AVZBlockFrontCacheEntry;
 
 struct AVZNativeBlockCache {
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+    /* Intrusive global FIFO; hits do not reorder the 256-program pool. */
+    struct {
+        AVZBlockCacheEntry *owner;
+        AVZThreadedPrototype *program;
+        uint16_t previous, next;
+    } threaded_programs[256];
+    uint16_t threaded_lru;
+#if AVZ_THREADED_CACHE_DIAGNOSTICS
+    struct {
+        uint64_t hits, negative_hits, collisions, creations, destructions;
+        uint64_t eligibility_scans, allocation_failures;
+    } threaded_statistics;
+#endif
+#endif
     AVZBlockCacheEntry *entries;
     AVZBlockPageLink *page_links;
     int32_t *page_bucket_heads;
@@ -183,6 +216,60 @@ struct AVZNativeBlockCache {
     AVZGuestMemory *guest_memory;
     AVZNativeBlockCacheStatistics statistics;
 };
+
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+static void avz_threaded_initialize_lru(AVZNativeBlockCache *cache) {
+    for (size_t i = 0; i < 256; i++) {
+        cache->threaded_programs[i].previous = (uint16_t)((i + 255u) & 255u);
+        cache->threaded_programs[i].next = (uint16_t)((i + 1u) & 255u);
+    }
+    cache->threaded_lru = 0;
+}
+
+static void avz_threaded_touch_slot(AVZNativeBlockCache *cache, size_t slot) {
+    uint16_t head = cache->threaded_lru;
+    if (cache->threaded_programs[slot].next == head) return; /* Already at tail. */
+    if (slot == head) {
+        cache->threaded_lru = cache->threaded_programs[slot].next;
+        return;
+    }
+    uint16_t previous = cache->threaded_programs[slot].previous;
+    uint16_t next = cache->threaded_programs[slot].next;
+    cache->threaded_programs[previous].next = next;
+    cache->threaded_programs[next].previous = previous;
+    uint16_t tail = cache->threaded_programs[head].previous;
+    cache->threaded_programs[tail].next = (uint16_t)slot;
+    cache->threaded_programs[slot].previous = tail;
+    cache->threaded_programs[slot].next = head;
+    cache->threaded_programs[head].previous = (uint16_t)slot;
+}
+
+static void avz_threaded_release_slot(AVZNativeBlockCache *cache, size_t slot) {
+    if (cache->threaded_programs[slot].owner != NULL) {
+        cache->threaded_programs[slot].owner->threaded_slot = 0;
+    }
+    if (cache->threaded_programs[slot].program != NULL) {
+        AVZ_TC_COUNT(cache, destructions);
+        avz_tp_destroy(cache->threaded_programs[slot].program);
+    }
+    cache->threaded_programs[slot].owner = NULL;
+    cache->threaded_programs[slot].program = NULL;
+    /* Empty slots precede live slots, so misses consume free space first. */
+    avz_threaded_touch_slot(cache, slot);
+    cache->threaded_lru = (uint16_t)slot;
+}
+
+static void avz_threaded_forget_entry(AVZNativeBlockCache *cache,
+                                      AVZBlockCacheEntry *entry) {
+    if (entry->threaded_slot != 0) {
+        avz_threaded_release_slot(cache, entry->threaded_slot - 1u);
+    }
+    entry->threaded_eligibility = 0;
+}
+
+#else
+#define avz_threaded_forget_entry(cache, entry) ((void)0)
+#endif
 
 static void avz_advance_nonzero_counter(uint64_t *counter) {
     (*counter)++;
@@ -768,6 +855,7 @@ static void avz_discard_stale_entry(
     }
     avz_retire_unused_prefetch(cache, entry);
     avz_unindex_entry(cache, entry_index);
+    avz_threaded_forget_entry(cache, entry);
     entry->valid = 0;
     entry->serial = 0;
     entry->validated_code_mutation_epoch = 0;
@@ -783,6 +871,7 @@ static void avz_invalidate_entry(AVZNativeBlockCache *cache, size_t entry_index)
     }
     avz_retire_unused_prefetch(cache, entry);
     avz_unindex_entry(cache, entry_index);
+    avz_threaded_forget_entry(cache, entry);
     entry->valid = 0;
     entry->serial = 0;
     avz_advance_nonzero_counter(&cache->generation);
@@ -795,6 +884,9 @@ AVZNativeBlockCache *avz_native_block_cache_create(void) {
     if (cache == NULL) {
         return NULL;
     }
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+    avz_threaded_initialize_lru(cache);
+#endif
     cache->generation = 1;
     cache->mutation_epoch = 1;
     cache->code_mutation_epoch = 1;
@@ -831,6 +923,11 @@ void avz_native_block_cache_destroy(AVZNativeBlockCache *cache) {
     if (cache == NULL) {
         return;
     }
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+    for (size_t i = 0; i < 256; i++) {
+        avz_threaded_release_slot(cache, i);
+    }
+#endif
     free(cache->entries);
     free(cache->page_links);
     free(cache->page_bucket_heads);
@@ -844,6 +941,12 @@ void avz_native_block_cache_clear(AVZNativeBlockCache *cache) {
     if (cache == NULL) {
         return;
     }
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+    for (size_t i = 0; i < 256; i++) {
+        avz_threaded_release_slot(cache, i);
+    }
+    avz_threaded_initialize_lru(cache);
+#endif
     avz_advance_nonzero_counter(&cache->generation);
     avz_advance_nonzero_counter(&cache->mutation_epoch);
     avz_advance_nonzero_counter(&cache->code_mutation_epoch);
@@ -1228,6 +1331,7 @@ const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
         }
         avz_retire_unused_prefetch(cache, &cache->entries[entry_index]);
         avz_unindex_entry(cache, entry_index);
+        avz_threaded_forget_entry(cache, &cache->entries[entry_index]);
         cache->entries[entry_index].serial = 0;
         avz_advance_nonzero_counter(&cache->mutation_epoch);
         cache->statistics.evictions++;
@@ -1394,6 +1498,75 @@ const AVZNativeInstruction *avz_native_decoded_block_instructions(
 ) {
     return block == NULL ? NULL : block->instructions;
 }
+
+#if AVZ_THREADED_PROTOTYPE_ENABLE
+const AVZThreadedPrototype *avz_native_block_cache_threaded_program(
+    AVZNativeBlockCache *cache, const AVZNativeDecodedBlock *block
+) {
+    return avz_native_block_cache_threaded_program_with_memory(cache, block, 0);
+}
+
+const AVZThreadedPrototype *avz_native_block_cache_threaded_program_with_memory(
+    AVZNativeBlockCache *cache, const AVZNativeDecodedBlock *block, uint8_t allow_memory
+) {
+    AVZBlockCacheEntry *entry = (AVZBlockCacheEntry *)avz_entry_for_block(cache, block);
+    if (entry == NULL || !entry->valid || entry->serial == 0 ||
+        block->instruction_count < 2) {
+        return NULL;
+    }
+    if (!avz_entry_code_is_current(cache, entry)) {
+        avz_threaded_forget_entry(cache, entry);
+        return NULL;
+    }
+    if (entry->threaded_eligibility == 2 || entry->threaded_eligibility == 3 ||
+        (entry->threaded_eligibility == 4 && !allow_memory)) {
+        AVZ_TC_COUNT(cache, negative_hits);
+        return NULL;
+    }
+    if (entry->threaded_slot != 0) {
+        size_t slot = entry->threaded_slot - 1u;
+        AVZ_TC_COUNT(cache, hits);
+        return cache->threaded_programs[slot].program;
+    }
+    if (entry->threaded_eligibility == 0) {
+        AVZ_TC_COUNT(cache, eligibility_scans);
+        int needs_memory = 0;
+        for (size_t i = 0; i < block->instruction_count; i++) {
+            if (!avz_tp_supports_instruction(&block->instructions[i])) {
+                if (!avz_tp_supports_instruction_with_memory(&block->instructions[i])) {
+                    entry->threaded_eligibility = 2;
+                    return NULL;
+                }
+                needs_memory = 1;
+            }
+        }
+        entry->threaded_eligibility = needs_memory ? 4 : 1;
+        if (needs_memory && !allow_memory) return NULL;
+    }
+    size_t slot = cache->threaded_lru;
+    if (cache->threaded_programs[slot].program != NULL) {
+        AVZ_TC_COUNT(cache, collisions);
+        avz_threaded_release_slot(cache, slot);
+    }
+    uint32_t words[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
+    for (size_t i = 0; i < block->instruction_count; i++) {
+        words[i] = block->instructions[i].raw;
+    }
+    /* Evict before allocating, so even transient ownership stays <= 256. */
+    cache->threaded_programs[slot].program = avz_tp_create(
+        words, block->instruction_count, block->key.pc);
+    if (cache->threaded_programs[slot].program == NULL) {
+        entry->threaded_eligibility = 3;
+        AVZ_TC_COUNT(cache, allocation_failures);
+        return NULL;
+    }
+    AVZ_TC_COUNT(cache, creations);
+    cache->threaded_programs[slot].owner = entry;
+    avz_threaded_touch_slot(cache, slot);
+    entry->threaded_slot = (uint16_t)(slot + 1u);
+    return cache->threaded_programs[slot].program;
+}
+#endif
 
 const uint8_t *avz_native_decoded_block_semantic_candidates(
     const AVZNativeDecodedBlock *block

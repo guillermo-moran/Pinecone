@@ -88,6 +88,31 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     public init() {
         nativeBlockCache = avz_native_block_cache_create()
         nativeExecutionContext = avz_native_execution_context_create()
+#if targetEnvironment(simulator)
+        // Experimental subset only. Physical-device and CLI defaults stay unchanged.
+        setNativeThreadedPrototypeEnabled(
+            ProcessInfo.processInfo.environment["PINECONE_THREADED_PROTOTYPE"] != "0"
+        )
+        setNativeThreadedMemoryEnabled(
+            ProcessInfo.processInfo.environment["PINECONE_THREADED_MEMORY"] == "1"
+        )
+#endif
+    }
+
+    public func setNativeThreadedPrototypeEnabled(_ enabled: Bool) {
+        avz_native_execution_context_set_threaded_prototype(nativeExecutionContext, enabled ? 1 : 0)
+    }
+
+    public func setNativeThreadedMemoryEnabled(_ enabled: Bool) {
+        avz_native_execution_context_set_threaded_memory(nativeExecutionContext, enabled ? 1 : 0)
+    }
+
+    public var nativeThreadedPrototypeStatistics: [String: UInt64] {
+        let counters = avz_native_execution_context_threaded_statistics(nativeExecutionContext)
+        return ["enabled": counters.enabled, "blocks": counters.blocks, "steps": counters.steps,
+                "memoryEnabled": counters.memory_enabled,
+                "memoryBoundaries": counters.memory_boundaries,
+                "memoryFaults": counters.memory_faults]
     }
 
     deinit {
@@ -2726,21 +2751,34 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         var exclusiveSize = UInt8(vm.cpu.exclusiveReservationSize ?? 0)
         var exclusiveValid: UInt8 = vm.cpu.exclusiveReservationAddress == nil ? 0 : 1
 
-        let outcome = try executeNativeBasicBlockBurstLoop(
-            vm,
-            maxSteps: maxSteps,
-            registers: &registers,
-            vectorLows: &vectorLows,
-            vectorHighs: &vectorHighs,
-            sp: &sp,
-            pc: &pc,
-            pstate: &pstate,
-            exclusiveAddress: &exclusiveAddress,
-            exclusiveGeneration: &exclusiveGeneration,
-            exclusiveSize: &exclusiveSize,
-            exclusiveValid: &exclusiveValid,
-            halted: &halted
-        )
+        let outcome: NativeBasicBlockExecutionOutcome?
+        do {
+            outcome = try executeNativeBasicBlockBurstLoop(
+                vm,
+                maxSteps: maxSteps,
+                registers: &registers,
+                vectorLows: &vectorLows,
+                vectorHighs: &vectorHighs,
+                sp: &sp,
+                pc: &pc,
+                pstate: &pstate,
+                exclusiveAddress: &exclusiveAddress,
+                exclusiveGeneration: &exclusiveGeneration,
+                exclusiveSize: &exclusiveSize,
+                exclusiveValid: &exclusiveValid,
+                halted: &halted
+            )
+        } catch {
+            // Failed device accesses can follow a retired prefix. Publish that
+            // state before reporting the error; it must never be replayed.
+            storeNativeCPUState(
+                vm, registers: registers, vectorLows: vectorLows, vectorHighs: vectorHighs,
+                sp: sp, pc: pc, pstate: pstate, exclusiveAddress: exclusiveAddress,
+                exclusiveGeneration: exclusiveGeneration, exclusiveSize: exclusiveSize,
+                exclusiveValid: exclusiveValid, halted: halted
+            )
+            throw error
+        }
 
         guard let outcome else {
             return nil
@@ -2913,6 +2951,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
         var fpcr = vm.systemRegisters.rawValue(for: ARM64SystemRegister.fpcr)
         var fpsr = vm.systemRegisters.rawValue(for: ARM64SystemRegister.fpsr)
+        defer {
+            vm.systemRegisters.writeRaw(ARM64SystemRegister.fpcr, value: fpcr)
+            vm.systemRegisters.writeRaw(ARM64SystemRegister.fpsr, value: fpsr)
+            pstate = livePState
+        }
         registers.withUnsafeBufferPointer { registerBuffer in
             vectorLows.withUnsafeBufferPointer { lowBuffer in
                 vectorHighs.withUnsafeBufferPointer { highBuffer in
@@ -2936,7 +2979,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             }
         }
         nativeBurstLoop: while totalSteps < maxSteps {
-            let loopResult: NativeBurstLoopResult = {
+            let loopResult: NativeBurstLoopResult = try {
                 defer {
                     registers.withUnsafeMutableBufferPointer { registerBuffer in
                         vectorLows.withUnsafeMutableBufferPointer { lowBuffer in
@@ -3050,6 +3093,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     if translationFault != nil {
                         return NativeBurstLoopResult.yielded
                     }
+                    if result.status == UInt32(AVZ_TP_STATUS_MEMORY_FAULT) {
+                        // A helper may already have touched MMIO. Never retry an
+                        // unclassified failed access through another executor.
+                        throw VMError.deviceError("native threaded memory access failed at PC 0x\(String(avz_native_execution_context_pc(nativeExecutionContext), radix: 16))")
+                    }
                     if result.blocks == 0, let fault = memoryContext.translationFault {
                         translationFault = fault
                         return NativeBurstLoopResult.yielded
@@ -3162,9 +3210,6 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             }
         }
 
-        vm.systemRegisters.writeRaw(ARM64SystemRegister.fpcr, value: fpcr)
-        vm.systemRegisters.writeRaw(ARM64SystemRegister.fpsr, value: fpsr)
-        pstate = livePState
         guard totalSteps > 0 else {
             return nil
         }

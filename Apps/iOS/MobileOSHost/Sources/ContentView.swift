@@ -331,7 +331,7 @@ private enum GuestViewMode: Hashable {
 private struct GuestFramebufferView: View {
     @ObservedObject var feed: GuestDisplayFeed
     @Binding var focused: Bool
-    let onTouch: (UInt32, UInt32, Bool) -> Void
+    let onTouch: (TimestampedTouchEvent) -> Void
     let copyFrame: GuestDisplayFrameSource
     let onPresented: GuestDisplayPresentedHandler
     let sendText: (String) -> Void
@@ -383,10 +383,12 @@ private struct GuestFramebufferView: View {
         Task { @MainActor in
             for step in 0...steps {
                 let y = startY - ((startY - endY) * step / steps)
-                onTouch(x, y, true)
+                onTouch(TimestampedTouchEvent(x: x, y: y, phase: step == 0 ? .down : .move,
+                    timestampNanoseconds: DispatchTime.now().uptimeNanoseconds))
                 try? await Task.sleep(nanoseconds: 20_000_000)
             }
-            onTouch(x, endY, false)
+            onTouch(TimestampedTouchEvent(x: x, y: endY, phase: .up,
+                timestampNanoseconds: DispatchTime.now().uptimeNanoseconds))
         }
     }
 
@@ -420,7 +422,7 @@ private struct GuestFramebufferView: View {
 
 private struct GuestTouchCaptureView: UIViewRepresentable {
     let layout: GuestDisplayLayout?
-    let onTouch: (UInt32, UInt32, Bool) -> Void
+    let onTouch: (TimestampedTouchEvent) -> Void
 
     func makeUIView(context: Context) -> GuestTouchCaptureUIView {
         let view = GuestTouchCaptureUIView()
@@ -431,49 +433,92 @@ private struct GuestTouchCaptureView: UIViewRepresentable {
     }
 
     func updateUIView(_ view: GuestTouchCaptureUIView, context: Context) {
+        if layout == nil { view.cancelActiveTouch() }
         view.layout = layout
         view.onTouch = onTouch
         view.isUserInteractionEnabled = layout != nil
+    }
+
+    static func dismantleUIView(_ view: GuestTouchCaptureUIView, coordinator: ()) {
+        view.cancelActiveTouch()
     }
 }
 
 private final class GuestTouchCaptureUIView: UIView {
     var layout: GuestDisplayLayout?
-    var onTouch: ((UInt32, UInt32, Bool) -> Void)?
+    var onTouch: ((TimestampedTouchEvent) -> Void)?
+    private var activeTouch: UITouch?
+    private var lastUIKitTimestamp: TimeInterval = 0
     private var lastPoint: (x: UInt32, y: UInt32)?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first,
+        guard activeTouch == nil, let touch = touches.first,
               let point = guestPoint(for: touch.location(in: self)) else { return }
+        activeTouch = touch
+        lastUIKitTimestamp = touch.timestamp
         lastPoint = point
-        onTouch?(point.x, point.y, true)
+        emit(point, phase: .down, timestamp: TouchTimestamp.capture(touch.timestamp))
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first,
-              let point = guestPoint(for: touch.location(in: self)),
-              point.x != lastPoint?.x || point.y != lastPoint?.y else { return }
-        lastPoint = point
-        onTouch?(point.x, point.y, true)
+        guard let touch = activeTouch, touches.contains(touch) else { return }
+        forwardMotion(touch, event: event)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        finishTouch(touches.first)
+        guard let touch = activeTouch, touches.contains(touch) else { return }
+        finishTouch(touch, event: event, phase: .up)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        finishTouch(touches.first)
+        guard let touch = activeTouch, touches.contains(touch) else { return }
+        finishTouch(touch, event: event, phase: .cancel)
     }
 
-    private func finishTouch(_ touch: UITouch?) {
-        let point = touch.flatMap { guestPoint(for: $0.location(in: self)) } ?? lastPoint
-        if let point {
-            if point.x != lastPoint?.x || point.y != lastPoint?.y {
-                onTouch?(point.x, point.y, true)
-            }
-            onTouch?(point.x, point.y, false)
+    private func forwardMotion(_ touch: UITouch, event: UIEvent?) {
+        // UIKit includes the current touch in coalescedTouches; do not send it twice.
+        // Predicted touches are intentionally excluded from the guest input stream.
+        let samples = event?.coalescedTouches(for: touch) ?? [touch]
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let now = DispatchTime.now().uptimeNanoseconds
+        for sample in samples where sample.timestamp > lastUIKitTimestamp && sample.timestamp <= touch.timestamp {
+            guard let point = guestPoint(for: sample.location(in: self)) else { continue }
+            lastPoint = point
+            lastUIKitTimestamp = sample.timestamp
+            emit(point, phase: .move, timestamp: TouchTimestamp.capture(sample.timestamp,
+                uptime: uptime, nowNanoseconds: now))
         }
+        if touch.timestamp > lastUIKitTimestamp,
+           let point = guestPoint(for: touch.location(in: self)) {
+            lastPoint = point
+            lastUIKitTimestamp = touch.timestamp
+            emit(point, phase: .move, timestamp: TouchTimestamp.capture(touch.timestamp,
+                uptime: uptime, nowNanoseconds: now))
+        }
+    }
+
+    private func finishTouch(_ touch: UITouch, event: UIEvent?, phase: TouchPhase) {
+        forwardMotion(touch, event: event)
+        let point = guestPoint(for: touch.location(in: self)) ?? lastPoint
+        if let point {
+            // The bounded queue inserts a final move if the release position changed.
+            emit(point, phase: phase, timestamp: TouchTimestamp.capture(touch.timestamp))
+        }
+        activeTouch = nil
         lastPoint = nil
+    }
+
+    func cancelActiveTouch() {
+        if activeTouch != nil, let point = lastPoint {
+            emit(point, phase: .cancel, timestamp: DispatchTime.now().uptimeNanoseconds)
+        }
+        activeTouch = nil
+        lastPoint = nil
+    }
+
+    private func emit(_ point: (x: UInt32, y: UInt32), phase: TouchPhase, timestamp: UInt64) {
+        onTouch?(TimestampedTouchEvent(x: point.x, y: point.y, phase: phase,
+                                      timestampNanoseconds: timestamp))
     }
 
     private func guestPoint(for location: CGPoint) -> (x: UInt32, y: UInt32)? {

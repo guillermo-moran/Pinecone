@@ -83,6 +83,35 @@ int main(int argc, char **argv) {
     cairo_surface_finish(s);
     if (patched) assert(cairo_image_surface_get_data(s) == NULL);
     cairo_surface_destroy(s);
+
+    // A caller-owned alias survives nested scopes and remains writable across
+    // frames. The Cairo integration must not silently turn it into a lease.
+    uint32_t external[4] = { 0xff123456, 0xff123456, 0xff123456, 0xff123456 };
+    cairo_surface_t *alias = cairo_image_surface_create_for_data(
+        (unsigned char *)external, CAIRO_FORMAT_ARGB32, 2, 2, 8);
+    cairo_surface_t *copy = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 2, 2);
+    assert(cairo_surface_status(alias) == CAIRO_STATUS_SUCCESS);
+    assert(cairo_surface_status(copy) == CAIRO_STATUS_SUCCESS);
+    pinecone_pixman_begin_cpu_access_flags(3u);
+    pinecone_pixman_begin_cpu_access_flags(1u);
+    prior = escapes;
+    assert(cairo_image_surface_get_data(alias) == (unsigned char *)external);
+    if (patched) assert(escapes == prior + 1);
+    pinecone_pixman_end_cpu_access();
+    pinecone_pixman_end_cpu_access();
+    cr = cairo_create(copy);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    for (unsigned frame = 0; frame < 2; ++frame) {
+        external[0] += 0x00010203;
+        cairo_surface_mark_dirty(alias);
+        cairo_set_source_surface(cr, alias, 0, 0);
+        cairo_paint(cr);
+        cairo_surface_flush(copy);
+        assert(*(uint32_t *)cairo_image_surface_get_data(copy) == external[0]);
+    }
+    cairo_destroy(cr);
+    cairo_surface_destroy(copy);
+    cairo_surface_destroy(alias);
     assert(depth == 0 && begins == ends);
     if (patched) puts("Cairo access: lazy acquisition, draw scopes, flush, exports, mapping and finish passed");
     return 0;

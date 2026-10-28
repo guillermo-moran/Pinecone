@@ -15,6 +15,7 @@ let package = Package(
         .target(
             name: "ARM64VizNative",
             cSettings: [
+                .define("AVZ_THREADED_PROTOTYPE_ENABLE", to: "1"),
                 .unsafeFlags(["-O3"], .when(configuration: .debug)),
                 .unsafeFlags(["-O3"], .when(configuration: .release))
             ]

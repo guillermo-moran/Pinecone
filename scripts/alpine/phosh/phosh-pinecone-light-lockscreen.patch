@@ -1,0 +1,431 @@
+diff -ruN -x subprojects a/src/lockscreen.c b/src/lockscreen.c
+--- a/src/lockscreen.c	2026-08-19 10:32:03
++++ b/src/lockscreen.c	2026-10-27 22:29:12
+@@ -10,6 +10,7 @@
+ #define G_LOG_DOMAIN "phosh-lockscreen"
+ 
+ #include "auth.h"
++#include "pinecone-lockscreen-policy.h"
+ #include "call-notification.h"
+ #include "calls-manager.h"
+ #include "keypad.h"
+@@ -77,6 +78,8 @@
+   GtkWidget          *carousel;
+   PhoshLockscreenPage default_page;
+   gboolean            require_unlock;
++  gboolean            lightweight;
++  GtkWidget          *unlock_hint;
+ 
+   /* info page */
+   GtkWidget          *box_info;
+@@ -557,10 +560,12 @@
+   time = phosh_wall_clock_get_clock (wall_clock, TRUE);
+ 
+   stripped = phosh_wall_clock_strip_am_pm (wall_clock, time);
+-  gtk_label_set_text (GTK_LABEL (priv->lbl_clock), stripped);
++  if (g_strcmp0 (gtk_label_get_text (GTK_LABEL (priv->lbl_clock)), stripped) != 0)
++    gtk_label_set_text (GTK_LABEL (priv->lbl_clock), stripped);
+ 
+   date = phosh_wall_clock_local_date (wall_clock);
+-  gtk_label_set_label (GTK_LABEL (priv->lbl_date), date);
++  if (g_strcmp0 (gtk_label_get_text (GTK_LABEL (priv->lbl_date)), date) != 0)
++    gtk_label_set_label (GTK_LABEL (priv->lbl_date), date);
+ }
+ 
+ 
+@@ -696,7 +701,7 @@
+     swipe_back = FALSE;
+ 
+   hdy_deck_set_can_swipe_forward (deck, swipe_forward);
+-  hdy_deck_set_can_swipe_back (deck, swipe_back);
++  hdy_deck_set_can_swipe_back (deck, !priv->lightweight && swipe_back);
+ }
+ 
+ 
+@@ -748,6 +753,9 @@
+   g_return_if_fail (PHOSH_IS_LOCKSCREEN (self));
+   priv = phosh_lockscreen_get_instance_private (self);
+ 
++  if (priv->lightweight)
++    return;
++
+   has_info |= gtk_revealer_get_reveal_child (priv->rev_notifications);
+   has_info |= gtk_revealer_get_reveal_child (priv->rev_call_notifications);
+   has_info |= gtk_revealer_get_reveal_child (priv->rev_media_player);
+@@ -844,6 +852,21 @@
+ 
+ 
+ static void
++on_light_unlock_clicked (PhoshLockscreen *self)
++{
++  PhoshLockscreenPrivate *priv = phosh_lockscreen_get_instance_private (self);
++  if (priv->auth ||
++      phosh_lockscreen_get_page (self) != PHOSH_LOCKSCREEN_PAGE_INFO ||
++      hdy_deck_get_visible_child (priv->deck) != priv->box_info)
++    return;
++
++  /* Use the existing page/authentication path, never a direct unlock signal. */
++  g_object_ref (self);
++  phosh_lockscreen_set_page (self, PHOSH_LOCKSCREEN_PAGE_UNLOCK);
++  g_object_unref (self);
++}
++
++static void
+ phosh_lockscreen_constructed (GObject *object)
+ {
+   PhoshLockscreen *self = PHOSH_LOCKSCREEN (object);
+@@ -907,18 +930,20 @@
+ 
+   manager = phosh_notify_manager_get_default ();
+   priv->notification_settings = g_settings_new (PHOSH_NOTIFICATIONS_SCHEMA_ID);
+-  gtk_list_box_bind_model (GTK_LIST_BOX (priv->list_notifications),
+-                           G_LIST_MODEL (phosh_notify_manager_get_list (manager)),
+-                           create_notification_row,
+-                           NULL,
+-                           NULL);
+-  g_signal_connect_object (phosh_notify_manager_get_list (manager),
+-                           "items-changed",
+-                           G_CALLBACK (on_notification_items_changed),
+-                           self,
+-                           G_CONNECT_SWAPPED);
+-  on_notification_items_changed (self, -1, -1, -1,
+-                                 G_LIST_MODEL (phosh_notify_manager_get_list (manager)));
++  if (!priv->lightweight) {
++    gtk_list_box_bind_model (GTK_LIST_BOX (priv->list_notifications),
++                             G_LIST_MODEL (phosh_notify_manager_get_list (manager)),
++                             create_notification_row,
++                             NULL,
++                             NULL);
++    g_signal_connect_object (phosh_notify_manager_get_list (manager),
++                             "items-changed",
++                             G_CALLBACK (on_notification_items_changed),
++                             self,
++                             G_CONNECT_SWAPPED);
++    on_notification_items_changed (self, -1, -1, -1,
++                                   G_LIST_MODEL (phosh_notify_manager_get_list (manager)));
++  }
+ 
+   shell = phosh_shell_get_default ();
+   osk_manager = phosh_shell_get_osk_manager (shell);
+@@ -946,7 +971,7 @@
+ 
+   plugin_settings = g_settings_new ("sm.puri.phosh.plugins");
+   plugins = g_settings_get_strv (plugin_settings, "lock-screen");
+-  if (plugins)
++  if (plugins && !priv->lightweight)
+     phosh_widget_box_set_plugins (PHOSH_WIDGET_BOX (priv->widget_box), plugins);
+ 
+   on_deck_visible_child_changed (self, NULL, priv->deck);
+@@ -1171,6 +1196,7 @@
+ 
+   /* info page */
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshLockscreen, box_info);
++  gtk_widget_class_bind_template_child_private (widget_class, PhoshLockscreen, unlock_hint);
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshLockscreen, box_datetime);
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshLockscreen, lbl_clock);
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshLockscreen, lbl_date);
+@@ -1199,7 +1225,29 @@
+ {
+   PhoshLockscreenPrivate *priv = phosh_lockscreen_get_instance_private (self);
+ 
++  priv->lightweight = pinecone_light_lockscreen_enabled ();
+   gtk_widget_init_template (GTK_WIDGET (self));
++
++  if (priv->lightweight) {
++    GtkWidget *button = pinecone_lockscreen_create_unlock_button ();
++    hdy_carousel_set_interactive (HDY_CAROUSEL (priv->carousel), FALSE);
++    hdy_carousel_set_animation_duration (HDY_CAROUSEL (priv->carousel), 0);
++    hdy_deck_set_transition_duration (priv->deck, 0);
++    gtk_revealer_set_transition_duration (GTK_REVEALER (priv->keypad_revealer), 0);
++    gtk_widget_set_no_show_all (GTK_WIDGET (priv->rev_notifications), TRUE);
++    gtk_widget_hide (GTK_WIDGET (priv->rev_notifications));
++    gtk_widget_set_no_show_all (GTK_WIDGET (priv->rev_media_player), TRUE);
++    gtk_widget_hide (GTK_WIDGET (priv->rev_media_player));
++    gtk_style_context_add_class (gtk_widget_get_style_context (GTK_WIDGET (self)),
++                                 "pinecone-light-lockscreen");
++    gtk_widget_set_no_show_all (priv->unlock_hint, TRUE);
++    gtk_widget_hide (priv->unlock_hint);
++    gtk_box_pack_end (GTK_BOX (priv->box_info), button, FALSE, FALSE, 0);
++    g_signal_connect_object (button, "clicked", G_CALLBACK (on_light_unlock_clicked),
++                             self, G_CONNECT_SWAPPED);
++    gtk_widget_show (button);
++    g_message ("Pinecone lightweight lockscreen enabled");
++  }
+ 
+   /* LTR doesn't work for the deck
+    * https://gitlab.gnome.org/World/Phosh/phosh/-/issues/1132 */
+diff -ruN -x subprojects a/src/pinecone-launcher.c b/src/pinecone-launcher.c
+--- a/src/pinecone-launcher.c	2026-10-27 21:45:08
++++ b/src/pinecone-launcher.c	2026-10-27 22:14:29
+@@ -8,11 +8,60 @@
+   GListModel *apps, *favorites;
+   GListStore *home_items, *dock_items;
+   GtkWidget *home, *dock, *empty, *count;
++  GtkIconTheme *icon_theme;
++  GPtrArray *warm_icons;
++  guint warm_idle, warm_index;
+ };
+ G_DEFINE_TYPE (PineconeLauncher, pinecone_launcher, GTK_TYPE_BOX)
+ static guint app_launched;
+ 
++static gboolean
++prewarm_next_icon (gpointer data)
++{
++  PineconeLauncher *self = data;
++  guint dock_count = g_list_model_get_n_items (G_LIST_MODEL (self->dock_items));
++  guint count = dock_count + g_list_model_get_n_items (G_LIST_MODEL (self->home_items));
++  guint index = self->warm_index++;
++  gboolean dock = index < dock_count;
++  g_autoptr (GAppInfo) app = NULL;
++  g_autoptr (GtkIconInfo) info = NULL;
++  g_autoptr (GdkPixbuf) pixels = NULL;
++  GIcon *icon;
++
++  if (index >= MIN (count, 32)) {
++    self->warm_idle = 0;
++    return G_SOURCE_REMOVE;
++  }
++  app = g_list_model_get_item (G_LIST_MODEL (dock ? self->dock_items : self->home_items),
++                               dock ? index : index - dock_count);
++  icon = g_app_info_get_icon (app);
++  if (!icon)
++    return G_SOURCE_CONTINUE;
++  info = gtk_icon_theme_lookup_by_gicon_for_scale (self->icon_theme, icon, dock ? 48 : 56,
++                                                  gtk_widget_get_scale_factor (GTK_WIDGET (self)),
++                                                  GTK_ICON_LOOKUP_FORCE_SIZE);
++  if (info)
++    pixels = gtk_icon_info_load_icon (info, NULL);
++  /* Retain GTK's cached icon info, not a second Home framebuffer. Each idle
++   * dispatch decodes at most one icon; input takes priority over preloading. */
++  if (pixels)
++    g_ptr_array_add (self->warm_icons, g_steal_pointer (&info));
++  return G_SOURCE_CONTINUE;
++}
++
+ static void
++schedule_prewarm (PineconeLauncher *self)
++{
++  g_clear_handle_id (&self->warm_idle, g_source_remove);
++  g_ptr_array_set_size (self->warm_icons, 0);
++  self->warm_index = 0;
++  if (g_strcmp0 (g_getenv ("PINECONE_PHOSH_HOME_PREWARM"), "0") == 0)
++    return;
++  self->warm_idle = g_idle_add_full (G_PRIORITY_LOW, prewarm_next_icon, self, NULL);
++  g_source_set_name_by_id (self->warm_idle, "[PineconeLauncher] preload Home icons");
++}
++
++static void
+ on_app_launched (GtkWidget *button, GAppInfo *info, PineconeLauncher *self)
+ {
+   g_signal_emit (self, app_launched, 0, info);
+@@ -118,6 +167,7 @@
+   gtk_label_set_text (GTK_LABEL (self->count), count_text);
+   gtk_widget_set_visible (self->dock, g_list_model_get_n_items (G_LIST_MODEL (self->dock_items)) > 0);
+   gtk_widget_set_visible (self->empty, g_hash_table_size (seen) == 0);
++  schedule_prewarm (self);
+ }
+ 
+ static void
+@@ -149,6 +199,11 @@
+ pinecone_launcher_dispose (GObject *object)
+ {
+   PineconeLauncher *self = PINECONE_LAUNCHER (object);
++  g_clear_handle_id (&self->warm_idle, g_source_remove);
++  if (self->icon_theme)
++    g_signal_handlers_disconnect_by_data (self->icon_theme, self);
++  g_clear_object (&self->icon_theme);
++  g_clear_pointer (&self->warm_icons, g_ptr_array_unref);
+   if (self->apps)
+     g_signal_handlers_disconnect_by_data (self->apps, self);
+   if (self->favorites)
+@@ -173,6 +228,11 @@
+ pinecone_launcher_init (PineconeLauncher *self)
+ {
+   GtkWidget *header, *heading, *scroll, *content;
++  self->warm_icons = g_ptr_array_new_with_free_func (g_object_unref);
++  self->icon_theme = g_object_ref (gtk_icon_theme_get_for_screen (gtk_widget_get_screen (GTK_WIDGET (self))));
++  g_signal_connect_object (self->icon_theme, "changed", G_CALLBACK (schedule_prewarm),
++                           self, G_CONNECT_SWAPPED);
++  g_signal_connect_swapped (self, "notify::scale-factor", G_CALLBACK (schedule_prewarm), self);
+   gtk_orientable_set_orientation (GTK_ORIENTABLE (self), GTK_ORIENTATION_VERTICAL);
+   gtk_widget_set_vexpand (GTK_WIDGET (self), TRUE);
+   self->home_items = g_list_store_new (G_TYPE_DESKTOP_APP_INFO);
+diff -ruN -x subprojects a/src/pinecone-lockscreen-policy.h b/src/pinecone-lockscreen-policy.h
+--- a/src/pinecone-lockscreen-policy.h	1969-12-31 18:00:00
++++ b/src/pinecone-lockscreen-policy.h	2026-10-27 22:29:12
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <gtk/gtk.h>
++
++static inline gboolean
++pinecone_light_lockscreen_enabled (void)
++{
++  const char *value = g_getenv ("PINECONE_PHOSH_LIGHT_LOCKSCREEN");
++  if (value)
++    return g_strcmp0 (value, "1") == 0;
++  return g_strcmp0 (g_getenv ("PINECONE_PHOSH_LAUNCHER"), "1") == 0;
++}
++
++static inline GtkWidget *
++pinecone_lockscreen_create_unlock_button (void)
++{
++  GtkWidget *button = gtk_button_new_with_label ("Tap to unlock");
++  gtk_widget_set_name (button, "pinecone-tap-unlock");
++  gtk_button_set_image (GTK_BUTTON (button),
++                        gtk_image_new_from_icon_name ("changes-prevent-symbolic", GTK_ICON_SIZE_BUTTON));
++  gtk_button_set_always_show_image (GTK_BUTTON (button), TRUE);
++  gtk_widget_set_halign (button, GTK_ALIGN_CENTER);
++  gtk_widget_set_size_request (button, 200, 52);
++  gtk_widget_set_margin_bottom (button, 32);
++  gtk_widget_set_margin_top (button, 16);
++  return button;
++}
+diff -ruN -x subprojects a/src/ui/lockscreen.ui b/src/ui/lockscreen.ui
+--- a/src/ui/lockscreen.ui	2026-08-19 10:32:03
++++ b/src/ui/lockscreen.ui	2026-10-27 22:29:12
+@@ -73,7 +73,7 @@
+                 <property name="hexpand">1</property>
+                 <property name="vexpand">1</property>
+                 <child>
+-                  <object class="GtkBox">
++                  <object class="GtkBox" id="unlock_hint">
+                     <property name="visible">1</property>
+                     <property name="orientation">vertical</property>
+                     <child>
+diff -ruN -x subprojects a/tests/meson.build b/tests/meson.build
+--- a/tests/meson.build	2026-10-26 18:55:51
++++ b/tests/meson.build	2026-10-27 22:14:29
+@@ -132,6 +132,7 @@
+   'notify-feedback',
+   'overview',
+   'pinecone-launcher',
++  'pinecone-lockscreen-policy',
+   'plugin-loader',
+   'quick-setting',
+   'quick-settings-box',
+diff -ruN -x subprojects a/tests/test-pinecone-launcher.c b/tests/test-pinecone-launcher.c
+--- a/tests/test-pinecone-launcher.c	2026-10-27 21:49:06
++++ b/tests/test-pinecone-launcher.c	2026-10-27 22:15:15
+@@ -241,6 +241,22 @@
+   g_assert_true (found); /* This app is deliberately absent from the boot manifest. */
+ }
+ 
++static void
++test_prewarm_lifetime (void)
++{
++  g_autoptr (GListStore) apps = g_list_store_new (G_TYPE_DESKTOP_APP_INFO);
++  g_autoptr (GListStore) favorites = g_list_store_new (G_TYPE_DESKTOP_APP_INFO);
++  GtkWidget *launcher = pinecone_launcher_new (G_LIST_MODEL (apps), G_LIST_MODEL (favorites));
++  gpointer weak = launcher;
++  g_object_ref_sink (launcher);
++  g_object_add_weak_pointer (G_OBJECT (launcher), &weak);
++  gtk_widget_destroy (launcher);
++  g_object_unref (launcher);
++  g_assert_null (weak);
++  /* A pending low-priority callback must not retain or access destroyed Home. */
++  while (g_main_context_iteration (NULL, FALSE));
++}
++
+ int
+ main (int argc, char **argv)
+ {
+@@ -253,6 +269,7 @@
+   gtk_test_init (&argc, &argv, NULL);
+   hdy_init ();
+   g_test_add_func ("/pinecone/launcher/models", test_models);
++  g_test_add_func ("/pinecone/launcher/prewarm-lifetime", test_prewarm_lifetime);
+   g_test_add_func ("/pinecone/launcher/layout", test_layout);
+   g_test_add_func ("/pinecone/launcher/pages", test_pages);
+   g_test_add_func ("/pinecone/launcher/complete-discovery", test_complete_discovery);
+diff -ruN -x subprojects a/tests/test-pinecone-lockscreen-policy.c b/tests/test-pinecone-lockscreen-policy.c
+--- a/tests/test-pinecone-lockscreen-policy.c	1969-12-31 18:00:00
++++ b/tests/test-pinecone-lockscreen-policy.c	2026-10-27 22:29:13
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "pinecone-lockscreen-policy.h"
++#include <handy.h>
++
++static void
++page_changed (HdyCarousel *carousel, guint index, guint *changes)
++{
++  (*changes)++;
++}
++
++static void
++test_static_transition (void)
++{
++  for (guint pin = 0; pin < 2; pin++) {
++    GtkWidget *window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
++    GtkWidget *carousel = hdy_carousel_new ();
++    GtkWidget *info = gtk_label_new ("Clock");
++    GtkWidget *keypad = gtk_label_new ("PIN");
++    guint changes = 0;
++    gtk_container_add (GTK_CONTAINER (window), carousel);
++    gtk_container_add (GTK_CONTAINER (carousel), info);
++    gtk_container_add (GTK_CONTAINER (carousel), keypad);
++    hdy_carousel_set_interactive (HDY_CAROUSEL (carousel), FALSE);
++    hdy_carousel_set_animation_duration (HDY_CAROUSEL (carousel), 0);
++    gtk_widget_show_all (window);
++    gtk_widget_set_visible (keypad, pin);
++    while (g_main_context_iteration (NULL, FALSE));
++    g_signal_connect (carousel, "page-changed", G_CALLBACK (page_changed), &changes);
++    hdy_carousel_scroll_to (HDY_CAROUSEL (carousel), keypad);
++    while (g_main_context_iteration (NULL, FALSE));
++    g_assert_cmpfloat_with_epsilon (hdy_carousel_get_position (HDY_CAROUSEL (carousel)), 1.0, 0.0001);
++    g_assert_cmpuint (changes, ==, 1);
++    gtk_widget_destroy (window);
++  }
++}
++
++static void
++count_click (GtkButton *button, guint *clicks)
++{
++  (*clicks)++;
++}
++
++static void
++test_button (void)
++{
++  GtkWidget *button = pinecone_lockscreen_create_unlock_button ();
++  guint clicks = 0;
++  int width, height;
++  g_object_ref_sink (button);
++  g_signal_connect (button, "clicked", G_CALLBACK (count_click), &clicks);
++  g_assert_cmpstr (gtk_button_get_label (GTK_BUTTON (button)), ==, "Tap to unlock");
++  g_assert_true (gtk_widget_get_can_focus (button));
++  gtk_widget_get_size_request (button, &width, &height);
++  g_assert_cmpint (width, >=, 200);
++  g_assert_cmpint (height, >=, 48);
++  gtk_button_clicked (GTK_BUTTON (button));
++  g_assert_cmpuint (clicks, ==, 1);
++  gtk_widget_destroy (button);
++  g_object_unref (button);
++}
++
++static void
++test_preference (void)
++{
++  g_unsetenv ("PINECONE_PHOSH_LAUNCHER");
++  g_unsetenv ("PINECONE_PHOSH_LIGHT_LOCKSCREEN");
++  g_assert_false (pinecone_light_lockscreen_enabled ());
++  g_setenv ("PINECONE_PHOSH_LAUNCHER", "1", TRUE);
++  g_assert_true (pinecone_light_lockscreen_enabled ());
++  g_setenv ("PINECONE_PHOSH_LIGHT_LOCKSCREEN", "0", TRUE);
++  g_assert_false (pinecone_light_lockscreen_enabled ());
++  g_setenv ("PINECONE_PHOSH_LIGHT_LOCKSCREEN", "invalid", TRUE);
++  g_assert_false (pinecone_light_lockscreen_enabled ());
++  g_setenv ("PINECONE_PHOSH_LIGHT_LOCKSCREEN", "1", TRUE);
++  g_assert_true (pinecone_light_lockscreen_enabled ());
++}
++
++int
++main (int argc, char **argv)
++{
++  gtk_test_init (&argc, &argv, NULL);
++  hdy_init ();
++  g_test_add_func ("/pinecone/lockscreen/button", test_button);
++  g_test_add_func ("/pinecone/lockscreen/preference", test_preference);
++  g_test_add_func ("/pinecone/lockscreen/static-transition", test_static_transition);
++  return g_test_run ();
++}

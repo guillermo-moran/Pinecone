@@ -1845,6 +1845,9 @@ public final class VirtualVirtIODevice: MMIODevice {
 
     private let interruptController: InterruptController?
     private let deviceLock = NSRecursiveLock()
+    private let gpuCompletionDispatchQueue = DispatchQueue(
+        label: "arm64viz.virtio-gpu.completions"
+    )
     private let memory: PhysicalMemory?
     private var selectedDeviceFeatures: UInt32 = 0
     private var selectedDriverFeatures: UInt32 = 0
@@ -1866,15 +1869,43 @@ public final class VirtualVirtIODevice: MMIODevice {
     private let inputMaximumY: UInt32
     private var pendingInputEvents: [VirtIOInputEvent] = []
     private var pendingInputReadIndex = 0
-    private var pendingTouchMoveStart: Int?
+    private var pendingTouchSamples = TouchMotionQueue()
+    private var inputClockSnapshotNanoseconds: UInt64 = 0
     private var touchContactActive = false
     private var nextTouchTrackingID: Int32 = 0
     private let gpu: VirtIOGPUDevice?
-    private var pendingGPUQueueCounts: [UInt32: Int] = [:]
-    private var pendingGPUResources: [UInt64: Set<UInt32>] = [:]
+    private final class GPUQueuedCommand {
+        let token: UInt64
+        let queue: UInt32
+        let descriptorIndex: UInt16
+        let responseDescriptors: [VirtIODescriptor]
+        let queueState: VirtIOQueueState
+        let request: [UInt8]
+        let access: GPUResourceAccess
+        var started = false
+        var response: [UInt8]?
+
+        init(token: UInt64, queue: UInt32, descriptorIndex: UInt16,
+             responseDescriptors: [VirtIODescriptor], queueState: VirtIOQueueState,
+             request: [UInt8]) {
+            self.token = token
+            self.queue = queue
+            self.descriptorIndex = descriptorIndex
+            self.responseDescriptors = responseDescriptors
+            self.queueState = queueState
+            self.request = request
+            self.access = GPUResourceAccess.parse(request)
+        }
+    }
+
+    private var gpuCommands: [GPUQueuedCommand] = []
+    private var processingGPUCommands = false
     private var nextGPUCommandToken: UInt64 = 0
 
     private static let maximumInFlightGPUCommands = 3
+    // Includes pending, executing, and completed-but-not-retired commands.
+    static let maximumPendingGPUCommands = 32
+    static let maximumPendingGPURequestBytes = 1_048_576
 
     public private(set) var lastNotifiedQueue: UInt32?
     public private(set) var completedBlockRequests: Int = 0
@@ -1896,6 +1927,12 @@ public final class VirtualVirtIODevice: MMIODevice {
 
     public var deliveredInputFrameCount: Int {
         withDeviceLock { inputFramesDelivered }
+    }
+
+    // Runtime drains no more than this many samples, so an admitted gesture
+    // cannot be rejected at the second queue. Two slots remain for termination.
+    public var availableTouchSampleCapacity: Int {
+        withDeviceLock { max(0, pendingTouchSamples.capacity - pendingTouchSamples.count - 2) }
     }
 
     public func inputFrameDeliveryTimestamp(for frame: Int) -> UInt64? {
@@ -1921,7 +1958,7 @@ public final class VirtualVirtIODevice: MMIODevice {
                 }
             return (
                 delivered: inputFramesDelivered,
-                target: inputFramesDelivered + pendingFrames
+                target: inputFramesDelivered + pendingFrames + pendingTouchSamples.count
             )
         }
     }
@@ -2028,7 +2065,8 @@ public final class VirtualVirtIODevice: MMIODevice {
             return
         }
         for touch in touches {
-            appendTouchLocked(x: touch.x, y: touch.y, isDown: touch.isDown)
+            inputSamplesReceived += 1
+            pendingTouchSamples.enqueue(touch)
         }
         if ((try? processInputEventQueue()) ?? 0) > 0 {
             interruptStatus |= Self.usedBufferInterrupt
@@ -2037,13 +2075,16 @@ public final class VirtualVirtIODevice: MMIODevice {
         }
     }
 
-    private func appendTouchLocked(x: UInt32, y: UInt32, isDown: Bool) {
-        inputSamplesReceived += 1
-        let clampedX = Int32(clamping: min(x, inputMaximumX))
-        let clampedY = Int32(clamping: min(y, inputMaximumY))
-        if isDown {
+    private func appendTouchFrameLocked(_ touch: TouchEvent) {
+        let clampedX = Int32(clamping: min(touch.x, inputMaximumX))
+        let clampedY = Int32(clamping: min(touch.y, inputMaximumY))
+        let time = TouchTimestampWire.words(touch.timestampNanoseconds ?? DispatchTime.now().uptimeNanoseconds)
+        pendingInputEvents.append(contentsOf: [
+            VirtIOInputEvent(type: 4, code: TouchTimestampWire.lowCode, value: time.low),
+            VirtIOInputEvent(type: 4, code: TouchTimestampWire.highCode, value: time.high)
+        ])
+        if touch.isDown {
             if !touchContactActive {
-                pendingTouchMoveStart = nil
                 let trackingID = nextTouchTrackingID
                 nextTouchTrackingID = nextTouchTrackingID == Int32.max ? 0 : nextTouchTrackingID + 1
                 pendingInputEvents.append(contentsOf: [
@@ -2059,26 +2100,17 @@ public final class VirtualVirtIODevice: MMIODevice {
                 inputFramesGenerated += 1
                 touchContactActive = true
             } else {
-                let moveFrame = [
+                pendingInputEvents.append(contentsOf: [
                     VirtIOInputEvent(type: 3, code: 0, value: clampedX),
                     VirtIOInputEvent(type: 3, code: 1, value: clampedY),
                     VirtIOInputEvent(type: 3, code: 47, value: 0),
                     VirtIOInputEvent(type: 3, code: 53, value: clampedX),
                     VirtIOInputEvent(type: 3, code: 54, value: clampedY),
                     VirtIOInputEvent(type: 0, code: 0, value: 0)
-                ]
-                if let start = pendingTouchMoveStart,
-                   start >= pendingInputReadIndex,
-                   start + moveFrame.count == pendingInputEvents.count {
-                    pendingInputEvents.replaceSubrange(start..., with: moveFrame)
-                } else {
-                    pendingTouchMoveStart = pendingInputEvents.count
-                    pendingInputEvents.append(contentsOf: moveFrame)
-                }
+                ])
                 inputFramesGenerated += 1
             }
         } else if touchContactActive {
-            pendingTouchMoveStart = nil
             pendingInputEvents.append(contentsOf: [
                 VirtIOInputEvent(type: 1, code: 330, value: 0),
                 VirtIOInputEvent(type: 3, code: 47, value: 0),
@@ -2373,11 +2405,11 @@ public final class VirtualVirtIODevice: MMIODevice {
         pendingInputEvents.removeAll(keepingCapacity: true)
         inputDeliveryTimes = .init(repeating: nil, count: inputDeliveryTimes.count)
         pendingInputReadIndex = 0
-        pendingTouchMoveStart = nil
+        pendingTouchSamples.removeAll()
+        inputClockSnapshotNanoseconds = 0
         touchContactActive = false
         nextTouchTrackingID = 0
-        pendingGPUQueueCounts.removeAll(keepingCapacity: true)
-        pendingGPUResources.removeAll(keepingCapacity: true)
+        gpuCommands.removeAll(keepingCapacity: true)
         gpu?.reset()
         updateInterruptLine()
     }
@@ -2412,20 +2444,68 @@ public final class VirtualVirtIODevice: MMIODevice {
     }
 
     private func processGPUQueue(_ queue: UInt32) throws -> Int {
-        guard var state = queues[queue], state.ready, state.size > 0,
-              let memory, let gpu,
-              pendingGPUQueueCounts[queue, default: 0] <
-                Self.maximumInFlightGPUCommands else {
+        guard !processingGPUCommands,
+              let state = queues[queue], state.ready, state.size > 0,
+              let memory, let gpu else {
             return 0
         }
+        processingGPUCommands = true
+        defer { processingGPUCommands = false }
         let availableIndex = try readMemory16Acquire(memory, at: state.driverAddress + 2)
         let initialDisplayGeneration = gpu.generation
-        var completed = 0
-        while state.lastAvailableIndex != availableIndex {
-            if pendingGPUQueueCounts[queue, default: 0] >=
-                Self.maximumInFlightGPUCommands {
-                break
+        defer {
+            let finalDisplayGeneration = gpu.generation
+            if finalDisplayGeneration != initialDisplayGeneration {
+                onDisplayFrameCommitted?(finalDisplayGeneration)
             }
+        }
+        var completed = 0
+        while true {
+            var stagingError: Error?
+            do {
+                try stageGPUCommands(queue: queue, availableIndex: availableIndex, memory: memory)
+            } catch {
+                stagingError = error
+            }
+            var dispatched = false
+            while let command = nextRunnableGPUCommand() {
+                dispatched = true
+                command.started = true
+                var dispatch: VirtIOGPUDevice.DispatchResult = .unhandled
+                if command.queue == VirtIOGPUDevice.controlQueue {
+                    let token = command.token
+                    dispatch = gpu.processDeferred(
+                        request: command.request,
+                        memory: memory,
+                        completion: { [weak self] response in
+                            self?.completeDeferredGPUCommand(commandToken: token, response: response)
+                        }
+                    )
+                }
+                switch dispatch {
+                case .deferred:
+                    continue
+                case let .completed(response):
+                    command.response = response
+                case .unhandled:
+                    command.response = gpu.process(request: command.request, memory: memory)
+                }
+            }
+            completed += try retireGPUCommands(memory: memory)
+            if let stagingError { throw stagingError }
+            guard dispatched,
+                  gpuCommands.count < Self.maximumPendingGPUCommands,
+                  queues[queue]?.lastAvailableIndex != availableIndex else { break }
+        }
+        return completed
+    }
+
+    private func stageGPUCommands(
+        queue: UInt32, availableIndex: UInt16, memory: PhysicalMemory
+    ) throws {
+        guard var state = queues[queue] else { return }
+        while state.lastAvailableIndex != availableIndex,
+              gpuCommands.count < Self.maximumPendingGPUCommands {
             let ringOffset = UInt64(4 + (UInt32(state.lastAvailableIndex) % state.size) * 2)
             let descriptorIndex = try readMemory16(memory, at: state.driverAddress + ringOffset)
             let descriptors = try descriptorChain(startingAt: descriptorIndex, queueState: state, memory: memory)
@@ -2439,11 +2519,15 @@ public final class VirtualVirtIODevice: MMIODevice {
             }
             let requestLength = try requestDescriptors.reduce(0) { total, descriptor in
                 let length = Int(descriptor.length)
-                guard total <= 1_048_576 - length else {
+                guard total <= Self.maximumPendingGPURequestBytes - length else {
                     throw VMError.deviceError("\(name) GPU control request is too large")
                 }
                 return total + length
             }
+            // Count retained requests too: out-of-order completions must not
+            // allow an unbounded backlog behind a slow fence.
+            let retainedBytes = gpuCommands.reduce(0) { $0 + $1.request.count }
+            guard requestLength <= Self.maximumPendingGPURequestBytes - retainedBytes else { break }
             var request = Array(repeating: UInt8(0), count: requestLength)
             try memory.copyOwnedDeviceBytes(
                 from: requestDescriptors.map {
@@ -2451,59 +2535,55 @@ public final class VirtualVirtIODevice: MMIODevice {
                 },
                 to: &request
             )
-            let dependencies = VirtIOGPUDevice.resourceDependencies(request)
-            if !pendingGPUResources.isEmpty && (dependencies == nil ||
-                pendingGPUResources.values.contains(where: { !$0.isDisjoint(with: dependencies!) })) {
-                break
-            }
-            var synchronousResponse: [UInt8]?
-            if queue == VirtIOGPUDevice.controlQueue {
-                let synchronousState = state
-                state.lastAvailableIndex &+= 1
-                let deferredQueueState = state
-                queues[queue] = state
-                pendingGPUQueueCounts[queue, default: 0] += 1
-                nextGPUCommandToken &+= 1
-                let commandToken = nextGPUCommandToken
-                pendingGPUResources[commandToken] = dependencies ?? []
-                let dispatch = gpu.processDeferred(
-                    request: request,
-                    memory: memory,
-                    completion: { [weak self] response in
-                        self?.completeDeferredGPUCommand(
-                            queue: queue,
-                            commandToken: commandToken,
-                            descriptorIndex: descriptorIndex,
-                            responseDescriptors: responseDescriptors,
-                            queueState: deferredQueueState,
-                            response: response
-                        )
-                    }
-                )
-                if case .deferred = dispatch {
-                    continue
-                }
-                if case let .completed(response) = dispatch { synchronousResponse = response }
-                pendingGPUResources.removeValue(forKey: commandToken)
-                let pendingCount = pendingGPUQueueCounts[queue, default: 0]
-                if pendingCount <= 1 {
-                    pendingGPUQueueCounts.removeValue(forKey: queue)
-                } else {
-                    pendingGPUQueueCounts[queue] = pendingCount - 1
-                }
-                queues[queue] = synchronousState
-                state = synchronousState
-            }
+            nextGPUCommandToken &+= 1
+            gpuCommands.append(GPUQueuedCommand(
+                token: nextGPUCommandToken, queue: queue, descriptorIndex: descriptorIndex,
+                responseDescriptors: responseDescriptors, queueState: state, request: request
+            ))
+            state.lastAvailableIndex &+= 1
+            queues[queue] = state
+        }
+    }
 
-            let response = synchronousResponse ?? gpu.process(request: request, memory: memory)
+    private func nextRunnableGPUCommand() -> GPUQueuedCommand? {
+        let active = gpuCommands.filter { $0.started && $0.response == nil }
+        guard active.count < Self.maximumInFlightGPUCommands else { return nil }
+        for (index, command) in gpuCommands.enumerated() where !command.started {
+            guard !active.contains(where: { command.access.conflicts(with: $0.access) }) else {
+                continue
+            }
+            // Earlier blocked readers/writers still own their position in the
+            // dependency graph. A later command must not overtake their hazards.
+            guard !gpuCommands[..<index].contains(where: {
+                !$0.started && command.access.conflicts(with: $0.access)
+            }) else { continue }
+            return command
+        }
+        return nil
+    }
+
+    private func retireGPUCommands(memory: PhysicalMemory) throws -> Int {
+        var completed = 0
+        var blockedQueues = Set<UInt32>()
+        var index = 0
+        while index < gpuCommands.count {
+            let command = gpuCommands[index]
+            guard !blockedQueues.contains(command.queue), let response = command.response else {
+                blockedQueues.insert(command.queue)
+                index += 1
+                continue
+            }
+            // Linux signals earlier fences on a timeline when a later fence is
+            // returned. Retire in queue order, even when execution finishes out
+            // of order, and keep response bytes private until that retirement.
             var usedLength: UInt32 = 0
-            if queue == VirtIOGPUDevice.controlQueue {
-                let responseCapacity = responseDescriptors.reduce(0) { $0 + Int($1.length) }
+            if command.queue == VirtIOGPUDevice.controlQueue {
+                let responseCapacity = command.responseDescriptors.reduce(0) { $0 + Int($1.length) }
                 guard response.count <= responseCapacity else {
                     throw VMError.deviceError("\(name) GPU response descriptor is too small")
                 }
                 var responseOffset = 0
-                for descriptor in responseDescriptors where responseOffset < response.count {
+                for descriptor in command.responseDescriptors where responseOffset < response.count {
                     let count = min(Int(descriptor.length), response.count - responseOffset)
                     try memory.copyOwnedDeviceBytes(
                         from: response,
@@ -2516,82 +2596,62 @@ public final class VirtualVirtIODevice: MMIODevice {
                 usedLength = UInt32(response.count)
             }
             try publishUsedElement(
-                descriptorIndex: descriptorIndex,
+                descriptorIndex: command.descriptorIndex,
                 usedLength: usedLength,
-                queueState: state,
+                queueState: command.queueState,
                 memory: memory
             )
-            state.lastAvailableIndex &+= 1
+            gpuCommands.remove(at: index)
             completed += 1
-        }
-        queues[queue] = state
-        let finalDisplayGeneration = gpu.generation
-        if finalDisplayGeneration != initialDisplayGeneration {
-            onDisplayFrameCommitted?(finalDisplayGeneration)
+            interruptStatus |= Self.usedBufferInterrupt
+            updateInterruptLine()
         }
         return completed
     }
 
     private func completeDeferredGPUCommand(
-        queue: UInt32,
         commandToken: UInt64,
-        descriptorIndex: UInt16,
-        responseDescriptors: [VirtIODescriptor],
-        queueState: VirtIOQueueState,
         response: [UInt8]
     ) {
-        withDeviceLock {
-            guard pendingGPUResources.removeValue(forKey: commandToken) != nil,
-                  let pendingCount = pendingGPUQueueCounts[queue],
-                  pendingCount > 0, let memory else {
-                return
-            }
-            if pendingCount == 1 {
-                pendingGPUQueueCounts.removeValue(forKey: queue)
-            } else {
-                pendingGPUQueueCounts[queue] = pendingCount - 1
-            }
-            do {
-                let responseCapacity = responseDescriptors.reduce(0) {
-                    $0 + Int($1.length)
+        // Reset holds deviceLock while draining every GPU reservation. Metal
+        // may deliver callbacks serially, so this callback must not wait for
+        // that lock and prevent the next callback from releasing its reservation.
+        // Recursive try-lock preserves synchronous inline/uncontended retirement.
+        guard deviceLock.try() else {
+            gpuCompletionDispatchQueue.async { [self] in
+                withDeviceLock {
+                    completeDeferredGPUCommandLocked(commandToken: commandToken, response: response)
                 }
-                guard response.count <= responseCapacity else {
-                    throw VMError.deviceError(
-                        "\(name) deferred GPU response descriptor is too small"
-                    )
-                }
-                var responseOffset = 0
-                for descriptor in responseDescriptors where responseOffset < response.count {
-                    let count = min(
-                        Int(descriptor.length),
-                        response.count - responseOffset
-                    )
-                    try memory.copyOwnedDeviceBytes(
-                        from: response,
-                        sourceOffset: responseOffset,
-                        count: count,
-                        to: descriptor.address
-                    )
-                    responseOffset += count
-                }
-                try publishUsedElement(
-                    descriptorIndex: descriptorIndex,
-                    usedLength: UInt32(response.count),
-                    queueState: queueState,
-                    memory: memory
-                )
-                interruptStatus |= Self.usedBufferInterrupt
-                _ = try processGPUQueue(queue)
-                _ = try processGPUQueue(VirtIOGPUDevice.cursorQueue)
-                updateInterruptLine()
-            } catch {
-                interruptStatus |= Self.usedBufferInterrupt
-                updateInterruptLine()
             }
+            return
+        }
+        defer { deviceLock.unlock() }
+        completeDeferredGPUCommandLocked(commandToken: commandToken, response: response)
+    }
+
+    private func completeDeferredGPUCommandLocked(
+        commandToken: UInt64,
+        response: [UInt8]
+    ) {
+        // Tokens are not reused on reset; stale accelerator callbacks cannot
+        // publish into the new queue or release its resource reservations.
+        guard let command = gpuCommands.first(where: { $0.token == commandToken }),
+              command.started, command.response == nil, let memory else {
+            return
+        }
+        command.response = response
+        do {
+            _ = try retireGPUCommands(memory: memory)
+            _ = try processGPUQueue(VirtIOGPUDevice.controlQueue)
+            _ = try processGPUQueue(VirtIOGPUDevice.cursorQueue)
+        } catch {
+            interruptStatus |= Self.usedBufferInterrupt
+            updateInterruptLine()
         }
     }
 
     private func processInputEventQueue() throws -> Int {
+        stageNextTouchFrame()
         guard pendingInputReadIndex < pendingInputEvents.count else {
             return 0
         }
@@ -2617,9 +2677,6 @@ public final class VirtualVirtIODevice: MMIODevice {
             }
             let event = pendingInputEvents[pendingInputReadIndex]
             pendingInputReadIndex += 1
-            if let moveStart = pendingTouchMoveStart, pendingInputReadIndex > moveStart {
-                pendingTouchMoveStart = nil
-            }
             var eventBytes = [UInt8](repeating: 0, count: 8)
             eventBytes[0] = UInt8(truncatingIfNeeded: event.type)
             eventBytes[1] = UInt8(truncatingIfNeeded: event.type >> 8)
@@ -2651,10 +2708,20 @@ public final class VirtualVirtIODevice: MMIODevice {
                     inputFramesDelivered, DispatchTime.now().uptimeNanoseconds
                 )
             }
+            stageNextTouchFrame()
         }
         queues[0] = state
         compactPendingInputEvents()
         return delivered
+    }
+
+    private func stageNextTouchFrame() {
+        guard kind == .input, inputRole == .touchscreen,
+              pendingInputReadIndex == pendingInputEvents.count else { return }
+        compactPendingInputEvents()
+        if let touch = pendingTouchSamples.popFirst() {
+            appendTouchFrameLocked(touch)
+        }
     }
 
     private func compactPendingInputEvents() {
@@ -2664,7 +2731,6 @@ public final class VirtualVirtIODevice: MMIODevice {
         if pendingInputReadIndex == pendingInputEvents.count {
             pendingInputEvents.removeAll(keepingCapacity: true)
             pendingInputReadIndex = 0
-            pendingTouchMoveStart = nil
             return
         }
         guard pendingInputReadIndex >= 256,
@@ -2672,9 +2738,6 @@ public final class VirtualVirtIODevice: MMIODevice {
             return
         }
         pendingInputEvents.removeFirst(pendingInputReadIndex)
-        if let moveStart = pendingTouchMoveStart {
-            pendingTouchMoveStart = moveStart - pendingInputReadIndex
-        }
         pendingInputReadIndex = 0
     }
 
@@ -3297,6 +3360,9 @@ public final class VirtualVirtIODevice: MMIODevice {
                 inputConfigSelect = byte
             } else if byteOffset == 1 {
                 inputConfigSubselect = byte
+                if inputConfigSelect == TouchTimestampWire.configSelect {
+                    inputClockSnapshotNanoseconds = DispatchTime.now().uptimeNanoseconds
+                }
             }
         }
     }
@@ -3345,7 +3411,10 @@ public final class VirtualVirtIODevice: MMIODevice {
             Self.writeLE16(0x06, into: &payload, at: 0)
             Self.writeLE16(0x4156, into: &payload, at: 2)
             Self.writeLE16(0x0001, into: &payload, at: 4)
-            Self.writeLE16(0x0001, into: &payload, at: 6)
+            Self.writeLE16(inputRole == .touchscreen ? 0x0002 : 0x0001, into: &payload, at: 6)
+        case TouchTimestampWire.configSelect where inputRole == .touchscreen && inputConfigSubselect == 0:
+            payload = Array(repeating: 0, count: 8)
+            Self.writeLE64(inputClockSnapshotNanoseconds, into: &payload, at: 0)
         case 0x10 where inputConfigSubselect == 0 && inputRole == .touchscreen:
             payload = [0x02]
         case 0x11:

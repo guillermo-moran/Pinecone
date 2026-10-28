@@ -231,6 +231,12 @@ Portfolio, GNOME Calculator, Calendar, Clocks, Text Editor, Foot, and their
 runtime dependencies. Downloaded APKs are cached under
 `artifacts/alpine-packages/edge-aarch64/`.
 
+The graphical image also includes the native GTK3 **Packages** app. Its builder
+requires `gtk+3.0-dev`, `json-glib-dev`, and a C toolchain in the Alpine/aarch64
+build VM (`PINECONE_CACHE_LIMA_INSTANCE`, normally `pinecone-builder`). The image
+build uses APK itself to verify archives and generate the installed-package
+database; it does not merely extract files and leave APK unaware of them.
+
 To build a smaller non-graphical rootfs:
 
 ```sh
@@ -299,6 +305,34 @@ Inside the guest, start the graphical session with:
 ```sh
 start-pinecone-phosh
 ```
+
+## Guest Launcher
+
+Pinecone's guest Home screen is part of the patched Phosh shell, not an iOS
+overlay. It provides a four-column app grid, a four-app dock, and a persistent
+bottom navigation strip: **Recent Apps**, **Home**, and **All Apps**. Narrow
+displays reduce the Home grid's column count without shrinking the icons.
+
+The dock uses the first four Phosh favorites. Fresh images seed Browser, Files,
+Packages, and Settings; long-press an app to change its favorite status. Extra
+favorites remain on Home. All Apps includes dock apps and search, and desktop
+entries installed or removed by the package manager update through Phosh's
+existing application monitor. Recents uses real running windows, including the
+existing close and activate actions.
+
+The navigation surface reserves its own space so applications are not obscured,
+does not take keyboard focus, and is hidden while the guest is locked. These are
+shell navigation controls, not a synthetic Android-style Back key.
+`PINECONE_PHOSH_LAUNCHER=0 start-pinecone-phosh` retains upstream Phosh's overview
+for comparison. The normal guest session enables the Pinecone launcher.
+
+Rebuild the patched shell before rebuilding the rootfs:
+
+```sh
+PINECONE_WLROOTS_LIMA_INSTANCE=pinecone-builder bash scripts/build-pinecone-phosh.sh
+```
+
+The build runs upstream Phosh tests plus the launcher model/lifecycle tests.
 
 ## Desktop Tools
 
@@ -374,18 +408,60 @@ hostnames are not redirected to that HTTP-only endpoint.
 
 ### Web Browser
 
-The Phosh image includes NetSurf GTK3, accessible from the app grid and
-favorites. Its default page is `https://example.com/`. From a terminal inside
-the Phosh session, run `pinecone-launch-browser https://example.com/`.
-The browser uses the guest CA bundle and retains its profile on the persistent
-root filesystem. No on-device package installation is needed.
+The Phosh image includes **Firefox**, with NetSurf GTK3 retained as a lightweight
+alternative. Fresh images put Firefox in the dock. From a terminal inside the
+Phosh session, run `pinecone-launch-firefox https://example.com/`, or
+`pinecone-launch-browser https://example.com/` for NetSurf. TLS certificate
+validation remains enabled, and both retain their profiles on the persistent root filesystem.
+No on-device package installation is needed.
 
-This is a basic HTML/CSS browser, not a Chromium/WebKit replacement. JavaScript
+Firefox uses native Wayland and software WebRender because this virtual GPU
+does not expose OpenGL/Vulkan. Its launcher requires a kernel with user
+namespaces and seccomp; rebuild the kernel as well as the root image when
+upgrading an older bundle. It does not disable browser sandboxing or site
+isolation. See [Firefox integration](docs/firefox-browser-2026-10-28.md) for
+package compatibility, verification, and remaining limitations.
+
+NetSurf is a basic HTML/CSS browser, not a Chromium/WebKit replacement. JavaScript
 is disabled in the initial profile and many modern web apps will not work.
 NetSurf has no renderer sandbox, and the current demo desktop runs as root:
 use trusted test pages only, without sensitive credentials. Browser isolation
 and modern web-app compatibility remain separate work; TLS validation is not
 disabled to obtain connectivity.
+
+### Package Manager
+
+Open **Packages** from Phosh's app grid, or run `pinecone-launch-packages` inside
+the guest desktop. Its mobile, Cydia-inspired interface has Home, Sources,
+Updates, Installed, and Search tabs. Home offers curated app categories;
+package pages show real APK metadata, dependencies, sizes, and installed versions.
+Queue packages, open the queue in the header, and review APK's proposed changes
+before applying them. Activity streams transaction output and errors. Search
+uses the guest Wayland keyboard, not an iOS overlay.
+
+The bundled runtime is retained by the `.pinecone-platform` metapackage with
+exact dependency versions. Bundled packages are separated from added packages;
+additional packages can be installed, updated, and removed. A package requiring newer
+platform libraries may be rejected until the base image is rebuilt. This is
+intentional: an unrestricted rolling-edge upgrade could overwrite the patched
+musl, GLib, Pixman, Cairo, wlroots, Phoc, or Phosh implementation. A queue batches
+one transaction type at a time (install, remove, or update); it does not perform
+whole-system upgrades. Sources can be added, enabled, and disabled without
+replacing trusted keys. Neither the build nor the UI disables APK signature checks. These
+pins are compatibility constraints, not a security boundary against guest root.
+The CLI remains available:
+
+```sh
+apk update
+apk add tree
+apk del tree
+```
+
+Packages and the APK database live on persistent `rootfs.ext4`. Use Pinecone's
+normal stop/reboot controls to flush that disk; force-killing the host is not a
+durability guarantee. The builder seeds the explicit host package-proxy URLs;
+boot no longer overwrites a user's repository configuration. This package UI
+uses the current root demo session, not a new privilege-escalation service.
 
 ## Debugging and Performance
 

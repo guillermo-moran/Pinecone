@@ -9,6 +9,9 @@ INSTANCE="${PINECONE_WLROOTS_LIMA_INSTANCE:-pinecone-wlroots}"
 mkdir -p "${OUTPUT_DIR}"
 cp "${ROOT_DIR}/scripts/patches/wlroots-pinecone-0.20.2.patch" \
   "${PACKAGE_DIR}/wlroots-pinecone-0.20.2.patch"
+for patch_name in wlroots-pinecone-dmabuf wlroots-pinecone-ownership; do
+  cp "${ROOT_DIR}/scripts/patches/${patch_name}.patch" "${PACKAGE_DIR}/"
+done
 
 if [[ "$(uname -s)" == "Linux" ]] && command -v abuild >/dev/null 2>&1; then
   cd "${PACKAGE_DIR}"
@@ -50,22 +53,24 @@ limactl copy \
   "${PACKAGE_DIR}/APKBUILD" \
   "${PACKAGE_DIR}/e8c983808d8b98a71f991c16c24367494386958b.patch" \
   "${PACKAGE_DIR}/wlroots-pinecone-0.20.2.patch" \
+  "${PACKAGE_DIR}/wlroots-pinecone-dmabuf.patch" \
+  "${PACKAGE_DIR}/wlroots-pinecone-ownership.patch" \
   "${INSTANCE}:${GUEST_BUILD_DIR}/"
 limactl shell "${INSTANCE}" sudo -u "${GUEST_USER}" -g abuild sh -lc \
   "cd '${GUEST_BUILD_DIR}' && abuild -r"
 
 GUEST_PACKAGE="$(limactl shell "${INSTANCE}" sh -lc \
-  "find ~/packages -path '*/aarch64/wlroots0.20-0.20.2-r4.apk' -print -quit")"
+  "find ~/packages -path '*/aarch64/wlroots0.20-0.20.2-r6.apk' -print -quit")"
 [[ -n "${GUEST_PACKAGE}" ]] || {
   echo "wlroots runtime package was not produced" >&2
   exit 1
 }
 limactl copy "${INSTANCE}:${GUEST_PACKAGE}" "${OUTPUT_DIR}/"
 
-PACKAGE="${OUTPUT_DIR}/wlroots0.20-0.20.2-r4.apk"
+PACKAGE="${OUTPUT_DIR}/wlroots0.20-0.20.2-r6.apk"
 INFO="$(bsdtar -xOf "${PACKAGE}" .PKGINFO)"
 grep -qx 'pkgname = wlroots0.20' <<<"${INFO}"
-grep -qx 'pkgver = 0.20.2-r4' <<<"${INFO}"
+grep -qx 'pkgver = 0.20.2-r6' <<<"${INFO}"
 grep -qx 'arch = aarch64' <<<"${INFO}"
 bsdtar -tf "${PACKAGE}" | grep -q '^usr/lib/libwlroots-0.20.so$'
 

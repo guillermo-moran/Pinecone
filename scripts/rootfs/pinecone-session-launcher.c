@@ -305,6 +305,7 @@ static void configure_environment(void)
     setenv("PINECONE_PIXMAN_DIAGNOSTICS", "0", 0);
     setenv("PINECONE_PIXMAN_OPERATOR_MASK", "0x3fff", 0);
     setenv("PINECONE_PHOSH_PROFILE", "1", 1);
+    setenv("PINECONE_PHOSH_LAUNCHER", "1", 0);
     setenv("PINECONE_PHOSH_APP_MANIFEST", "/usr/share/pinecone/phosh-apps.list", 1);
     setenv("PINECONE_SETTINGS_PREWARM_READY_FILE", settings_ready_path, 0);
     setenv("PHOSH_DEBUG", "fake-builtin", 1);

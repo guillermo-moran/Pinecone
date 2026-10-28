@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Packages
+Comment=Manage Alpine Linux packages
+Exec=/usr/local/bin/pinecone-launch-packages
+Icon=system-software-install-symbolic
+Terminal=false
+DBusActivatable=false
+Categories=System;PackageManager;
+Keywords=apk;install;software;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

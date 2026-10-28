@@ -1,9 +1,9 @@
 # Pinecone's reproducible Phosh build. It follows Alpine edge's 0.57.0-r1
-# package and adds only the opt-in Pinecone startup profile.
+# package with opt-in Pinecone startup, launch tracking, and launcher integration.
 maintainer="team/phosh <newbyte@postmarketos.org>"
 pkgname=phosh
 pkgver=0.57.0
-pkgrel=3
+pkgrel=8
 pkgdesc="Wayland shell for GNOME on mobile devices"
 arch="all !armhf"
 url="https://gitlab.gnome.org/World/Phosh/phosh"
@@ -28,17 +28,18 @@ depends="
 	xwayland
 	"
 makedepends="
+	appstream-dev
 	callaudiod-dev
 	elogind-dev
 	evince-dev
-	evolution-data-server-dev
+	evolution-data-server-dev=3.60.2-r2
 	feedbackd-dev
 	gcr-dev
 	gettext-dev
 	glib-dev
 	gmobile-dev
 	gnome-bluetooth-dev
-	gnome-desktop-dev
+	gnome-desktop-dev=44.5-r0
 	gtk+3.0-dev
 	libadwaita-dev
 	libgudev-dev
@@ -74,6 +75,11 @@ source="
 	phosh-pinecone-startup.patch
 	phosh-pinecone-app-manifest.patch
 	phosh-pinecone-service-profile.patch
+	phosh-pinecone-launch-lifecycle.patch
+	phosh-pinecone-launcher.patch
+	phosh-pinecone-launcher-polish.patch
+	phosh-pinecone-light-lockscreen.patch
+	pinecone-launcher.css
 	"
 builddir="$srcdir/$pkgname-$pkgver"
 somask="libphoshsearch.so"
@@ -94,7 +100,10 @@ build() {
 }
 
 check() {
-	xvfb-run -a meson test --print-errorlogs -C output
+	mkdir -p "$startdir/launcher-screenshots"
+	PINECONE_LAUNCHER_CSS="$srcdir/pinecone-launcher.css" \
+	PINECONE_LAUNCHER_SCREENSHOT_DIR="$startdir/launcher-screenshots" \
+		xvfb-run -a meson test --print-errorlogs -C output
 }
 
 package() {
@@ -125,4 +134,9 @@ cb4bad612e5d2dff156c6b97b460c16ab7fd48067935b616fe0b65d11c3d255f1ecd06b800c654ac
 5d0d8ec0c0896d2d7859b2fdf1507a17950cabdc764f22950aba7b30ba6d10eaf55d5e5bb8de54b14c9fac9e18b71f5ecc3bd1cc10ed8d0264620eb38e419581  phosh-pinecone-startup.patch
 e25c3f729f04be6831fe43f3a9fbd71ece0243d5e2e43c30a580608aa825f2c0f390bf3d815669fbeb2c4c63a089048618a1b88c3d0a317dc5577ff845711853  phosh-pinecone-app-manifest.patch
 bb941dbcc332698dac3af264dd370b9381d87a2bb7630fd9a6173396962724c03cf6c811923b05d87d8a46baeea32d17cf68e24aa68046f310ba2893447b9354  phosh-pinecone-service-profile.patch
+4436b5018a7e2d11e295285427d22f81a80ebe2aefac6ac8064e442583c839e507e5605b8885f252527785fb923d5708189475de7dc951f9f0e77590fa25ca00  phosh-pinecone-launch-lifecycle.patch
+be2c41e9f0105aefbabeb888676f80acf6bfb2fd3438be3b93c3315064c272643b13d895a1a70c954d6dc60649393b248f05d84db083f2c2d86ea3e07d34d489  phosh-pinecone-launcher.patch
+3bf3e40c51706a9de5c10cc8c5104b9146fe7194446fe8f049c848428817807b9859a330f5fadfc290a3aed5adb4fae58360eb5e5cfe960a8a290fde618b7898  phosh-pinecone-launcher-polish.patch
+bedcbfe4a335e01947e9e574dbc397c9a72a3a9cbd436a863a72a222c0e1caa520b031a714f304a2fa9fee89e29961d256b69aa12a26d7167507c2703ece786c  phosh-pinecone-light-lockscreen.patch
+034adfe5928128df266033689e8ddcc3b52b9e4628062ee67ccff2d94ea02c1528c9f6d057938b7e21bb66b85384c2eb914edab04aa36ad1a507391dc92a5604  pinecone-launcher.css
 "

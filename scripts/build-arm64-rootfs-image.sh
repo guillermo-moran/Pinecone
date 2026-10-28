@@ -93,7 +93,17 @@ mkdir -p \
 chmod 1777 "${ROOTFS_DIR}/tmp" "${ROOTFS_DIR}/var/tmp"
 if [[ "${ARM64VIZ_GRAPHICAL_ROOTFS:-1}" == "1" ]]; then
   export ARM64VIZ_GRAPHICAL_PROFILE="${ARM64VIZ_GRAPHICAL_PROFILE:-phosh}"
-  "${ROOT_DIR}/scripts/stage-alpine-graphical-rootfs.sh" "${ROOTFS_DIR}"
+  PINECONE_APK_MANIFEST_OUT="${WORK_DIR}/apk-manifest.txt" \
+    "${ROOT_DIR}/scripts/stage-alpine-graphical-rootfs.sh" "${ROOTFS_DIR}"
+  bash "${ROOT_DIR}/scripts/register-rootfs-packages.sh" \
+    "${ROOTFS_DIR}" "${WORK_DIR}/apk-manifest.txt"
+  if [[ "${ARM64VIZ_GRAPHICAL_PROFILE}" == phosh ]]; then
+    bash "${ROOT_DIR}/scripts/build-pinecone-packages.sh" "${OUT_DIR}/pinecone-packages"
+    install -m 0755 "${OUT_DIR}/pinecone-packages" "${ROOTFS_DIR}/usr/local/bin/pinecone-packages"
+    install -m 0755 "${ROOT_DIR}/scripts/rootfs/pinecone-launch-packages" "${ROOTFS_DIR}/usr/local/bin/pinecone-launch-packages"
+    install -m 0644 "${ROOT_DIR}/scripts/rootfs/pinecone-packages.desktop" \
+      "${ROOTFS_DIR}/usr/share/applications/me.gmoran.pinecone.packages.desktop"
+  fi
   "${ROOT_DIR}/scripts/build-pinecone-pixman.sh" \
     "${OUT_DIR}/libpinecone-pixman.so"
   "${ROOT_DIR}/scripts/build-pinecone-session-launcher.sh" \
@@ -189,6 +199,8 @@ org.gnome.clocks.desktop
 org.gnome.TextEditor.desktop
 org.gnome.Settings.desktop
 netsurf.desktop
+firefox.desktop
+me.gmoran.pinecone.packages.desktop
 EOF
   SCHEMA_DIR="${ROOTFS_DIR}/usr/share/glib-2.0/schemas"
   if [[ -d "${SCHEMA_DIR}" ]]; then
@@ -220,8 +232,8 @@ toolkit-accessibility=false
 require-unlock=false
 
 [sm.puri.phosh]
-favorites=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.TextEditor.desktop', 'netsurf.desktop']
-force-adaptive=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.Calendar.desktop', 'org.gnome.clocks.desktop', 'org.gnome.TextEditor.desktop', 'netsurf.desktop']
+favorites=['firefox.desktop', 'dev.tchx84.Portfolio.desktop', 'me.gmoran.pinecone.packages.desktop', 'org.gnome.Settings.desktop']
+force-adaptive=['foot.desktop', 'dev.tchx84.Portfolio.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.Calendar.desktop', 'org.gnome.clocks.desktop', 'org.gnome.TextEditor.desktop', 'netsurf.desktop', 'firefox.desktop']
 EOF
     if ! command -v glib-compile-schemas >/dev/null 2>&1; then
       echo "glib-compile-schemas is required for graphical rootfs profiles" >&2
@@ -787,8 +799,9 @@ iface lo inet loopback
 # eth0 belongs to pinecone-network bootstrap, then NetworkManager.
 EOF
 cat > "${ROOTFS_DIR}/etc/apk/repositories" <<'EOF'
-http://dl-cdn.alpinelinux.org/alpine/edge/main
-http://dl-cdn.alpinelinux.org/alpine/edge/community
+http://10.0.2.2/alpine/edge/main
+http://10.0.2.2/alpine/edge/community
+@browser https://dl-cdn.alpinelinux.org/alpine/v3.24/community
 EOF
 cat > "${ROOTFS_DIR}/etc/apk/arch" <<'EOF'
 aarch64
@@ -859,6 +872,10 @@ fi
   -L arm64viz-root \
   -d "${ROOTFS_DIR}" \
   "${IMAGE_STAGING}"
+
+# mke2fs copies staging ownership; /root must belong to guest root, not the
+# unprivileged host build user. Firefox correctly rejects a mismatched HOME.
+bash "${ROOT_DIR}/scripts/fix-rootfs-home-owner.sh" "${IMAGE_STAGING}"
 
 # Never publish an image unless the ext4 metadata is internally consistent.
 # -n keeps validation read-only; -f checks every group even for a clean image.

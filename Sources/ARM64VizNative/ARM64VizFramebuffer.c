@@ -110,6 +110,11 @@ static void avz_framebuffer_copy_rectangle(
     size_t height
 );
 
+static int avz_framebuffer_disjoint_spans(
+    const uint8_t *a, size_t a_stride, size_t a_height,
+    const uint8_t *b, size_t b_stride, size_t b_height
+);
+
 int avz_framebuffer_normalize_bgra8(
     uint8_t *pixels,
     size_t stride,
@@ -613,6 +618,15 @@ int avz_framebuffer_bilinear_scale_copy_bgra8(
             destination_width, destination_height)) {
         return 0;
     }
+    // At 1:1 pixel centers the bilinear weights select exactly one pixel.
+    // Keep the scalar loop for aliases, whose sequential reads are observable.
+    if (source_width == destination_width && source_height == destination_height &&
+        avz_framebuffer_disjoint_spans(source, source_stride, source_y + source_height,
+            destination, destination_stride, destination_y + destination_height)) {
+        return avz_framebuffer_copy_bgra8(source, source_stride, source_x, source_y,
+            destination, destination_stride, destination_x, destination_y,
+            destination_width, destination_height);
+    }
     for (size_t y = 0; y < destination_height; y++) {
         uint8_t *destination_row = destination +
             (destination_y + y) * destination_stride;
@@ -648,6 +662,13 @@ int avz_framebuffer_bilinear_scale_source_over_bgra8(
             destination_x, destination_y,
             destination_width, destination_height)) {
         return 0;
+    }
+    if (source_width == destination_width && source_height == destination_height &&
+        avz_framebuffer_disjoint_spans(source, source_stride, source_y + source_height,
+            destination, destination_stride, destination_y + destination_height)) {
+        return avz_framebuffer_source_over_bgra8(source, source_stride, source_x, source_y,
+            destination, destination_stride, destination_x, destination_y,
+            destination_width, destination_height);
     }
     for (size_t y = 0; y < destination_height; y++) {
         uint8_t *destination_row = destination +
@@ -773,6 +794,67 @@ int avz_framebuffer_masked_composite_bgra8(
     return 1;
 }
 
+static int avz_framebuffer_disjoint_spans(
+    const uint8_t *a, size_t a_stride, size_t a_height,
+    const uint8_t *b, size_t b_stride, size_t b_height
+) {
+    if (a_stride == 0 || b_stride == 0 ||
+        a_height > SIZE_MAX / a_stride || b_height > SIZE_MAX / b_stride)
+        return 0;
+    const size_t a_bytes = a_stride * a_height;
+    const size_t b_bytes = b_stride * b_height;
+    const uintptr_t a_start = (uintptr_t)a;
+    const uintptr_t b_start = (uintptr_t)b;
+    if (a_bytes > UINTPTR_MAX - a_start || b_bytes > UINTPTR_MAX - b_start)
+        return 0;
+    return a_start + a_bytes <= b_start || b_start + b_bytes <= a_start;
+}
+
+#if AVZ_FRAMEBUFFER_HAS_NEON
+static void avz_framebuffer_solid_a8_over_bgra8(
+    const uint8_t *mask, size_t mask_stride,
+    uint8_t *destination, size_t destination_stride,
+    size_t destination_x, size_t destination_y,
+    size_t width, size_t height, uint32_t color
+) {
+    const uint8_t solid[4] = {
+        (uint8_t)color, (uint8_t)(color >> 8u),
+        (uint8_t)(color >> 16u), (uint8_t)(color >> 24u)
+    };
+    uint8x8_t channels[4];
+    for (size_t c = 0; c < 4u; c++)
+        channels[c] = vdup_n_u8(solid[c]);
+    for (size_t y = 0; y < height; y++) {
+        const uint8_t *coverage = mask + y * mask_stride;
+        uint8_t *row = destination + (destination_y + y) * destination_stride +
+            destination_x * 4u;
+        size_t x = 0;
+        for (; x + 8u <= width; x += 8u) {
+            const uint8x8_t alpha = vld1_u8(coverage + x);
+            const uint8x8_t inverse = vsub_u8(vdup_n_u8(UINT8_MAX),
+                avz_framebuffer_divide_255_round(vmull_u8(channels[3], alpha)));
+            uint8x8x4_t pixels = vld4_u8(row + x * 4u);
+            for (size_t c = 0; c < 4u; c++) {
+                pixels.val[c] = vqadd_u8(
+                    avz_framebuffer_divide_255_round(vmull_u8(channels[c], alpha)),
+                    avz_framebuffer_divide_255_round(vmull_u8(pixels.val[c], inverse)));
+            }
+            vst4_u8(row + x * 4u, pixels);
+        }
+        for (; x < width; x++) {
+            const uint8_t inverse = UINT8_MAX -
+                avz_framebuffer_multiply_255(solid[3], coverage[x]);
+            for (size_t c = 0; c < 4u; c++) {
+                const uint32_t value =
+                    avz_framebuffer_multiply_255(solid[c], coverage[x]) +
+                    avz_framebuffer_multiply_255(row[x * 4u + c], inverse);
+                row[x * 4u + c] = value > UINT8_MAX ? UINT8_MAX : (uint8_t)value;
+            }
+        }
+    }
+}
+#endif
+
 int avz_framebuffer_composite_bgra8(
     const uint8_t *source,
     size_t source_stride,
@@ -820,6 +902,22 @@ int avz_framebuffer_composite_bgra8(
               source_stride / source_bytes_per_pixel))) {
         return 0;
     }
+
+#if AVZ_FRAMEBUFFER_HAS_NEON
+    // Text glyphs use a solid premultiplied source and packed coverage. Preserve
+    // the generic loop's sequential alias behavior by vectorizing only disjoint
+    // allocations, with separate rounding for mask and destination products.
+    if (blend_operator == 3u && source_is_solid && mask != NULL &&
+        mask_is_packed_a8 && !component_alpha_mask && !destination_is_packed_a8 &&
+        mask_stride >= destination_width &&
+        avz_framebuffer_disjoint_spans(mask, mask_stride, destination_height,
+            destination, destination_stride, destination_y + destination_height)) {
+        avz_framebuffer_solid_a8_over_bgra8(mask, mask_stride,
+            destination, destination_stride, destination_x, destination_y,
+            destination_width, destination_height, premultiplied_bgra);
+        return 1;
+    }
+#endif
 
     const uint8_t solid[4] = {
         (uint8_t)premultiplied_bgra,

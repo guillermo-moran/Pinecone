@@ -1060,22 +1060,15 @@ public final class VirtualFramebuffer: MMIODevice {
     }
 }
 
-public struct TouchEvent: Codable, Equatable {
-    public let x: UInt32
-    public let y: UInt32
-    public let isDown: Bool
-
-    public init(x: UInt32, y: UInt32, isDown: Bool) {
-        self.x = x
-        self.y = y
-        self.isDown = isDown
-    }
-}
+public typealias TouchEvent = TimestampedTouchEvent
 
 public final class VirtualTouchInput: MMIODevice {
     public let name: String
     public let range: AddressRange
-    private var queue: [TouchEvent] = []
+    static let maximumPendingEvents = 256
+    private let lock = NSLock()
+    private var queue = TouchMotionQueue(capacity: maximumPendingEvents)
+    // The MMIO latch is separate from pending samples and changes only on ACK.
     private var current = TouchEvent(x: 0, y: 0, isDown: false)
 
     public init(name: String = "touch0", base: GuestAddress, length: UInt64 = 0x1000) {
@@ -1084,13 +1077,20 @@ public final class VirtualTouchInput: MMIODevice {
     }
 
     public func enqueue(_ event: TouchEvent) {
-        queue.append(event)
+        lock.lock()
+        defer { lock.unlock() }
+        queue.enqueue(event)
+    }
+
+    var pendingEventCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return queue.count
     }
 
     public func read(offset: UInt64, width: MMIOWidth) throws -> UInt64 {
-        if offset == 0x0c, !queue.isEmpty {
-            return 1
-        }
+        lock.lock()
+        defer { lock.unlock() }
 
         switch offset {
         case 0x00:
@@ -1100,18 +1100,22 @@ public final class VirtualTouchInput: MMIODevice {
         case 0x08:
             return current.isDown ? 1 : 0
         case 0x0c:
-            return 0
+            return queue.isEmpty ? 0 : 1
         default:
             return 0
         }
     }
 
     public func write(offset: UInt64, width: MMIOWidth, value: UInt64) throws {
-        guard offset == 0x0c, value == 1, !queue.isEmpty else { return }
-        current = queue.removeFirst()
+        lock.lock()
+        defer { lock.unlock() }
+        guard offset == 0x0c, value == 1, let event = queue.popFirst() else { return }
+        current = event
     }
 
     public func reset() {
+        lock.lock()
+        defer { lock.unlock() }
         queue.removeAll()
         current = TouchEvent(x: 0, y: 0, isDown: false)
     }
