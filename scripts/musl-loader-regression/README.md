@@ -163,3 +163,41 @@ The loader extracted from this exact APK passed another 12 matrix cases with
 string is present in the binary. This package supersedes the standalone production
 library for integration. Parent owns staging-reference updates; no shared image
 build, rootfs installation, or simulator operation was performed here.
+
+### GNU Hash Reuse And Identity Lookup (r10)
+
+The graphics interaction profile found `gnu_hash` while building the startup
+index and bytewise symbol-name comparison on the Settings launch path. The
+second patch, `musl-pinecone-gnu-hash-reuse.patch`, preserves the full-hash r8
+index and its lookup, binding, version, and teardown rules. It walks GNU bucket
+chains and reconstructs the overwritten low hash bit from bucket membership.
+With more than one bucket, adjacent hashes cannot have the same remainder;
+one-bucket or inconsistent cases retain name-based hashing. SysV indexing is
+unchanged. GNU lookup also accepts identical name pointers without comparing
+their bytes, but still visits earlier eligible symbols first. This does not
+skip duplicate-name or version selection.
+
+Test the actual patched source with:
+
+```sh
+python3 scripts/musl-loader-regression/test-gnu-hash.py /path/to/musl/ldso/dynlink.c
+```
+
+This compiles extracted production functions with UBSan, exercises 2,497,152
+hash-recovery cases, and checks identical pointers, distinct equal strings,
+earlier duplicates, hidden versions, hash collisions, and misses. The exact
+signed r10 package also passed the 12-case native aarch64 loader matrix with
+production statistics disabled. This is not malformed-ELF fuzzing or complete
+loader security certification.
+
+The builder produces `musl-1.2.6-r10`. At the user's request, graphical staging
+now defaults to r10 for physical-device testing. Set
+`PINECONE_MUSL_PACKAGE_VERSION=1.2.6-r8` for the previous comparison runtime.
+This test promotion does not imply that the end-to-end performance gate is met.
+Package SHA-256:
+`80f6d4a432f6cf0c7d36ce0f5f060f1ad2336b8ae3c1c3cfcd5191abe9e105a4`.
+Packaged loader SHA-256:
+`952a2ad567d2cbaa7aeb76b22d40a0f1edbb2636561dcf2d1a30be1cc7337335`.
+The pinned Alpine security patches and package signature checks remain enabled.
+See `docs/phosh-graphics-priority-profile.md` for Simulator results and limitations;
+native loader tests alone are not evidence of improved UI latency.

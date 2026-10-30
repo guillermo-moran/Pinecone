@@ -1,4 +1,5 @@
 #include "ARM64VizGuestMemoryInternal.h"
+#include "Assembly/boundary_profile.h"
 
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -78,6 +79,7 @@ enum {
 #define AVZ_STAGE1_OUTPUT_ADDRESS_MASK 0x0000fffffffff000ULL
 #define AVZ_STAGE1_ACCESS_FLAG_BIT (1ULL << 10)
 #define AVZ_STAGE1_READ_ONLY_AP_BIT (1ULL << 7)
+#define AVZ_STAGE1_UNPRIVILEGED_AP_BIT (1ULL << 6)
 #define AVZ_STAGE1_PRIVILEGED_EXECUTE_NEVER_BIT (1ULL << 53)
 #define AVZ_STAGE1_UNPRIVILEGED_EXECUTE_NEVER_BIT (1ULL << 54)
 
@@ -1906,8 +1908,10 @@ static int avz_stage1_validate_leaf(
             (uint8_t)(AVZ_FAULT_ACCESS_FLAG_LEVEL_0 + level)
         );
     }
-    if (access == AVZ_NATIVE_MEMORY_ACCESS_WRITE &&
-        (descriptor & AVZ_STAGE1_READ_ONLY_AP_BIT) != 0) {
+    if ((fast_path->translation_state.current_el == 0 &&
+         (descriptor & AVZ_STAGE1_UNPRIVILEGED_AP_BIT) == 0) ||
+        (access == AVZ_NATIVE_MEMORY_ACCESS_WRITE &&
+         (descriptor & AVZ_STAGE1_READ_ONLY_AP_BIT) != 0)) {
         return avz_stage1_fault(
             fast_path,
             virtual_address,
@@ -3723,7 +3727,8 @@ void avz_native_memory_fast_path_set_instruction_translator(
     if (fast_path == NULL) {
         return;
     }
-    avz_native_block_cache_invalidate_decode_window(fast_path->block_cache);
+    /* Retire resident code before replacing its instruction mapping source. */
+    avz_fast_invalidate_decoded_mappings(fast_path);
     fast_path->translate_instruction_ram = translate_instruction_ram;
     memset(
         fast_path->instruction_tlb,
@@ -3902,6 +3907,7 @@ int avz_native_memory_fast_path_advance_time(
     /* Cached chains may execute without a memory callback. Observe shootdowns
      * at their native block boundary before reusing decoded successors. */
     avz_fast_synchronize_shared_translation_epoch(fast_path);
+    ag_profile_mark(AG_PROFILE_TLBI);
     AVZNativeArchitecturalState *state = &fast_path->architectural_state;
     if (fast_path->counter_clock.frequency != 0) {
         fast_path->counter_refresh_instructions += instruction_count;
@@ -3912,13 +3918,13 @@ int avz_native_memory_fast_path_advance_time(
     } else {
         state->counter_ticks += instruction_count * state->timer_cycles_per_instruction;
     }
-    if ((pstate & 0x80u) != 0)
-        return 0;
-    return state->pending_irq ||
+    int irq = !(pstate & 0x80u) && (state->pending_irq ||
         avz_native_timer_asserted(
             state->cntp_ctl_el0, state->cntp_cval_el0, state->counter_ticks) ||
         avz_native_timer_asserted(
-            state->cntv_ctl_el0, state->cntv_cval_el0, state->counter_ticks);
+            state->cntv_ctl_el0, state->cntv_cval_el0, state->counter_ticks));
+    ag_profile_mark(AG_PROFILE_TIMER);
+    return irq;
 }
 
 static void avz_native_fast_set_current_el(

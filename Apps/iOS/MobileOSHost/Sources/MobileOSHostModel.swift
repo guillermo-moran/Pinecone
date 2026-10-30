@@ -877,7 +877,8 @@ final class MobileOSHostModel: ObservableObject {
                 _ = try fileManager.replaceItemAt(
                     writableDiskURL,
                     withItemAt: stagingURL,
-                    backupItemName: "rootfs.previous.ext4"
+                    backupItemName: "rootfs.previous.ext4",
+                    options: .withoutDeletingBackupItem
                 )
             } else {
                 try fileManager.moveItem(at: stagingURL, to: writableDiskURL)
@@ -1102,7 +1103,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private let graphicsAccelerator: PineconeMetalGraphicsAccelerator?
     private let networkBridge: LinkLocalVirtIONetworkBackend
     private let hostWakeSignal: HostWakeSignal
-    private let inputPreemptionSignal: InputPreemptionSignal
+    private let inputPreemptionSignal: HostPreemptionSignal
     private let displayCommitSignal: DisplayCommitSignal
     private let performanceTimeline = VMPerformanceTimeline(attributionEnabled:
         ProcessInfo.processInfo.environment["PINECONE_INTERACTION_TRACE"] == "1")
@@ -1198,7 +1199,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         let networkBridge = LinkLocalVirtIONetworkBackend()
         let graphicsAccelerator = PineconeMetalGraphicsAccelerator()
         let hostWakeSignal = HostWakeSignal()
-        let inputPreemptionSignal = InputPreemptionSignal()
+        let inputPreemptionSignal = HostPreemptionSignal()
         let displayCommitSignal = DisplayCommitSignal()
         machine.parallelVCPUCluster?.setHostWakeHandler { [weak hostWakeSignal] in
             hostWakeSignal?.signal()
@@ -1228,9 +1229,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         machine.vm.wallClockRunBudgetNanoseconds =
             Self.normalWallClockRunBudgetNanoseconds
         machine.vm.nativeCheckpointBlockInterval = 4_096
-        machine.vm.hostPreemptionGenerationProvider = { [weak inputPreemptionSignal] in
-            inputPreemptionSignal?.currentGeneration ?? 0
-        }
+        machine.vm.hostPreemptionGenerationProvider = inputPreemptionSignal.makeGenerationProvider()
         if let backend = machine.vm.backend as? SoftwareARM64Backend {
             backend.enableBasicBlockExecution = true
             backend.fallbackInterpreterPolicy = .nativeOnly
@@ -2411,6 +2410,14 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         ]
         report["threadedPrototypePrimary"] =
             (machine.vm.backend as? SoftwareARM64Backend)?.nativeThreadedPrototypeStatistics
+        report["assemblyExecutorPrimary"] =
+            (machine.vm.backend as? SoftwareARM64Backend)?.nativeAssemblyStatistics
+        report["assemblyExecutorSecondaryByVCPU"] =
+            machine.parallelVCPUCluster?.secondaryAssemblyStatistics ?? [:]
+        report["assemblyCachePrimary"] =
+            (machine.vm.backend as? SoftwareARM64Backend)?.nativeAssemblyCacheDiagnostics
+        report["assemblyCacheSecondaryByVCPU"] =
+            machine.parallelVCPUCluster?.secondaryAssemblyCacheDiagnostics ?? [:]
         lock.lock()
         report["hotPCs"] = latestHotPCProfile
         lock.unlock()
@@ -2481,24 +2488,6 @@ private final class HostWakeSignal: @unchecked Sendable {
         let continuation = waiters.removeValue(forKey: identifier)
         lock.unlock()
         continuation?.resume()
-    }
-}
-
-private final class InputPreemptionSignal: @unchecked Sendable {
-    private let lock = NSLock()
-    private var generation: UInt64 = 0
-
-    var currentGeneration: UInt64 {
-        lock.lock()
-        let value = generation
-        lock.unlock()
-        return value
-    }
-
-    func signal() {
-        lock.lock()
-        generation &+= 1
-        lock.unlock()
     }
 }
 

@@ -21,7 +21,7 @@ OVERLAYS = {
     "PHOSH": ("phosh", "0.57.0-r8", "pinecone-phosh"),
     "SETTINGS": ("gnome-control-center", "50.4-r2", "pinecone-gnome-control-center"),
     "GLIB": ("glib", "2.88.3-r1", "pinecone-glib"),
-    "MUSL": ("musl", "1.2.6-r8", "pinecone-musl"),
+    "MUSL": ("musl", "1.2.6-r10", "pinecone-musl"),
 }
 
 
@@ -95,6 +95,20 @@ class OverlayTests(unittest.TestCase):
                 self.overlay(kind, ("so:libgnome-desktop-3.so.21",))
                 self.assert_rejected("so:libgnome-desktop-3.so.21")
                 self.env[f"PINECONE_USE_PATCHED_{kind}"] = "0"
+
+    def test_previous_musl_can_be_selected_explicitly(self):
+        self.env["PINECONE_USE_PATCHED_MUSL"] = "1"
+        self.env["PINECONE_MUSL_PACKAGE_VERSION"] = "1.2.6-r8"
+        apk(self.repo / "artifacts/alpine-packages/pinecone-musl/aarch64",
+            "musl", "1.2.6-r8", files={"overlay/musl": "1.2.6-r8"})
+        result = self.run_stage()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.dest / "overlay/musl").read_text(), "1.2.6-r8")
+
+    def test_unknown_musl_version_rejected_before_extraction(self):
+        self.env["PINECONE_USE_PATCHED_MUSL"] = "1"
+        self.env["PINECONE_MUSL_PACKAGE_VERSION"] = "unexpected"
+        self.assert_rejected("Unsupported Pinecone musl package version")
 
     def test_expands_transitive_actual_apk_metadata_preserving_pins(self):
         self.overlay("PHOC", ("so:liboverlay.so.1",))

@@ -85,13 +85,34 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     private let maxBasicBlockInstructions = 32
     private let nativeChainBlockLimit: UInt64 = 262_144
     private let decodeScratch = DecodeScratch(capacity: 32)
+    private let assemblyDiagnosticsLock = NSLock()
+    private var publishedAssemblyCacheDiagnostics: [String: UInt64] = [:]
+    private var assemblyCacheDiagnosticsEnabled = false
+    private var lastAssemblyCachePublication: UInt64 = 0
     public init() {
         nativeBlockCache = avz_native_block_cache_create()
         nativeExecutionContext = avz_native_execution_context_create()
-#if targetEnvironment(simulator)
-        // Experimental subset only. Physical-device and CLI defaults stay unchanged.
+        let assemblyOverride = ProcessInfo.processInfo.environment["PINECONE_ASSEMBLY_EXECUTOR"]
+#if os(iOS)
+        // The device-test configuration must also apply when launched outside Xcode.
+        let assemblyEnabled = assemblyOverride.map { $0 == "1" } ?? true
+#else
+        let assemblyEnabled = assemblyOverride == "1"
+#endif
+        setNativeAssemblyExecutorEnabled(assemblyEnabled)
+        setNativeAssemblyChainingEnabled(
+            assemblyEnabled && ProcessInfo.processInfo.environment["PINECONE_ASSEMBLY_CHAINING"] == "1"
+        )
+        setNativeAssemblyBoundedEnabled(
+            assemblyEnabled && ProcessInfo.processInfo.environment["PINECONE_ASSEMBLY_BOUNDED"] == "1"
+        )
+        let diagnostics = ProcessInfo.processInfo.environment["PINECONE_ASSEMBLY_CACHE_DIAGNOSTICS"]
+        configureAssemblyCacheDiagnostics(enabled: diagnostics == "1" || diagnostics == "time",
+                                          timing: diagnostics == "time")
+#if os(iOS)
+        // Older threaded experiments remain explicit alternatives, not a second executor.
         setNativeThreadedPrototypeEnabled(
-            ProcessInfo.processInfo.environment["PINECONE_THREADED_PROTOTYPE"] != "0"
+            !assemblyEnabled && ProcessInfo.processInfo.environment["PINECONE_THREADED_PROTOTYPE"] == "1"
         )
         setNativeThreadedMemoryEnabled(
             ProcessInfo.processInfo.environment["PINECONE_THREADED_MEMORY"] == "1"
@@ -101,6 +122,94 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     public func setNativeThreadedPrototypeEnabled(_ enabled: Bool) {
         avz_native_execution_context_set_threaded_prototype(nativeExecutionContext, enabled ? 1 : 0)
+    }
+
+    public func setNativeAssemblyExecutorEnabled(_ enabled: Bool) {
+        avz_native_execution_context_set_assembly_executor(nativeExecutionContext, enabled ? 1 : 0)
+    }
+
+    public var nativeAssemblyStatistics: [String: UInt64] {
+        let counters = avz_native_execution_context_assembly_statistics(nativeExecutionContext)
+        let chains = avz_native_execution_context_assembly_chain_statistics(nativeExecutionContext)
+        return ["enabled": counters.enabled, "blocks": counters.blocks, "steps": counters.steps,
+                "boundaries": counters.boundaries, "faults": counters.faults,
+                "chainEnabled": chains.enabled, "chainRuns": chains.runs,
+                "chainVisits": chains.visits, "chainSteps": chains.steps,
+                "boundedEnabled": chains.bounded_enabled, "boundedRuns": chains.bounded_runs,
+                "boundedVisits": chains.bounded_visits, "boundedSteps": chains.bounded_steps]
+    }
+
+    /// Configure before starting the vCPU; no executor default is changed.
+    public func setNativeAssemblyChainingEnabled(_ enabled: Bool) {
+        avz_native_execution_context_set_assembly_chaining(nativeExecutionContext, enabled ? 1 : 0)
+    }
+
+    /// Requires assembly and chaining; configure before starting the vCPU.
+    public func setNativeAssemblyBoundedEnabled(_ enabled: Bool) {
+        avz_native_execution_context_set_assembly_bounded(nativeExecutionContext, enabled ? 1 : 0)
+    }
+
+    /// Call only before starting the vCPU or on its owning execution thread.
+    /// A diagnostic window does not clear or rewarm the decoded/program caches.
+    @discardableResult
+    public func configureAssemblyCacheDiagnostics(enabled: Bool, timing: Bool = false) -> Bool {
+        let flags = enabled ? UInt32(timing ? AVZ_CACHE_DIAGNOSTICS_PREPARATION_TIME : AVZ_CACHE_DIAGNOSTICS_COUNTS) : 0
+        let accepted = avz_native_block_cache_diagnostics_begin(nativeBlockCache, flags) != 0
+        assemblyCacheDiagnosticsEnabled = enabled && accepted
+        publishAssemblyCacheDiagnostics(force: true)
+        return accepted
+    }
+
+    /// Thread-safe copy; the cache itself is never inspected by the consumer.
+    public var nativeAssemblyCacheDiagnostics: [String: UInt64] {
+        assemblyDiagnosticsLock.lock()
+        defer { assemblyDiagnosticsLock.unlock() }
+        return publishedAssemblyCacheDiagnostics
+    }
+
+    // Owner-thread only, including forced publications at test boundaries.
+    func publishAssemblyCacheDiagnostics(force: Bool = false) {
+        guard force || assemblyCacheDiagnosticsEnabled else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard force || now &- lastAssemblyCachePublication >= 1_000_000_000 else { return }
+        lastAssemblyCachePublication = now
+        let c = avz_native_block_cache_diagnostics_snapshot(nativeBlockCache)
+        let snapshot: [String: UInt64] = [
+            "compiled": UInt64(c.compiled), "enabled": UInt64(c.enabled),
+            "timingEnabled": UInt64(c.timing_enabled), "capacity": UInt64(c.program_capacity),
+            "programByteBudget": c.program_byte_budget,
+            "protectedByteBudget": c.protected_byte_budget,
+            "protectedProgramBytes": c.protected_program_bytes,
+            "promotions": c.promotions, "protectedDemotions": c.protected_demotions,
+            "budgetEvictions": c.budget_evictions, "budgetRejections": c.budget_rejections,
+            "maxRetirementsPerAdmission": c.max_retirements_per_admission,
+            "peakAdmissionRetirements": c.peak_admission_retirements,
+            "publishedHostNanoseconds": now,
+            "requests": c.requests, "invalidRequests": c.invalid_requests,
+            "staleRequests": c.stale_requests, "hits": c.program_hits, "misses": c.program_misses,
+            "negativeHits": c.negative_hits, "semanticRejections": c.semantic_rejections,
+            "preparations": c.preparation_attempts, "allocations": c.program_allocations,
+            "nullPreparations": c.preparation_null_results,
+            "unsupportedPreparations": c.unsupported_preparations,
+            "memoryDeniedPreparations": c.memory_denied_preparations,
+            "admissions": c.admissions, "repreparations": c.positive_repreparations,
+            "evictions": c.positive_evictions, "evictionsWithFreeSlots": c.evictions_with_free_slots,
+            "reusedEvictions": c.reused_positive_evictions,
+            "evictedHits": c.evicted_program_hits, "entryReleases": c.entry_releases,
+            "clearReleases": c.clear_releases, "transientReleases": c.transient_releases,
+            "timedPreparations": c.preparation_timed_samples,
+            "preparationNanoseconds": c.preparation_ns, "maxPreparationNanoseconds": c.preparation_max_ns,
+            "clockFailures": c.preparation_clock_failures,
+            "allocatedProgramBytes": c.allocated_program_bytes,
+            "ownedPrograms": c.cache_owned_programs, "ownedProgramBytes": c.cache_owned_program_bytes,
+            "peakOwnedPrograms": c.peak_cache_owned_programs,
+            "peakOwnedProgramBytes": c.peak_cache_owned_program_bytes,
+            "peakPreparationLiveBytes": c.peak_preparation_live_bytes,
+            "cacheStorageBytes": c.cache_storage_bytes, "slotStorageBytes": c.assembly_slot_storage_bytes
+        ]
+        assemblyDiagnosticsLock.lock()
+        publishedAssemblyCacheDiagnostics = snapshot
+        assemblyDiagnosticsLock.unlock()
     }
 
     public func setNativeThreadedMemoryEnabled(_ enabled: Bool) {
@@ -398,6 +507,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     }
 
     public func run(vm: VirtualMachine, maxSteps: Int) throws -> RunResult {
+        defer { publishAssemblyCacheDiagnostics() }
         var steps = 0
         var nextDeadlineCheckStep = 256
         let ownsRunDeadline = vm.currentRunDeadlineNanoseconds == nil

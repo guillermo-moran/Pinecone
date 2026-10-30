@@ -1,5 +1,32 @@
 import Dispatch
+import Foundation
 import ARM64VizNative
+
+/// A thread-safe host-input generation shared by vCPU preemption providers.
+public final class HostPreemptionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    public init() {}
+
+    public var currentGeneration: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
+    }
+
+    public func signal() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
+    }
+
+    public func makeGenerationProvider() -> @Sendable () -> UInt64 {
+        // Retain only the signal, which has no owner back-reference. Polling
+        // must not weak-load a runtime object at every native checkpoint.
+        { [self] in currentGeneration }
+    }
+}
 
 public enum ARM64ExceptionSource: String, Codable, Equatable {
     case supervisorCall

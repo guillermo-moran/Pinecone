@@ -1,5 +1,12 @@
 #include "ARM64VizNative.h"
 #include "ARM64VizGuestMemoryInternal.h"
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+#include "Assembly/gadget.h"
+#if AG_SERVICE_CHAIN_ENABLE
+#include "ARM64VizAssemblyChain.h"
+#include "Assembly/boundary_profile.h"
+#endif
+#endif
 #if AVZ_THREADED_PROTOTYPE_ENABLE
 #include "ARM64VizThreadedPrototype.h"
 #endif
@@ -6007,12 +6014,14 @@ static int execute_decoded_instruction(
         cpu->pc = pc + 4;
         return 1;
     }
-    case AVZ_NATIVE_OP_REGISTER_BRANCH:
+    case AVZ_NATIVE_OP_REGISTER_BRANCH: {
+        uint64_t target = read_register(cpu, instruction->rn);
         if ((instruction->flags & 1) != 0) {
             cpu->x[30] = pc + 4;
         }
-        cpu->pc = read_register(cpu, instruction->rn);
+        cpu->pc = target;
         return 1;
+    }
     case AVZ_NATIVE_OP_CONDITIONAL_SELECT: {
         unsigned bits = instruction->bits;
         uint64_t value;
@@ -11710,12 +11719,14 @@ op_add_sub_shifted_register: {
     }
     int subtract = (instruction->flags & 1) != 0;
     int set_flags = (instruction->flags & 2) != 0;
-    if (subtract) {
-        rhs = (~rhs) & mask;
-    }
-    uint64_t flags = add_with_carry_nzcv(lhs, rhs, subtract ? 1 : 0, bits, &value);
     if (set_flags) {
+        if (subtract) {
+            rhs = (~rhs) & mask;
+        }
+        uint64_t flags = add_with_carry_nzcv(lhs, rhs, subtract ? 1 : 0, bits, &value);
         cpu.pstate = (cpu.pstate & ~UINT64_C(0xf0000000)) | (flags & UINT64_C(0xf0000000));
+    } else {
+        value = (subtract ? lhs - rhs : lhs + rhs) & mask;
     }
     write_register(&cpu, instruction->rd, value);
     cpu.pc += 4;
@@ -11731,12 +11742,14 @@ op_branch: {
     AVZ_THREADED_STEP();
 }
 
-op_register_branch:
+op_register_branch: {
+    uint64_t target = read_register(&cpu, instruction->rn);
     if ((instruction->flags & 1) != 0) {
         cpu.x[30] = cpu.pc + 4;
     }
-    cpu.pc = read_register(&cpu, instruction->rn);
+    cpu.pc = target;
     AVZ_THREADED_STEP();
+}
 
 op_conditional_select: {
     unsigned bits = instruction->bits;
@@ -13282,6 +13295,18 @@ static int avz_native_direct_link_is_current(
 
 struct AVZNativeExecutionContext {
     AVZNativeCPU cpu;
+    _Atomic uint64_t assembly_enabled, assembly_blocks, assembly_steps;
+    _Atomic uint64_t assembly_boundaries, assembly_faults;
+    _Atomic uint64_t assembly_chaining_enabled, assembly_chain_runs;
+    _Atomic uint64_t assembly_chain_visits, assembly_chain_steps;
+    _Atomic uint64_t assembly_bounded_enabled, assembly_bounded_runs;
+    _Atomic uint64_t assembly_bounded_visits, assembly_bounded_steps;
+    /* Only the execution owner touches totals; readers use the published atomics. */
+    uint64_t assembly_owner_blocks, assembly_owner_steps;
+    uint64_t assembly_owner_boundaries, assembly_owner_faults;
+    uint64_t assembly_owner_chain_runs, assembly_owner_chain_visits, assembly_owner_chain_steps;
+    uint64_t assembly_owner_bounded_runs, assembly_owner_bounded_visits, assembly_owner_bounded_steps;
+    uint8_t assembly_statistics_dirty;
     _Atomic uint64_t threaded_prototype_enabled;
     _Atomic uint64_t threaded_prototype_blocks;
     _Atomic uint64_t threaded_prototype_steps;
@@ -13694,6 +13719,182 @@ AVZNativeExecutionContext *avz_native_execution_context_create(void) {
     return calloc(1, sizeof(AVZNativeExecutionContext));
 }
 
+void avz_native_execution_context_set_assembly_executor(
+    AVZNativeExecutionContext *context, uint8_t enabled) {
+    if (!context) return;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    atomic_store_explicit(&context->assembly_enabled, enabled && ag_available(), memory_order_relaxed);
+#else
+    (void)enabled;
+    atomic_store_explicit(&context->assembly_enabled, 0, memory_order_relaxed);
+#endif
+}
+AVZNativeAssemblyStatistics avz_native_execution_context_assembly_statistics(
+    const AVZNativeExecutionContext *context) {
+    if (!context) return (AVZNativeAssemblyStatistics){0};
+    return (AVZNativeAssemblyStatistics){
+        .enabled = atomic_load_explicit(&context->assembly_enabled, memory_order_relaxed),
+        .blocks = atomic_load_explicit(&context->assembly_blocks, memory_order_relaxed),
+        .steps = atomic_load_explicit(&context->assembly_steps, memory_order_relaxed),
+        .boundaries = atomic_load_explicit(&context->assembly_boundaries, memory_order_relaxed),
+        .faults = atomic_load_explicit(&context->assembly_faults, memory_order_relaxed)
+    };
+}
+
+void avz_native_execution_context_set_assembly_chaining(
+    AVZNativeExecutionContext *context, uint8_t enabled) {
+    if (!context) return;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE && AG_SERVICE_CHAIN_ENABLE
+    atomic_store_explicit(&context->assembly_chaining_enabled,
+        enabled && ag_available(), memory_order_relaxed);
+#else
+    (void)enabled;
+    atomic_store_explicit(&context->assembly_chaining_enabled, 0, memory_order_relaxed);
+#endif
+}
+
+AVZNativeAssemblyChainStatistics avz_native_execution_context_assembly_chain_statistics(
+    const AVZNativeExecutionContext *context) {
+    if (!context) return (AVZNativeAssemblyChainStatistics){0};
+    return (AVZNativeAssemblyChainStatistics){
+        .enabled = atomic_load_explicit(&context->assembly_chaining_enabled, memory_order_relaxed),
+        .runs = atomic_load_explicit(&context->assembly_chain_runs, memory_order_relaxed),
+        .visits = atomic_load_explicit(&context->assembly_chain_visits, memory_order_relaxed),
+        .steps = atomic_load_explicit(&context->assembly_chain_steps, memory_order_relaxed),
+        .bounded_enabled = atomic_load_explicit(&context->assembly_bounded_enabled, memory_order_relaxed),
+        .bounded_runs = atomic_load_explicit(&context->assembly_bounded_runs, memory_order_relaxed),
+        .bounded_visits = atomic_load_explicit(&context->assembly_bounded_visits, memory_order_relaxed),
+        .bounded_steps = atomic_load_explicit(&context->assembly_bounded_steps, memory_order_relaxed)
+    };
+}
+
+void avz_native_execution_context_set_assembly_bounded(
+    AVZNativeExecutionContext *context, uint8_t enabled) {
+    if (!context) return;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE && AG_SERVICE_CHAIN_ENABLE
+    atomic_store_explicit(&context->assembly_bounded_enabled,
+        enabled && ag_available(), memory_order_relaxed);
+#else
+    (void)enabled;
+    atomic_store_explicit(&context->assembly_bounded_enabled, 0, memory_order_relaxed);
+#endif
+}
+
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+typedef struct {
+    const AGProgram *program;
+    AGGuards proof;
+    uint64_t pc, instruction_count;
+} AVZNativePreparedAssembly;
+
+static AVZNativePreparedAssembly avz_native_prepare_assembly_block(
+    AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *block, int allow_memory,
+    const uint64_t *code_token, const uint64_t *shared_token,
+    uint64_t selected_code_epoch, uint64_t selected_shared_epoch) {
+    AVZNativePreparedAssembly prepared = {0};
+    /* These epochs precede selection/validation, not just program preparation.
+     * A later snapshot must not bless instructions selected before a code write. */
+    prepared.proof = (AGGuards){
+        .local = code_token,
+        .shared = {(const _Atomic uint64_t *)shared_token},
+        .expected = {selected_code_epoch, selected_shared_epoch}
+    };
+    prepared.pc = avz_native_decoded_block_pc(block);
+    prepared.instruction_count = avz_native_decoded_block_instruction_count(block);
+    prepared.program = avz_assembly_cache_program(cache, block, allow_memory);
+    return prepared;
+}
+static AVZNativeBlockResult avz_native_run_assembly_block(
+    AVZNativeExecutionContext *context, const AVZNativePreparedAssembly *prepared,
+    uint64_t requested_steps,
+    AVZNativeMemoryFastPath *memory) {
+    /* Borrowed only across callback-free owner code. ag_run_memory pins before
+     * any helper can evict/retire it; never carry this record over a checkpoint. */
+    if (!prepared->program || context->cpu.pc != prepared->pc)
+        return (AVZNativeBlockResult){.status = AVZ_TP_STATUS_REVALIDATE};
+    uint64_t limit = prepared->instruction_count;
+    if (limit > requested_steps) limit = requested_steps;
+    AVZNativeBlockResult result = ag_run_memory(prepared->program, limit, &context->cpu,
+        &prepared->proof, memory);
+    context->assembly_owner_blocks++;
+    context->assembly_statistics_dirty = 1;
+    context->assembly_owner_steps += result.steps;
+    if (result.status == AVZ_TP_STATUS_REVALIDATE)
+        context->assembly_owner_boundaries++;
+    if (result.status == AVZ_TP_STATUS_MEMORY_FAULT)
+        context->assembly_owner_faults++;
+    return result;
+}
+
+#if AG_SERVICE_CHAIN_ENABLE
+static AGServiceDecision avz_native_service_assembly_chain(
+    void *owner, const AGServiceBoundary *boundary, const AVZNativeCPU *cpu) {
+    AVZNativeMemoryFastPath *memory = owner;
+    /* This also catches up peer TLBI for register-only chains. It can retire
+     * the pinned graph, so the service runtime must revalidate before resuming. */
+    int irq = avz_native_memory_fast_path_advance_time(
+        memory, boundary->retired_delta, cpu->pstate);
+    ag_profile_mark(AG_PROFILE_ADVANCE_TIME);
+    uint64_t allowance = UINT64_MAX;
+    const AVZNativeArchitecturalState *state = &memory->architectural_state;
+    if (!irq && !(cpu->pstate & 0x80u) && !memory->counter_clock.frequency &&
+        state->timer_cycles_per_instruction) {
+        const uint64_t controls[2] = {state->cntp_ctl_el0, state->cntv_ctl_el0};
+        const uint64_t compares[2] = {state->cntp_cval_el0, state->cntv_cval_el0};
+        for (size_t i = 0; i < 2; i++) {
+            if ((controls[i] & 3u) != 1u) continue;
+            if (compares[i] <= state->counter_ticks) {
+                irq = 1;
+                break;
+            }
+            uint64_t distance = compares[i] - state->counter_ticks;
+            uint64_t cycles = state->timer_cycles_per_instruction;
+            /* Ceiling division without overflowing distance + cycles - 1. */
+            uint64_t steps = distance / cycles + (distance % cycles != 0);
+            if (steps < allowance) allowance = steps;
+        }
+    }
+    ag_profile_mark(AG_PROFILE_ALLOWANCE);
+    return (AGServiceDecision){
+        .next_steps = irq ? 0 : allowance,
+        .action = irq ? AG_SERVICE_IRQ : AG_SERVICE_CONTINUE
+    };
+}
+
+static AGServiceDecision avz_native_service_assembly_bounded(
+    void *owner, const AGServiceBoundary *boundary, const AVZNativeCPU *cpu) {
+    AVZNativeMemoryFastPath *memory = owner;
+    AGServiceDecision decision = avz_native_service_assembly_chain(owner, boundary, cpu);
+    /* Preserve the existing host-clock polling contract even in register-only
+     * loops. advance_time refreshes/reset this count before we compute it. */
+    if (memory->counter_clock.frequency && decision.action == AG_SERVICE_CONTINUE) {
+        uint64_t pending = memory->counter_refresh_instructions;
+        uint64_t remaining = pending < 1024 ? 1024 - pending : 1;
+        if (remaining < decision.next_steps) decision.next_steps = remaining;
+    }
+    return decision;
+}
+#endif
+
+static void avz_native_publish_assembly_statistics(AVZNativeExecutionContext *context) {
+    /* All valid-slice exits converge here, including zero-progress/fault exits.
+     * As before, individual counters are race-safe, not a transactional snapshot. */
+    if (!context->assembly_statistics_dirty) return;
+    atomic_store_explicit(&context->assembly_blocks, context->assembly_owner_blocks, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_steps, context->assembly_owner_steps, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_boundaries, context->assembly_owner_boundaries, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_faults, context->assembly_owner_faults, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_chain_runs, context->assembly_owner_chain_runs, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_chain_visits, context->assembly_owner_chain_visits, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_chain_steps, context->assembly_owner_chain_steps, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_bounded_runs, context->assembly_owner_bounded_runs, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_bounded_visits, context->assembly_owner_bounded_visits, memory_order_relaxed);
+    atomic_store_explicit(&context->assembly_bounded_steps, context->assembly_owner_bounded_steps, memory_order_relaxed);
+    context->assembly_statistics_dirty = 0;
+}
+#endif
+
 void avz_native_execution_context_set_threaded_prototype(
     AVZNativeExecutionContext *context, uint8_t enabled
 ) {
@@ -13752,6 +13953,8 @@ static AVZNativeBlockResult avz_native_run_threaded_prototype_block(
     AVZNativeMemoryFastPath *memory
 ) {
     /* A host checkpoint may have invalidated the earlier eligibility lookup. */
+    uint64_t code_epoch = avz_native_block_cache_code_mutation_epoch(cache);
+    uint64_t shared_epoch = avz_native_block_cache_shared_code_mutation_epoch(cache);
     const AVZThreadedPrototype *program =
         avz_native_prepare_threaded_block(context, cache, block, memory != NULL);
     if (program == NULL || context->cpu.pc != avz_native_decoded_block_pc(block))
@@ -13761,12 +13964,8 @@ static AVZNativeBlockResult avz_native_run_threaded_prototype_block(
      * Pure arithmetic cannot invoke callbacks or invalidate its own snapshot. */
     uint64_t limit = avz_native_decoded_block_instruction_count(block);
     if (limit > requested_steps) limit = requested_steps;
-    int memory_program = memory != NULL && avz_tp_program_uses_memory(program);
-    AVZNativeBlockResult result = avz_tp_run_with_memory(program, limit, &context->cpu, memory);
-    /* Budget-ending memory also requires a host boundary. The program may have
-     * been destroyed by its last callback, so use only the captured flag. */
-    if (memory_program && result.status == AVZ_NATIVE_STATUS_MAX_STEPS)
-        result.status = AVZ_TP_STATUS_REVALIDATE;
+    AVZNativeBlockResult result = avz_tp_run_guarded(program, limit, &context->cpu,
+        memory, cache, code_epoch, shared_epoch);
     if (result.status == AVZ_TP_STATUS_REVALIDATE)
         atomic_fetch_add_explicit(&context->threaded_memory_boundaries, 1, memory_order_relaxed);
     if (result.status == AVZ_TP_STATUS_MEMORY_FAULT)
@@ -14550,6 +14749,14 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
         return chain;
     }
 
+    /* Cache/token storage and memory binding outlive a slice. Both C and
+     * assembly need pre-selection epochs; avoid accessor calls per block. */
+    const uint64_t *selected_code_token = avz_native_block_cache_code_mutation_epoch_token(cache);
+    const uint64_t *selected_shared_token = avz_native_block_cache_shared_code_mutation_epoch_token(cache);
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    /* Executor switches are changed only while the vCPU is stopped. */
+    int assembly_enabled = atomic_load_explicit(&context->assembly_enabled, memory_order_relaxed) != 0;
+#endif
     while (chain.steps < max_steps && chain.blocks < max_blocks) {
         if (context->cpu.halted) {
             chain.status = AVZ_NATIVE_STATUS_HALTED;
@@ -14559,8 +14766,9 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
         key.pc = context->cpu.pc;
         key.current_el = (uint8_t)((context->cpu.pstate >> 2) & 0x3u);
         key = avz_native_canonical_block_key(&key);
-        uint64_t selected_code_epoch = avz_native_block_cache_code_mutation_epoch(cache);
-        uint64_t selected_shared_epoch = avz_native_block_cache_shared_code_mutation_epoch(cache);
+        uint64_t selected_code_epoch = *selected_code_token;
+        uint64_t selected_shared_epoch = selected_shared_token == NULL ? 0 :
+            __atomic_load_n(selected_shared_token, __ATOMIC_ACQUIRE);
         uint32_t decode_status = AVZ_NATIVE_BLOCK_DECODE_FETCH_FAULT;
         uint32_t unsupported = 0;
         const AVZNativeDecodedBlock *block =
@@ -14585,10 +14793,17 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
             avz_native_selected_execution_span(cache, block, &key);
         uint64_t remaining_steps = max_steps - chain.steps;
         AVZNativeBlockResult block_result;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+        AVZNativePreparedAssembly assembly = {0};
+        if (assembly_enabled)
+            assembly = avz_native_prepare_assembly_block(cache, block, 0,
+                selected_code_token, selected_shared_token, selected_code_epoch, selected_shared_epoch);
+        if (assembly.program) {
+            block_result = avz_native_run_assembly_block(context, &assembly, remaining_steps, NULL);
+        } else
+#endif
 #if AVZ_THREADED_PROTOTYPE_ENABLE
-        const AVZThreadedPrototype *program =
-            avz_native_prepare_threaded_block(context, cache, block, 0);
-        if (program != NULL) {
+        if (avz_native_prepare_threaded_block(context, cache, block, 0) != NULL) {
             block_result = avz_native_run_threaded_prototype_block(
                 context, cache, block, remaining_steps, NULL);
         } else
@@ -14629,6 +14844,8 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
         chain.fast_path_hits += block_result.fast_path_hits;
         chain.blocks++;
         chain.status = block_result.status;
+        if (chain.status == AVZ_TP_STATUS_REVALIDATE)
+            chain.status = AVZ_NATIVE_STATUS_OUTSIDE_BLOCK;
         if (native_irq_due &&
             chain.status != AVZ_NATIVE_STATUS_HALTED &&
             chain.status != AVZ_NATIVE_STATUS_UNSUPPORTED)
@@ -14638,6 +14855,7 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
         if (chain.status == AVZ_NATIVE_STATUS_HALTED ||
             chain.status == AVZ_NATIVE_STATUS_UNSUPPORTED ||
             chain.status == AVZ_NATIVE_STATUS_YIELDED ||
+            block_result.status == AVZ_TP_STATUS_REVALIDATE ||
             block_result.status == AVZ_NATIVE_STATUS_MAX_STEPS ||
             block_result.steps == 0 ||
             avz_native_block_is_chain_barrier(block)) {
@@ -14649,6 +14867,9 @@ AVZNativeChainResult avz_native_execution_context_run_cached_chain(
         chain.status == AVZ_NATIVE_STATUS_OUTSIDE_BLOCK) {
         chain.status = AVZ_NATIVE_STATUS_MAX_STEPS;
     }
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    if (assembly_enabled) avz_native_publish_assembly_statistics(context);
+#endif
     return chain;
 }
 
@@ -14707,18 +14928,45 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
     const AVZNativeDecodedBlock *previous_block = context->last_block;
     uint64_t previous_serial = context->last_block_serial;
     const AVZNativeSuperblock *active_superblock = NULL;
+    const uint64_t *selected_code_token = avz_native_block_cache_code_mutation_epoch_token(cache);
+    const uint64_t *selected_shared_token = avz_native_block_cache_shared_code_mutation_epoch_token(cache);
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    int assembly_enabled = atomic_load_explicit(&context->assembly_enabled, memory_order_relaxed) != 0;
+#if AG_SERVICE_CHAIN_ENABLE
+    int assembly_chaining = assembly_enabled && uses_fast_memory_context &&
+        atomic_load_explicit(&context->assembly_chaining_enabled, memory_order_relaxed) != 0;
+    int assembly_bounded = assembly_chaining &&
+        atomic_load_explicit(&context->assembly_bounded_enabled, memory_order_relaxed) != 0;
+    AVZNativeMemoryFastPath *assembly_memory = assembly_chaining ? memory_context : NULL;
+    const _Atomic uint64_t *selected_translation_token =
+        assembly_memory && assembly_memory->guest_memory
+            ? &assembly_memory->guest_memory->translation_epoch : NULL;
+#endif
+#endif
     while (chain.steps < max_steps && chain.blocks < max_blocks) {
         if (context->cpu.halted) {
             chain.status = AVZ_NATIVE_STATUS_HALTED;
             break;
         }
 
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE && AG_SERVICE_CHAIN_ENABLE
+        /* A register-only cached successor can otherwise avoid the fetch/MMU
+         * path that normally catches up peer TLBI. Synchronize before capture,
+         * never update a captured proof to bless previously selected code. */
+        if (assembly_chaining)
+            avz_native_memory_fast_path_synchronize_translations(assembly_memory);
+#endif
         AVZNativeBlockKey key = *key_template;
         key.pc = context->cpu.pc;
         key.current_el = (uint8_t)((context->cpu.pstate >> 2) & 0x3u);
         key = avz_native_canonical_block_key(&key);
-        uint64_t selected_code_epoch = avz_native_block_cache_code_mutation_epoch(cache);
-        uint64_t selected_shared_epoch = avz_native_block_cache_shared_code_mutation_epoch(cache);
+        uint64_t selected_code_epoch = *selected_code_token;
+        uint64_t selected_shared_epoch = selected_shared_token == NULL ? 0 :
+            __atomic_load_n(selected_shared_token, __ATOMIC_ACQUIRE);
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE && AG_SERVICE_CHAIN_ENABLE
+        uint64_t selected_translation_epoch = selected_translation_token
+            ? atomic_load_explicit(selected_translation_token, memory_order_acquire) : 0;
+#endif
         uint32_t decode_status = AVZ_NATIVE_BLOCK_DECODE_FETCH_FAULT;
         uint32_t unsupported = 0;
         const AVZNativeDecodedBlock *block = NULL;
@@ -14909,7 +15157,55 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             : remaining_steps;
         uint64_t executed_blocks = 1;
         uint64_t fused_block_limit = 0;
+        uint64_t timer_accounted_steps = 0;
+        int ran_assembly_chain = 0;
+        int assembly_chain_irq = 0;
         AVZNativeBlockResult block_result;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+        /* Select only after the last pre-execution checkpoint. Ordinary
+         * assembly preserves C composition; opt-in chaining may replace a
+         * wholly covered, accelerator-free trace. No callback precedes its pin. */
+        AVZNativePreparedAssembly assembly = {0};
+        const AVZNativeDecodedBlock *assembly_block = block;
+#if AG_SERVICE_CHAIN_ENABLE
+        AGServiceChain *assembly_graph = NULL;
+        if (assembly_chaining && active_superblock != NULL)
+            assembly_block = active_superblock->blocks[0];
+#endif
+        if (assembly_enabled && (active_superblock == NULL
+#if AG_SERVICE_CHAIN_ENABLE
+            || assembly_chaining
+#endif
+        ))
+            assembly = avz_native_prepare_assembly_block(cache, assembly_block,
+                uses_fast_memory_context, selected_code_token, selected_shared_token,
+                selected_code_epoch, selected_shared_epoch);
+#if AG_SERVICE_CHAIN_ENABLE
+        if (assembly_chaining && assembly.program && selected_translation_token) {
+            AGGuards proof = assembly.proof;
+            proof.shared[1] = selected_translation_token;
+            proof.expected[2] = selected_translation_epoch;
+            assembly_graph = avz_assembly_cache_service_chain(cache, assembly_block, &key,
+                assembly_memory, &proof);
+            if (assembly_graph && active_superblock != NULL) {
+                /* Retain C semantic accelerators and mixed traces in their
+                 * entirety. A graph admits only ordinary eligible blocks and
+                 * must cover every resident member before replacing a trace. */
+                for (size_t slot = 0; slot < active_superblock->count; slot++) {
+                    if (!avz_assembly_cache_service_chain_contains(cache,
+                            active_superblock->blocks[slot], active_superblock->serials[slot])) {
+                        assembly_graph = NULL;
+                        break;
+                    }
+                }
+                if (assembly_graph) {
+                    active_superblock = NULL;
+                    block = assembly_block;
+                }
+            }
+        }
+#endif
+#endif
         if (active_superblock != NULL && active_superblock->count >= 2) {
             fused_block_limit = active_superblock->count;
             uint64_t block_budget = max_blocks - chain.blocks;
@@ -14978,6 +15274,65 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             }
             chain.superblock_blocks += executed_blocks;
         }
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+        else if (assembly.program) {
+            avz_native_sample_hot_pc(context, avz_native_decoded_block_pc(block),
+                avz_native_decoded_block_instructions(block),
+                avz_native_decoded_block_instruction_count(block));
+#if AG_SERVICE_CHAIN_ENABLE
+            if (assembly_graph) {
+                uint64_t visit_budget = checkpoint_block_interval > checkpoint_blocks
+                    ? checkpoint_block_interval - checkpoint_blocks : 1;
+                AGServiceLimits limits = {
+                    .steps = remaining_steps,
+                    .checkpoint_steps = checkpoint_remaining,
+                    .visits = max_blocks - chain.blocks,
+                    .checkpoint_visits = visit_budget
+                };
+                AGServiceResult result = assembly_bounded
+                    ? avz_assembly_cache_service_chain_run_bounded(cache, assembly_graph, limits,
+                        &context->cpu, avz_native_service_assembly_bounded, assembly_memory)
+                    : avz_assembly_cache_service_chain_run(cache, assembly_graph, limits,
+                        &context->cpu, avz_native_service_assembly_chain, assembly_memory);
+                if (result.stop == AG_SERVICE_STOP_PREPARATION) {
+                    /* No callback or instruction ran. Optional allocation
+                     * failure must not become a zero-progress retry loop. */
+                    block_result = avz_native_run_assembly_block(context, &assembly,
+                        requested_steps, assembly_memory);
+                } else {
+                    ran_assembly_chain = 1;
+                    block_result = result.architectural;
+                    executed_blocks = result.visits;
+                    timer_accounted_steps = result.timer_accounted_steps;
+                    assembly_chain_irq = result.service_action == AG_SERVICE_IRQ;
+                    /* A bounded graph stopping is not a VM yield. Let the existing
+                     * outer checkpoint determine whether the execution slice ends. */
+                    if (result.stop == AG_SERVICE_STOP_STEPS ||
+                        result.stop == AG_SERVICE_STOP_VISITS ||
+                        result.stop == AG_SERVICE_STOP_CHECKPOINT ||
+                        (assembly_bounded && result.stop == AG_SERVICE_STOP_ALLOWANCE &&
+                         result.service_action == AG_SERVICE_CONTINUE))
+                        block_result.status = AVZ_NATIVE_STATUS_MAX_STEPS;
+                    context->assembly_owner_chain_runs++;
+                    context->assembly_owner_chain_visits += result.visits;
+                    context->assembly_owner_chain_steps += block_result.steps;
+                    if (assembly_bounded) {
+                        context->assembly_owner_bounded_runs++;
+                        context->assembly_owner_bounded_visits += result.visits;
+                        context->assembly_owner_bounded_steps += block_result.steps;
+                    }
+                    context->assembly_owner_blocks += result.visits;
+                    context->assembly_owner_steps += block_result.steps;
+                    context->assembly_owner_boundaries += block_result.status == AVZ_TP_STATUS_REVALIDATE;
+                    context->assembly_owner_faults += block_result.status == AVZ_TP_STATUS_MEMORY_FAULT;
+                    context->assembly_statistics_dirty = 1;
+                }
+            } else
+#endif
+            block_result = avz_native_run_assembly_block(context, &assembly, requested_steps,
+                uses_fast_memory_context ? memory_context : NULL);
+        }
+#endif
 #if AVZ_THREADED_PROTOTYPE_ENABLE
         else if (threaded_eligible) {
             avz_native_sample_hot_pc(context, avz_native_decoded_block_pc(block),
@@ -15019,9 +15374,11 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             );
         }
         chain.steps += block_result.steps;
-        int native_irq_due = uses_fast_memory_context &&
-            avz_native_memory_fast_path_advance_time(
-                memory_context, block_result.steps, context->cpu.pstate);
+        int native_irq_due = assembly_chain_irq;
+        if (uses_fast_memory_context &&
+            (!ran_assembly_chain || timer_accounted_steps < block_result.steps))
+            native_irq_due |= avz_native_memory_fast_path_advance_time(
+                memory_context, block_result.steps - timer_accounted_steps, context->cpu.pstate);
         chain.generic_dispatches += block_result.generic_dispatches;
         chain.fast_path_steps += block_result.fast_path_steps;
         chain.fast_path_hits += block_result.fast_path_hits;
@@ -15037,7 +15394,12 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
         chain.unsupported_instruction = block_result.unsupported_instruction;
         checkpoint_steps += block_result.steps;
         checkpoint_blocks += executed_blocks;
-        if (fused_block_limit != 0 && executed_blocks != 0) {
+        if (ran_assembly_chain) {
+            /* Service/helper callbacks may have recycled the root. Never use
+             * a borrowed decoded pointer after the graph releases its pin. */
+            previous_block = NULL;
+            previous_serial = 0;
+        } else if (fused_block_limit != 0 && executed_blocks != 0) {
             size_t last_slot = (size_t)(executed_blocks - 1);
             const uint64_t *serial_token =
                 active_superblock->serial_tokens[last_slot];
@@ -15124,6 +15486,9 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
         chain.status == AVZ_NATIVE_STATUS_OUTSIDE_BLOCK) {
         chain.status = AVZ_NATIVE_STATUS_MAX_STEPS;
     }
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    if (assembly_enabled) avz_native_publish_assembly_statistics(context);
+#endif
     return chain;
 }
 

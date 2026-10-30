@@ -1,4 +1,15 @@
 #include "ARM64VizNative.h"
+#include "ARM64VizCacheDiagnostics.h"
+#include "ARM64VizAssemblyChain.h"
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE && defined(AG_SERVICE_CHAIN_ENABLE) && AG_SERVICE_CHAIN_ENABLE
+#include "ARM64VizGuestMemoryInternal.h"
+#define AVZ_CACHE_SERVICE_CHAIN 1
+#else
+#define AVZ_CACHE_SERVICE_CHAIN 0
+#endif
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+#include "Assembly/gadget.h"
+#endif
 #if AVZ_THREADED_PROTOTYPE_ENABLE
 #include "ARM64VizThreadedPrototype.h"
 #endif
@@ -7,6 +18,29 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
+
+/* Payload budget per owner/vCPU, excluding fixed decoded-entry metadata and
+ * retired active pins. Overrides are for isolated attribution/testing builds. */
+#ifndef AVZ_ASSEMBLY_CACHE_BYTE_BUDGET
+#define AVZ_ASSEMBLY_CACHE_BYTE_BUDGET (4u * 1024u * 1024u)
+#endif
+#define AVZ_ASSEMBLY_CACHE_PROTECTED_BUDGET (AVZ_ASSEMBLY_CACHE_BYTE_BUDGET * 3u / 4u)
+#define AVZ_ASSEMBLY_CACHE_MAX_RETIREMENTS 64u
+
+#ifndef AVZ_ASSEMBLY_CACHE_DIAGNOSTICS
+#define AVZ_ASSEMBLY_CACHE_DIAGNOSTICS 0
+#endif
+#if AVZ_ASSEMBLY_CACHE_DIAGNOSTICS && AVZ_ASSEMBLY_EXECUTOR_ENABLE
+#include <time.h>
+#define AVZ_AC_DIAGNOSTICS 1
+#define AVZ_AC_COUNT(cache, field) do { \
+    if ((cache) && (cache)->assembly_diagnostics.enabled) \
+        (cache)->assembly_diagnostics.field++; \
+} while (0)
+#else
+#define AVZ_AC_DIAGNOSTICS 0
+#define AVZ_AC_COUNT(cache, field) ((void)0)
+#endif
 
 /* Compile-time opt-in: no counters or counter branches in ordinary builds. */
 #ifndef AVZ_THREADED_CACHE_DIAGNOSTICS
@@ -143,6 +177,21 @@ static void avz_classify_block_semantics(AVZNativeDecodedBlock *block) {
     }
 }
 
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+typedef struct {
+    AGProgram *program;
+    size_t bytes;
+    uint16_t previous, next; /* One-based decoded-entry indices; zero is null. */
+    uint8_t queue; /* 0 absent, 1 probation, 2 protected. */
+    uint8_t reuse; /* Two cached hits promote; a paired initial lookup does not. */
+#if AVZ_AC_DIAGNOSTICS
+    uint64_t hits;
+#endif
+} AVZAssemblyRetention;
+_Static_assert(AVZ_BLOCK_CACHE_ENTRY_COUNT <= UINT16_MAX, "assembly queue index width");
+_Static_assert(AVZ_ASSEMBLY_CACHE_BYTE_BUDGET > 0, "assembly byte budget must be positive");
+#endif
+
 typedef struct {
     AVZNativeDecodedBlock block;
     uint64_t serial;
@@ -152,12 +201,45 @@ typedef struct {
     uint64_t last_used;
     uint8_t valid;
     uint8_t prefetched;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    uint8_t assembly_capability; /* 0 unknown, 1 registers, 2 memory, 3 rejected/OOM */
+    AVZAssemblyRetention assembly;
+#if AVZ_AC_DIAGNOSTICS
+    uint8_t assembly_rejection; /* 1 semantic, 2 unsupported, 3 NULL preparation */
+    uint8_t assembly_was_admitted;
+#endif
+#endif
 #if AVZ_THREADED_PROTOTYPE_ENABLE
     /* Decoded-entry lifetime, not auxiliary-slot lifetime. Fits tail padding. */
     uint8_t threaded_eligibility; /* 0 unknown, 1 registers, 2 unsupported, 3 OOM, 4 memory */
     uint16_t threaded_slot; /* One-based; zero means no owned program. */
 #endif
 } AVZBlockCacheEntry;
+
+#if AVZ_CACHE_SERVICE_CHAIN
+typedef struct {
+    const AVZBlockCacheEntry *entry;
+    uint64_t serial, base, physical_page;
+    size_t count;
+    const uint64_t *local_generation;
+    const _Atomic uint64_t *shared_generation;
+    uint64_t expected_local_generation, expected_shared_generation;
+} AVZAssemblyChainMember;
+
+typedef struct {
+    AGServiceChain *chain;
+    AVZNativeMemoryFastPath *memory;
+    AVZGuestMemory *guest_memory;
+    uint8_t *ram;
+    uint64_t ram_base, ram_size, reset_epoch, translation_epoch;
+    uint64_t memory_translation_generation, memory_tlbi_epoch;
+    AVZNativeBlockKey key, memory_key;
+    AGGuards proof;
+    size_t count, instructions, bytes;
+    unsigned active, native_translation_enabled;
+    AVZAssemblyChainMember members[AG_SERVICE_MAX_MEMBERS];
+} AVZAssemblyChainOwner;
+#endif
 
 typedef struct {
     uint64_t hash;
@@ -166,6 +248,20 @@ typedef struct {
 } AVZBlockFrontCacheEntry;
 
 struct AVZNativeBlockCache {
+#if AVZ_CACHE_SERVICE_CHAIN
+    AVZAssemblyChainOwner service_chain;
+    AVZAssemblyChainDiagnostics service_chain_diagnostics;
+#endif
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    /* Byte-weighted segmented LRU, directly attached to decoded lifetimes.
+     * Probation absorbs scans; protected entries have demonstrated reuse. */
+    uint16_t assembly_heads[2], assembly_tails[2];
+    size_t assembly_bytes[2];
+    uint32_t assembly_count;
+#if AVZ_AC_DIAGNOSTICS
+    AVZAssemblyCacheDiagnostics assembly_diagnostics;
+#endif
+#endif
 #if AVZ_THREADED_PROTOTYPE_ENABLE
     /* Intrusive global FIFO; hits do not reorder the 256-program pool. */
     struct {
@@ -217,6 +313,38 @@ struct AVZNativeBlockCache {
     AVZNativeBlockCacheStatistics statistics;
 };
 
+#if AVZ_CACHE_SERVICE_CHAIN
+void avz_assembly_cache_service_chain_retire(AVZNativeBlockCache *cache) {
+    if (!cache || !cache->service_chain.chain) return;
+    AGServiceChain *chain = cache->service_chain.chain;
+    /* Lazy preparation may have grown a pinned graph during this invocation. */
+    cache->service_chain.bytes = sizeof(cache->service_chain) + ag_service_chain_bytes(chain);
+    if (cache->service_chain.bytes > cache->service_chain_diagnostics.peak_bytes)
+        cache->service_chain_diagnostics.peak_bytes = cache->service_chain.bytes;
+    cache->service_chain.chain = NULL;
+    cache->service_chain_diagnostics.retirements++;
+    ag_service_chain_destroy(chain);
+    /* An active invocation retains this validation context until run returns. */
+    if (!cache->service_chain.active)
+        memset(&cache->service_chain, 0, sizeof(cache->service_chain));
+}
+
+static void avz_assembly_chain_forget_entry(AVZNativeBlockCache *cache,
+    const AVZBlockCacheEntry *entry) {
+    if (!cache->service_chain.chain) return;
+    for (size_t i = 0; i < cache->service_chain.count; i++) {
+        if (cache->service_chain.members[i].entry == entry) {
+            avz_assembly_cache_service_chain_retire(cache);
+            return;
+        }
+    }
+}
+#define avz_assembly_chain_retire(cache) avz_assembly_cache_service_chain_retire(cache)
+#else
+#define avz_assembly_chain_forget_entry(cache, entry) ((void)0)
+#define avz_assembly_chain_retire(cache) ((void)0)
+#endif
+
 #if AVZ_THREADED_PROTOTYPE_ENABLE
 static void avz_threaded_initialize_lru(AVZNativeBlockCache *cache) {
     for (size_t i = 0; i < 256; i++) {
@@ -250,6 +378,8 @@ static void avz_threaded_release_slot(AVZNativeBlockCache *cache, size_t slot) {
     }
     if (cache->threaded_programs[slot].program != NULL) {
         AVZ_TC_COUNT(cache, destructions);
+        /* Drop cache ownership now. A reentrant invalidation during execution
+         * retires the snapshot; the run's pin delays reclamation until return. */
         avz_tp_destroy(cache->threaded_programs[slot].program);
     }
     cache->threaded_programs[slot].owner = NULL;
@@ -269,6 +399,129 @@ static void avz_threaded_forget_entry(AVZNativeBlockCache *cache,
 
 #else
 #define avz_threaded_forget_entry(cache, entry) ((void)0)
+#endif
+
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+static void avz_assembly_unlink(AVZNativeBlockCache *cache, AVZBlockCacheEntry *entry) {
+    AVZAssemblyRetention *r = &entry->assembly;
+    unsigned queue = r->queue - 1u;
+    if (r->previous) cache->entries[r->previous - 1u].assembly.next = r->next;
+    else cache->assembly_heads[queue] = r->next;
+    if (r->next) cache->entries[r->next - 1u].assembly.previous = r->previous;
+    else cache->assembly_tails[queue] = r->previous;
+    cache->assembly_bytes[queue] -= r->bytes;
+    r->queue = 0;
+    r->previous = r->next = 0;
+}
+
+static void avz_assembly_append(AVZNativeBlockCache *cache,
+    AVZBlockCacheEntry *entry, unsigned queue) {
+    AVZAssemblyRetention *r = &entry->assembly;
+    uint16_t index = (uint16_t)(entry - cache->entries + 1u);
+    uint16_t tail = cache->assembly_tails[queue];
+    r->previous = tail;
+    r->next = 0;
+    r->queue = (uint8_t)(queue + 1u);
+    if (tail) cache->entries[tail - 1u].assembly.next = index;
+    else cache->assembly_heads[queue] = index;
+    cache->assembly_tails[queue] = index;
+    cache->assembly_bytes[queue] += r->bytes;
+}
+
+static void avz_assembly_release(AVZNativeBlockCache *cache, AVZBlockCacheEntry *entry) {
+    AVZAssemblyRetention *r = &entry->assembly;
+    if (!r->program) return;
+#if AVZ_AC_DIAGNOSTICS
+    if (cache->assembly_diagnostics.enabled) {
+        cache->assembly_diagnostics.cache_owned_programs--;
+        cache->assembly_diagnostics.cache_owned_program_bytes -= r->bytes;
+    }
+#endif
+    avz_assembly_unlink(cache, entry);
+    cache->assembly_count--;
+    /* Cache ownership ends now; active execution still pins the snapshot. */
+    ag_destroy(r->program);
+    memset(r, 0, sizeof(*r));
+}
+static void avz_assembly_forget_entry(AVZNativeBlockCache *cache,
+    AVZBlockCacheEntry *entry) {
+    if (entry->assembly.program) {
+        AVZ_AC_COUNT(cache, entry_releases);
+        avz_assembly_release(cache, entry);
+    }
+    entry->assembly_capability = 0;
+#if AVZ_AC_DIAGNOSTICS
+    entry->assembly_rejection = 0;
+    entry->assembly_was_admitted = 0;
+#endif
+}
+static void avz_assembly_clear(AVZNativeBlockCache *cache) {
+    for (unsigned queue = 0; queue < 2; queue++) {
+        while (cache->assembly_heads[queue]) {
+            AVZ_AC_COUNT(cache, clear_releases);
+            avz_assembly_release(cache, &cache->entries[cache->assembly_heads[queue] - 1u]);
+        }
+    }
+}
+
+static void avz_assembly_record_reuse(AVZNativeBlockCache *cache, AVZBlockCacheEntry *entry) {
+    AVZAssemblyRetention *r = &entry->assembly;
+    if (r->queue == 2) {
+        if (!r->next) return; /* Consecutive selection/execution pair: no writes. */
+        avz_assembly_unlink(cache, entry);
+        avz_assembly_append(cache, entry, 1);
+        return;
+    }
+    if (r->reuse < 2) r->reuse++;
+    if (r->reuse < 2 || r->bytes > AVZ_ASSEMBLY_CACHE_PROTECTED_BUDGET) return;
+    /* Demote at most one entry on a lookup. Large promotions that need more
+     * room remain in probation and retry on reuse; lookup work stays O(1). */
+    if (cache->assembly_bytes[1] > AVZ_ASSEMBLY_CACHE_PROTECTED_BUDGET - r->bytes) {
+        AVZBlockCacheEntry *old = &cache->entries[cache->assembly_heads[1] - 1u];
+        avz_assembly_unlink(cache, old);
+        old->assembly.reuse = 0;
+        avz_assembly_append(cache, old, 0);
+        AVZ_AC_COUNT(cache, protected_demotions);
+    }
+    if (cache->assembly_bytes[1] > AVZ_ASSEMBLY_CACHE_PROTECTED_BUDGET - r->bytes) return;
+    avz_assembly_unlink(cache, entry);
+    avz_assembly_append(cache, entry, 1);
+    AVZ_AC_COUNT(cache, promotions);
+}
+
+static int avz_assembly_make_room(AVZNativeBlockCache *cache, size_t bytes) {
+    if (bytes > AVZ_ASSEMBLY_CACHE_BYTE_BUDGET) return 0;
+    unsigned retired = 0;
+    while (cache->assembly_bytes[0] + cache->assembly_bytes[1] >
+           AVZ_ASSEMBLY_CACHE_BYTE_BUDGET - bytes &&
+           retired < AVZ_ASSEMBLY_CACHE_MAX_RETIREMENTS) {
+        /* Prefer probation; a program larger than the unprotected reserve may
+         * also require the oldest protected entry. Never scan decoded entries. */
+        uint16_t victim = cache->assembly_heads[0] ?
+            cache->assembly_heads[0] : cache->assembly_heads[1];
+        AVZBlockCacheEntry *entry = &cache->entries[victim - 1u];
+        AVZ_AC_COUNT(cache, positive_evictions);
+        AVZ_AC_COUNT(cache, budget_evictions);
+#if AVZ_AC_DIAGNOSTICS
+        if (cache->assembly_diagnostics.enabled) {
+            if (entry->assembly.hits) cache->assembly_diagnostics.reused_positive_evictions++;
+            cache->assembly_diagnostics.evicted_program_hits += entry->assembly.hits;
+        }
+#endif
+        avz_assembly_release(cache, entry);
+        retired++;
+    }
+#if AVZ_AC_DIAGNOSTICS
+    if (cache->assembly_diagnostics.enabled &&
+        retired > cache->assembly_diagnostics.peak_admission_retirements)
+        cache->assembly_diagnostics.peak_admission_retirements = retired;
+#endif
+    return cache->assembly_bytes[0] + cache->assembly_bytes[1] <=
+        AVZ_ASSEMBLY_CACHE_BYTE_BUDGET - bytes;
+}
+#else
+#define avz_assembly_forget_entry(cache, entry) ((void)0)
+#define avz_assembly_clear(cache) ((void)0)
 #endif
 
 static void avz_advance_nonzero_counter(uint64_t *counter) {
@@ -703,6 +956,8 @@ static void avz_unlink_page_link(AVZNativeBlockCache *cache, int32_t link_index)
 }
 
 static void avz_unindex_entry(AVZNativeBlockCache *cache, size_t entry_index) {
+    /* Retire private copies BEFORE dropping enrollment or recycling serials. */
+    avz_assembly_chain_forget_entry(cache, &cache->entries[entry_index]);
     size_t first_link = entry_index * AVZ_NATIVE_BLOCK_MAX_CODE_PAGES;
     for (size_t slot = 0; slot < AVZ_NATIVE_BLOCK_MAX_CODE_PAGES; slot++) {
         avz_unlink_page_link(cache, (int32_t)(first_link + slot));
@@ -856,6 +1111,7 @@ static void avz_discard_stale_entry(
     avz_retire_unused_prefetch(cache, entry);
     avz_unindex_entry(cache, entry_index);
     avz_threaded_forget_entry(cache, entry);
+    avz_assembly_forget_entry(cache, entry);
     entry->valid = 0;
     entry->serial = 0;
     entry->validated_code_mutation_epoch = 0;
@@ -872,6 +1128,7 @@ static void avz_invalidate_entry(AVZNativeBlockCache *cache, size_t entry_index)
     avz_retire_unused_prefetch(cache, entry);
     avz_unindex_entry(cache, entry_index);
     avz_threaded_forget_entry(cache, entry);
+    avz_assembly_forget_entry(cache, entry);
     entry->valid = 0;
     entry->serial = 0;
     avz_advance_nonzero_counter(&cache->generation);
@@ -923,6 +1180,8 @@ void avz_native_block_cache_destroy(AVZNativeBlockCache *cache) {
     if (cache == NULL) {
         return;
     }
+    avz_assembly_chain_retire(cache);
+    avz_assembly_clear(cache);
 #if AVZ_THREADED_PROTOTYPE_ENABLE
     for (size_t i = 0; i < 256; i++) {
         avz_threaded_release_slot(cache, i);
@@ -941,6 +1200,8 @@ void avz_native_block_cache_clear(AVZNativeBlockCache *cache) {
     if (cache == NULL) {
         return;
     }
+    avz_assembly_chain_retire(cache);
+    avz_assembly_clear(cache);
 #if AVZ_THREADED_PROTOTYPE_ENABLE
     for (size_t i = 0; i < 256; i++) {
         avz_threaded_release_slot(cache, i);
@@ -1098,6 +1359,7 @@ void avz_native_block_cache_invalidate_decode_window(
 
 void avz_native_block_cache_invalidate_translation_mappings(AVZNativeBlockCache *cache) {
     if (cache == NULL) return;
+    avz_assembly_chain_retire(cache);
     cache->decode_window_valid = 0;
     avz_advance_nonzero_counter(&cache->translation_epoch);
     /* Existing chain/link guards already observe this token. Physical code
@@ -1332,6 +1594,7 @@ const AVZNativeDecodedBlock *avz_native_block_cache_get_or_decode(
         avz_retire_unused_prefetch(cache, &cache->entries[entry_index]);
         avz_unindex_entry(cache, entry_index);
         avz_threaded_forget_entry(cache, &cache->entries[entry_index]);
+        avz_assembly_forget_entry(cache, &cache->entries[entry_index]);
         cache->entries[entry_index].serial = 0;
         avz_advance_nonzero_counter(&cache->mutation_epoch);
         cache->statistics.evictions++;
@@ -1424,6 +1687,8 @@ void avz_native_block_cache_invalidate_physical_range(
         return;
     }
 
+    avz_assembly_chain_retire(cache);
+
     uint64_t tracked_last_page = cache->tracked_page_count == 0
         ? 0
         : cache->tracked_first_page +
@@ -1499,6 +1764,202 @@ const AVZNativeInstruction *avz_native_decoded_block_instructions(
     return block == NULL ? NULL : block->instructions;
 }
 
+AVZAssemblyCacheDiagnostics avz_native_block_cache_diagnostics_snapshot(
+    const AVZNativeBlockCache *cache
+) {
+    AVZAssemblyCacheDiagnostics result = {0};
+#if AVZ_AC_DIAGNOSTICS
+    if (cache) result = cache->assembly_diagnostics;
+    result.compiled = 1;
+#endif
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    result.program_capacity = AVZ_BLOCK_CACHE_ENTRY_COUNT;
+    result.program_byte_budget = AVZ_ASSEMBLY_CACHE_BYTE_BUDGET;
+    result.protected_byte_budget = AVZ_ASSEMBLY_CACHE_PROTECTED_BUDGET;
+    result.max_retirements_per_admission = AVZ_ASSEMBLY_CACHE_MAX_RETIREMENTS;
+    result.assembly_slot_storage_bytes = AVZ_BLOCK_CACHE_ENTRY_COUNT *
+        sizeof(AVZAssemblyRetention) + sizeof(cache->assembly_heads) +
+        sizeof(cache->assembly_tails) + sizeof(cache->assembly_bytes) +
+        sizeof(cache->assembly_count);
+#endif
+    if (!cache) return result;
+    result.cache_storage_bytes = sizeof(*cache);
+    if (cache->entries) result.cache_storage_bytes +=
+        AVZ_BLOCK_CACHE_ENTRY_COUNT * sizeof(*cache->entries);
+    if (cache->page_links) result.cache_storage_bytes +=
+        AVZ_BLOCK_CACHE_ENTRY_COUNT * AVZ_NATIVE_BLOCK_MAX_CODE_PAGES *
+        sizeof(*cache->page_links);
+    if (cache->page_bucket_heads) result.cache_storage_bytes +=
+        AVZ_BLOCK_PAGE_BUCKET_COUNT * sizeof(*cache->page_bucket_heads);
+    if (cache->code_page_refcounts) result.cache_storage_bytes +=
+        cache->tracked_page_count * sizeof(*cache->code_page_refcounts);
+    if (cache->code_page_generations) result.cache_storage_bytes +=
+        cache->tracked_page_count * sizeof(*cache->code_page_generations);
+    if (cache->trace_code_page_bits) result.cache_storage_bytes +=
+        avz_trace_code_page_byte_count(cache->tracked_page_count);
+    result.cache_owned_programs = 0;
+    result.cache_owned_program_bytes = 0;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    result.cache_owned_programs = cache->assembly_count;
+    result.cache_owned_program_bytes = cache->assembly_bytes[0] + cache->assembly_bytes[1];
+    result.protected_program_bytes = cache->assembly_bytes[1];
+#endif
+    return result;
+}
+
+int avz_native_block_cache_diagnostics_begin(AVZNativeBlockCache *cache,
+    uint32_t flags
+) {
+#if AVZ_AC_DIAGNOSTICS
+    if (!cache || (flags & ~(AVZ_CACHE_DIAGNOSTICS_COUNTS |
+                            AVZ_CACHE_DIAGNOSTICS_PREPARATION_TIME))) return 0;
+    memset(&cache->assembly_diagnostics, 0, sizeof(cache->assembly_diagnostics));
+    for (size_t i = 0; i < AVZ_BLOCK_CACHE_ENTRY_COUNT; i++)
+        cache->entries[i].assembly.hits = 0;
+    cache->assembly_diagnostics = avz_native_block_cache_diagnostics_snapshot(cache);
+    AVZAssemblyCacheDiagnostics *d = &cache->assembly_diagnostics;
+    d->enabled = flags != 0;
+    d->timing_enabled = (flags & AVZ_CACHE_DIAGNOSTICS_PREPARATION_TIME) != 0;
+    d->peak_cache_owned_programs = d->cache_owned_programs;
+    d->peak_cache_owned_program_bytes = d->cache_owned_program_bytes;
+    d->peak_preparation_live_bytes = d->cache_owned_program_bytes;
+    return 1;
+#else
+    (void)cache;
+    (void)flags;
+    return 0;
+#endif
+}
+
+#if AVZ_AC_DIAGNOSTICS
+static int avz_assembly_diagnostic_clock(uint64_t *ns) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    *ns = (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+    return 1;
+}
+#endif
+
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+const AGProgram *avz_assembly_cache_program(AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *block, int allow_memory) {
+    AVZBlockCacheEntry *entry = (AVZBlockCacheEntry *)avz_entry_for_block(cache, block);
+    AVZ_AC_COUNT(cache, requests);
+    if (!entry || !entry->valid || !entry->serial || !block->instruction_count) {
+        AVZ_AC_COUNT(cache, invalid_requests);
+        return NULL;
+    }
+    if (!avz_entry_code_is_current(cache, entry)) {
+        AVZ_AC_COUNT(cache, stale_requests);
+        avz_assembly_forget_entry(cache, entry);
+        return NULL;
+    }
+    if (entry->assembly_capability == 3 ||
+        (entry->assembly_capability == 2 && !allow_memory)) {
+        AVZ_AC_COUNT(cache, negative_hits);
+#if AVZ_AC_DIAGNOSTICS
+        if (entry->assembly_capability == 2) AVZ_AC_COUNT(cache, negative_memory_hits);
+        else if (entry->assembly_rejection == 1) AVZ_AC_COUNT(cache, negative_semantic_hits);
+        else if (entry->assembly_rejection == 2) AVZ_AC_COUNT(cache, negative_unsupported_hits);
+        else if (entry->assembly_rejection == 3) AVZ_AC_COUNT(cache, negative_null_hits);
+#endif
+        return NULL;
+    }
+    if (!entry->assembly_capability) {
+        AVZ_AC_COUNT(cache, eligibility_scans);
+        /* Preserve existing bulk/string/PLT accelerators and opportunities to
+         * compose their mapped traces. Subset coverage is not a speed proof. */
+        for (size_t i = 0; i < block->instruction_count; i++) {
+            if (block->semantic_candidates[i] || block->trace_semantic_candidates[i]) {
+                entry->assembly_capability = 3;
+                AVZ_AC_COUNT(cache, semantic_rejections);
+#if AVZ_AC_DIAGNOSTICS
+                entry->assembly_rejection = 1;
+#endif
+                return NULL;
+            }
+        }
+    }
+    if (entry->assembly.program) {
+        AVZ_AC_COUNT(cache, program_hits);
+#if AVZ_AC_DIAGNOSTICS
+        if (cache->assembly_diagnostics.enabled)
+            entry->assembly.hits++;
+#endif
+        avz_assembly_record_reuse(cache, entry);
+        return entry->assembly.program;
+    }
+    AVZ_AC_COUNT(cache, program_misses);
+#if AVZ_AC_DIAGNOSTICS
+    if (entry->assembly_was_admitted) AVZ_AC_COUNT(cache, positive_repreparations);
+#endif
+    uint32_t words[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
+    for (size_t i = 0; i < block->instruction_count; i++) words[i] = block->instructions[i].raw;
+    AVZ_AC_COUNT(cache, preparation_attempts);
+#if AVZ_AC_DIAGNOSTICS
+    AVZAssemblyCacheDiagnostics *d = &cache->assembly_diagnostics;
+    uint64_t started = 0, finished = 0;
+    int timed = d->timing_enabled;
+    int clock_started = timed && avz_assembly_diagnostic_clock(&started);
+#endif
+    AGProgram *program = ag_create(words, block->instruction_count, block->key.pc);
+    unsigned capability = ag_program_capabilities(program);
+#if AVZ_AC_DIAGNOSTICS
+    if (timed) {
+        int clock_finished = avz_assembly_diagnostic_clock(&finished);
+        if (clock_started && clock_finished && finished >= started) {
+            uint64_t elapsed = finished - started;
+            d->preparation_timed_samples++;
+            d->preparation_ns += elapsed;
+            if (elapsed > d->preparation_max_ns) d->preparation_max_ns = elapsed;
+        } else d->preparation_clock_failures++;
+    }
+    if (d->enabled) {
+        if (program) {
+            d->program_allocations++;
+            uint64_t bytes = ag_program_bytes(program);
+            d->allocated_program_bytes += bytes;
+            if (d->cache_owned_program_bytes + bytes > d->peak_preparation_live_bytes)
+                d->peak_preparation_live_bytes = d->cache_owned_program_bytes + bytes;
+        } else d->preparation_null_results++;
+    }
+    if (!capability) entry->assembly_rejection = program ? 2 : 3;
+#endif
+    entry->assembly_capability = capability ? capability : 3;
+    if (!capability || (capability == 2 && !allow_memory)) {
+        if (program && !capability) AVZ_AC_COUNT(cache, unsupported_preparations);
+        if (capability == 2) AVZ_AC_COUNT(cache, memory_denied_preparations);
+        if (program) AVZ_AC_COUNT(cache, transient_releases);
+        ag_destroy(program);
+        return NULL;
+    }
+    size_t bytes = ag_program_bytes(program);
+    if (!avz_assembly_make_room(cache, bytes)) {
+        AVZ_AC_COUNT(cache, budget_rejections);
+        AVZ_AC_COUNT(cache, transient_releases);
+        ag_destroy(program);
+        return NULL;
+    }
+    entry->assembly.program = program;
+    entry->assembly.bytes = bytes;
+    avz_assembly_append(cache, entry, 0);
+    cache->assembly_count++;
+    AVZ_AC_COUNT(cache, admissions);
+#if AVZ_AC_DIAGNOSTICS
+    entry->assembly_was_admitted = 1;
+    if (d->enabled) {
+        d->cache_owned_programs++;
+        d->cache_owned_program_bytes += ag_program_bytes(program);
+        if (d->cache_owned_programs > d->peak_cache_owned_programs)
+            d->peak_cache_owned_programs = d->cache_owned_programs;
+        if (d->cache_owned_program_bytes > d->peak_cache_owned_program_bytes)
+            d->peak_cache_owned_program_bytes = d->cache_owned_program_bytes;
+    }
+#endif
+    return program;
+}
+#endif
+
 #if AVZ_THREADED_PROTOTYPE_ENABLE
 const AVZThreadedPrototype *avz_native_block_cache_threaded_program(
     AVZNativeBlockCache *cache, const AVZNativeDecodedBlock *block
@@ -1552,7 +2013,8 @@ const AVZThreadedPrototype *avz_native_block_cache_threaded_program_with_memory(
     for (size_t i = 0; i < block->instruction_count; i++) {
         words[i] = block->instructions[i].raw;
     }
-    /* Evict before allocating, so even transient ownership stays <= 256. */
+    /* At most 256 cache-owned programs. Retired running snapshots live only
+     * until their active calls return and cannot be selected again. */
     cache->threaded_programs[slot].program = avz_tp_create(
         words, block->instruction_count, block->key.pc);
     if (cache->threaded_programs[slot].program == NULL) {
@@ -1890,3 +2352,362 @@ uint64_t avz_native_block_cache_reset_epoch(
 ) {
     return cache == NULL ? 0 : cache->reset_epoch;
 }
+
+#if AVZ_CACHE_SERVICE_CHAIN
+static AVZNativeBlockKey avz_assembly_chain_memory_key(
+    const AVZNativeMemoryFastPath *memory, uint64_t pc) {
+    const AVZNativeStage1TranslationState *s = &memory->translation_state;
+    return (AVZNativeBlockKey){.pc = pc, .sctlr_el1 = s->sctlr_el1,
+        .tcr_el1 = s->tcr_el1, .ttbr0_el1 = s->ttbr0_el1,
+        .ttbr1_el1 = s->ttbr1_el1, .current_el = s->current_el};
+}
+
+static int avz_assembly_chain_proof_current(const AGGuards *p) {
+    if (!p->local || *p->local != p->expected[0]) return 0;
+    for (size_t i = 0; i < 3; i++)
+        if (p->shared[i] && atomic_load_explicit(p->shared[i],
+                memory_order_acquire) != p->expected[i + 1]) return 0;
+    return 1;
+}
+
+static int avz_assembly_chain_binding_matches(const AVZNativeBlockCache *cache) {
+    const AVZAssemblyChainOwner *o = &cache->service_chain;
+    const AVZNativeMemoryFastPath *m = o->memory;
+    if (!m || cache->reset_epoch != o->reset_epoch ||
+        cache->translation_epoch != o->translation_epoch ||
+        cache->guest_memory != o->guest_memory || cache->ram != o->ram ||
+        cache->ram_base != o->ram_base || cache->ram_size != o->ram_size ||
+        m->block_cache != cache || m->guest_memory != o->guest_memory ||
+        m->ram != o->ram || m->ram_base != o->ram_base || m->ram_size != o->ram_size ||
+        m->native_translation_enabled != o->native_translation_enabled ||
+        m->translation_generation != o->memory_translation_generation ||
+        m->tlbi_epoch != o->memory_tlbi_epoch ||
+        m->observed_shared_translation_epoch != o->proof.expected[2]) return 0;
+    AVZNativeBlockKey current = avz_assembly_chain_memory_key(m, o->key.pc);
+    return avz_block_keys_equal(&current, &o->memory_key);
+}
+
+static int avz_assembly_chain_binding_current(const AVZNativeBlockCache *cache) {
+    return avz_assembly_chain_binding_matches(cache) &&
+        avz_assembly_chain_proof_current(&cache->service_chain.proof);
+}
+
+/* Deliberately does not call avz_entry_code_is_current: mapping validation can
+ * call into the owner, and active validation must neither mutate nor retire. */
+static int avz_assembly_chain_entry_eligible(const AVZNativeBlockCache *cache,
+    const AVZBlockCacheEntry *e, const AVZNativeBlockKey *context) {
+    if (!e || !e->valid || !e->serial) return 0;
+    const AVZNativeDecodedBlock *b = &e->block;
+    if (!b->instruction_count || b->instruction_count > 16 || b->code_page_count != 1 ||
+        b->chain_barrier || b->requires_host_checkpoint || (b->key.pc & 3) ||
+        b->instruction_count > (UINT64_MAX - b->key.pc) / 4 ||
+        (b->key.pc >> 12) != ((b->key.pc + (b->instruction_count - 1u) * 4) >> 12) ||
+        e->validated_translation_epoch != cache->translation_epoch) return 0;
+    AVZNativeBlockKey canonical = *context;
+    canonical.pc = b->key.pc;
+    canonical = avz_canonical_block_key(&canonical);
+    if (!avz_block_keys_equal(&b->key, &canonical)) return 0;
+    uint64_t page = b->physical_code_pages[0];
+    if (page < cache->tracked_first_page || !cache->code_page_refcounts ||
+        !cache->code_page_generations || !cache->guest_memory) return 0;
+    uint64_t index = (page - cache->tracked_first_page) >> 12;
+    if (index >= cache->tracked_page_count || !cache->code_page_refcounts[index] ||
+        b->code_page_generation_tokens[0] != &cache->code_page_generations[index] ||
+        !avz_block_code_pages_are_current(b) ||
+        !avz_block_shared_code_pages_are_current(cache, b)) return 0;
+    size_t entry_index = (size_t)(e - cache->entries);
+    const AVZBlockPageLink *link = &cache->page_links[
+        entry_index * AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
+    const uint64_t *shared = avz_guest_memory_page_write_generation_token(
+        cache->guest_memory, page, cache->ram_base);
+    const uint8_t *host = avz_direct_physical_pointer(cache, page, 4096);
+    if (!link->linked || link->page != page || !shared || !host ||
+        b->shared_code_page_generation_tokens[0] != shared ||
+        b->host_code_pages[0] != host) return 0;
+    for (size_t i = 0; i < b->instruction_count; i++) {
+        if (b->semantic_candidates[i] || b->trace_semantic_candidates[i] ||
+            (b->physical_addresses[i] & ~UINT64_C(0xfff)) != page) return 0;
+        switch (b->instructions[i].kind) {
+        case AVZ_NATIVE_OP_SYSTEM_REGISTER_READ:
+        case AVZ_NATIVE_OP_SYSTEM_REGISTER_WRITE:
+        case AVZ_NATIVE_OP_SYSTEM_INSTRUCTION:
+        case AVZ_NATIVE_OP_EXCEPTION_RETURN:
+        case AVZ_NATIVE_OP_SYNCHRONOUS_EXCEPTION:
+        case AVZ_NATIVE_OP_PSTATE_IMMEDIATE:
+        case AVZ_NATIVE_OP_WAIT:
+        case AVZ_NATIVE_OP_HALT:
+        case AVZ_NATIVE_OP_BARRIER:
+            return 0;
+        default: break;
+        }
+    }
+    return 1;
+}
+
+static int avz_assembly_chain_member_current(const AVZNativeBlockCache *cache,
+    const AVZAssemblyChainMember *m, int check_generations) {
+    const AVZAssemblyChainOwner *o = &cache->service_chain;
+    const AVZNativeDecodedBlock *b = &m->entry->block;
+    size_t index = (size_t)(m->entry - cache->entries);
+    const AVZBlockPageLink *link = &cache->page_links[index * AVZ_NATIVE_BLOCK_MAX_CODE_PAGES];
+    /* Opcodes, semantic arrays and physical mappings are immutable for this
+     * resident serial. Hooks retire before any entry/enrollment recycling;
+     * only live identity, enrollment and captured proofs need per-visit work. */
+    return m->entry->valid && m->entry->serial == m->serial && b->key.pc == m->base &&
+        m->entry->validated_translation_epoch == o->translation_epoch &&
+        link->linked && link->page == m->physical_page && b->code_page_count == 1 &&
+        b->instruction_count == m->count && b->physical_code_pages[0] == m->physical_page &&
+        b->code_page_generation_tokens[0] == m->local_generation &&
+        b->code_page_generations[0] == m->expected_local_generation &&
+        (const void *)b->shared_code_page_generation_tokens[0] == m->shared_generation &&
+        b->shared_code_page_generations[0] == m->expected_shared_generation &&
+        (!check_generations || (*m->local_generation == m->expected_local_generation &&
+        atomic_load_explicit(m->shared_generation, memory_order_acquire) ==
+            m->expected_shared_generation));
+}
+
+static int avz_assembly_chain_all_current(const AVZNativeBlockCache *cache, int admission) {
+    const AVZAssemblyChainOwner *o = &cache->service_chain;
+    if (!avz_assembly_chain_binding_current(cache)) return 0;
+    for (size_t i = 0; i < o->count; i++) {
+        const AVZAssemblyChainMember *m = &o->members[i];
+        if (!avz_assembly_chain_member_current(cache, m, 1))
+            return 0;
+        if (admission && !avz_assembly_chain_entry_eligible(cache, m->entry, &o->key)) return 0;
+    }
+    return avz_assembly_chain_proof_current(&o->proof);
+}
+
+static int avz_assembly_chain_validate_graph(void *owner) {
+    const AVZNativeBlockCache *cache = owner;
+    const AVZAssemblyChainOwner *o = &cache->service_chain;
+    /* The service runtime checks every captured serial/page generation and
+     * global guard before AND after this callback. Avoid a third value load,
+     * but keep all binding, identity and enrollment metadata checks live. */
+    if (!avz_assembly_chain_binding_matches(cache)) return 0;
+    for (size_t i = 0; i < o->count; i++)
+        if (!avz_assembly_chain_member_current(cache, &o->members[i], 0)) return 0;
+    return 1;
+}
+
+AGServiceChain *avz_assembly_cache_service_chain(AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *root, const AVZNativeBlockKey *key,
+    AVZNativeMemoryFastPath *memory, const AGGuards *proof) {
+    if (!cache || !root || !key || !memory || !proof ||
+        cache->service_chain.active) return NULL;
+    if (!cache->guest_memory || !cache->ram || memory->block_cache != cache ||
+        memory->guest_memory != cache->guest_memory || memory->ram != cache->ram ||
+        memory->ram_base != cache->ram_base || memory->ram_size != cache->ram_size ||
+        proof->local != &cache->code_mutation_epoch ||
+        proof->shared[0] != &cache->guest_memory->code_mutation_epoch ||
+        proof->shared[1] != &cache->guest_memory->translation_epoch ||
+        memory->observed_shared_translation_epoch != proof->expected[2] ||
+        !avz_assembly_chain_proof_current(proof)) {
+        avz_assembly_chain_retire(cache);
+        return NULL;
+    }
+    AVZNativeBlockKey canonical = avz_canonical_block_key(key);
+    AVZNativeBlockKey memory_key = avz_assembly_chain_memory_key(memory, key->pc);
+    AVZNativeBlockKey canonical_memory = avz_canonical_block_key(&memory_key);
+    if (memory->native_translation_enabled &&
+        !avz_block_contexts_equal(&canonical, &canonical_memory)) return NULL;
+    const AVZBlockCacheEntry *first = avz_entry_for_block(cache, root);
+    if (!avz_assembly_chain_entry_eligible(cache, first, &canonical) ||
+        key->pc < root->key.pc || (key->pc & 3) ||
+        key->pc - root->key.pc >= root->instruction_count * 4u) return NULL;
+
+    AVZAssemblyChainOwner *o = &cache->service_chain;
+    if (o->chain) {
+        int same = o->memory == memory && avz_block_contexts_equal(&o->key, &canonical) &&
+            o->proof.local == proof->local && o->proof.expected[0] == proof->expected[0];
+        for (size_t i = 0; i < 3; i++)
+            same &= o->proof.shared[i] == proof->shared[i] &&
+                o->proof.expected[i + 1] == proof->expected[i + 1];
+        if (avz_assembly_chain_all_current(cache, 1)) {
+            if (same) {
+                for (size_t i = 0; i < o->count; i++) {
+                    if (o->members[i].entry == first && o->members[i].serial == first->serial) {
+                        cache->service_chain_diagnostics.reuses++;
+                        return o->chain;
+                    }
+                }
+            }
+            cache->service_chain_diagnostics.retained_graph_misses++;
+            return NULL;
+        }
+        avz_assembly_chain_retire(cache);
+    }
+    /* Only assembly-selected roots with retained positive programs earn a graph.
+     * Successor metadata demonstrates actual prior execution, not prediction. */
+    if (!first->assembly.program || !first->assembly_capability ||
+        first->assembly_capability == 3) return NULL;
+    const AVZBlockCacheEntry *entries[AG_SERVICE_MAX_MEMBERS] = {first};
+    size_t count = 1;
+    int self_edge = 0;
+    for (size_t i = 0; i < count && count < AG_SERVICE_MAX_MEMBERS; i++) {
+        for (size_t j = 0; j < 2 && count < AG_SERVICE_MAX_MEMBERS; j++) {
+            const AVZBlockSuccessor *s = &entries[i]->block.successors[j];
+            const AVZBlockCacheEntry *e = avz_entry_for_block(cache, s->target);
+            if (!e || !s->target_serial || s->target_serial_token != &e->serial ||
+                s->target_serial != e->serial ||
+                !e->assembly.program || !e->assembly_capability || e->assembly_capability == 3 ||
+                !avz_assembly_chain_entry_eligible(cache, e, &canonical)) continue;
+            if (e == first && entries[i] == first) self_edge = 1;
+            uint64_t start = e->block.key.pc;
+            uint64_t end = start + e->block.instruction_count * 4u;
+            int overlaps = 0;
+            for (size_t k = 0; k < count; k++) {
+                const AVZNativeDecodedBlock *b = &entries[k]->block;
+                overlaps |= start < b->key.pc + b->instruction_count * 4u && b->key.pc < end;
+            }
+            if (!overlaps) entries[count++] = e;
+        }
+    }
+    if (count < 2 && !self_edge) return NULL;
+    for (size_t i = 1; i < count; i++) {
+        const AVZBlockCacheEntry *e = entries[i];
+        size_t j = i;
+        while (j && entries[j - 1]->block.key.pc > e->block.key.pc) {
+            entries[j] = entries[j - 1]; j--;
+        }
+        entries[j] = e;
+    }
+    *o = (AVZAssemblyChainOwner){.memory = memory, .guest_memory = cache->guest_memory,
+        .ram = cache->ram, .ram_base = cache->ram_base, .ram_size = cache->ram_size,
+        .reset_epoch = cache->reset_epoch, .translation_epoch = cache->translation_epoch,
+        .memory_translation_generation = memory->translation_generation,
+        .memory_tlbi_epoch = memory->tlbi_epoch, .key = canonical, .memory_key = memory_key,
+        .proof = *proof, .count = count,
+        .native_translation_enabled = memory->native_translation_enabled};
+    uint32_t words[AG_SERVICE_MAX_MEMBERS][16];
+    AGServiceBlock blocks[AG_SERVICE_MAX_MEMBERS];
+    for (size_t i = 0; i < count; i++) {
+        const AVZBlockCacheEntry *e = entries[i];
+        const AVZNativeDecodedBlock *b = &e->block;
+        /* Shared tokens originate in atomic guest-memory storage; local tokens
+         * remain ordinary uint64_t and are never cast to atomic storage. */
+        const _Atomic uint64_t *shared = (const _Atomic uint64_t *)
+            b->shared_code_page_generation_tokens[0];
+        o->members[i] = (AVZAssemblyChainMember){.entry = e, .serial = e->serial,
+            .base = b->key.pc, .count = b->instruction_count,
+            .physical_page = b->physical_code_pages[0],
+            .local_generation = b->code_page_generation_tokens[0],
+            .shared_generation = shared,
+            .expected_local_generation = b->code_page_generations[0],
+            .expected_shared_generation = b->shared_code_page_generations[0]};
+        for (size_t j = 0; j < b->instruction_count; j++) words[i][j] = b->instructions[j].raw;
+        blocks[i] = (AGServiceBlock){.words = words[i], .count = b->instruction_count,
+            .base = b->key.pc, .serial = &e->serial, .expected_serial = e->serial,
+            .local_generation = b->code_page_generation_tokens[0],
+            .expected_local_generation = b->code_page_generations[0],
+            .shared_generation = shared,
+            .expected_shared_generation = b->shared_code_page_generations[0]};
+        o->instructions += b->instruction_count;
+    }
+    o->chain = ag_service_chain_create_graph(blocks, count, proof, memory,
+        avz_assembly_chain_validate_graph, cache);
+    if (!o->chain) {
+        cache->service_chain_diagnostics.failed_builds++;
+        memset(o, 0, sizeof(*o)); return NULL;
+    }
+    o->bytes = sizeof(*o) + ag_service_chain_bytes(o->chain);
+    if (o->instructions > 128 || o->bytes > 32768 || !avz_assembly_chain_all_current(cache, 1)) {
+        cache->service_chain_diagnostics.failed_builds++;
+        avz_assembly_chain_retire(cache);
+        return NULL;
+    }
+    cache->service_chain_diagnostics.builds++;
+    if (o->bytes > cache->service_chain_diagnostics.peak_bytes)
+        cache->service_chain_diagnostics.peak_bytes = o->bytes;
+    return o->chain;
+}
+
+static AGServiceResult avz_assembly_cache_service_chain_run_impl(AVZNativeBlockCache *cache,
+    AGServiceChain *chain, AGServiceLimits limits, AVZNativeCPU *cpu,
+    AGServiceCallback service, void *owner, int bounded) {
+    if (!cache || !chain || cache->service_chain.chain != chain || cache->service_chain.active)
+        return (AGServiceResult){.architectural.status = AVZ_TP_STATUS_INVALID_ARGUMENT,
+            .stop = AG_SERVICE_STOP_INVALID};
+    cache->service_chain.active = 1;
+    AGServiceResult result = bounded
+        ? ag_service_chain_run_bounded(chain, limits, cpu, service, owner)
+        : ag_service_chain_run(chain, limits, cpu, service, owner);
+    cache->service_chain.active = 0;
+    if (!cache->service_chain.chain) memset(&cache->service_chain, 0, sizeof(cache->service_chain));
+    else if (!avz_assembly_chain_all_current(cache, 0)) avz_assembly_chain_retire(cache);
+    else {
+        cache->service_chain.bytes = sizeof(cache->service_chain) +
+            ag_service_chain_bytes(cache->service_chain.chain);
+        if (cache->service_chain.bytes > cache->service_chain_diagnostics.peak_bytes)
+            cache->service_chain_diagnostics.peak_bytes = cache->service_chain.bytes;
+    }
+    return result;
+}
+
+AGServiceResult avz_assembly_cache_service_chain_run(AVZNativeBlockCache *cache,
+    AGServiceChain *chain, AGServiceLimits limits, AVZNativeCPU *cpu,
+    AGServiceCallback service, void *owner) {
+    return avz_assembly_cache_service_chain_run_impl(cache, chain, limits, cpu, service, owner, 0);
+}
+AGServiceResult avz_assembly_cache_service_chain_run_bounded(AVZNativeBlockCache *cache,
+    AGServiceChain *chain, AGServiceLimits limits, AVZNativeCPU *cpu,
+    AGServiceCallback service, void *owner) {
+    return avz_assembly_cache_service_chain_run_impl(cache, chain, limits, cpu, service, owner, 1);
+}
+
+int avz_assembly_cache_service_chain_contains(const AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *block, uint64_t serial) {
+    if (!cache || !cache->service_chain.chain || !serial ||
+        !avz_assembly_chain_all_current(cache, 0)) return 0;
+    for (size_t i = 0; i < cache->service_chain.count; i++) {
+        const AVZAssemblyChainMember *m = &cache->service_chain.members[i];
+        if (&m->entry->block == block && m->serial == serial) return 1;
+    }
+    return 0;
+}
+
+AVZAssemblyChainInfo avz_assembly_cache_service_chain_info(const AVZNativeBlockCache *cache) {
+    if (!cache || (!cache->service_chain.chain && !cache->service_chain.active))
+        return (AVZAssemblyChainInfo){0};
+    const AVZAssemblyChainOwner *o = &cache->service_chain;
+    return (AVZAssemblyChainInfo){o->count, o->instructions, o->bytes, o->active};
+}
+AVZAssemblyChainDiagnostics avz_assembly_cache_service_chain_diagnostics(
+    const AVZNativeBlockCache *cache) {
+    if (!cache) return (AVZAssemblyChainDiagnostics){0};
+    AVZAssemblyChainDiagnostics result = cache->service_chain_diagnostics;
+    result.bytes = avz_assembly_cache_service_chain_info(cache).bytes;
+    return result;
+}
+#else
+int avz_assembly_cache_service_chain_contains(const AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *block, uint64_t serial) {
+    (void)cache; (void)block; (void)serial; return 0;
+}
+AGServiceChain *avz_assembly_cache_service_chain(AVZNativeBlockCache *cache,
+    const AVZNativeDecodedBlock *root, const AVZNativeBlockKey *key,
+    AVZNativeMemoryFastPath *memory, const AGGuards *proof) {
+    (void)cache; (void)root; (void)key; (void)memory; (void)proof;
+    return NULL;
+}
+AGServiceResult avz_assembly_cache_service_chain_run(AVZNativeBlockCache *cache,
+    AGServiceChain *chain, AGServiceLimits limits, AVZNativeCPU *cpu,
+    AGServiceCallback service, void *owner) {
+    (void)cache; (void)chain; (void)limits; (void)cpu; (void)service; (void)owner;
+    return (AGServiceResult){.architectural.status = AVZ_TP_STATUS_DISABLED,
+        .stop = AG_SERVICE_STOP_DISABLED};
+}
+void avz_assembly_cache_service_chain_retire(AVZNativeBlockCache *cache) { (void)cache; }
+AGServiceResult avz_assembly_cache_service_chain_run_bounded(AVZNativeBlockCache *cache,
+    AGServiceChain *chain, AGServiceLimits limits, AVZNativeCPU *cpu,
+    AGServiceCallback service, void *owner) {
+    return avz_assembly_cache_service_chain_run(cache, chain, limits, cpu, service, owner);
+}
+AVZAssemblyChainInfo avz_assembly_cache_service_chain_info(const AVZNativeBlockCache *cache) {
+    (void)cache; return (AVZAssemblyChainInfo){0};
+}
+AVZAssemblyChainDiagnostics avz_assembly_cache_service_chain_diagnostics(
+    const AVZNativeBlockCache *cache) {
+    (void)cache; return (AVZAssemblyChainDiagnostics){0};
+}
+#endif

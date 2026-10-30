@@ -25,6 +25,7 @@ for name in handle-aux-at_base.patch \
   patch --fuzz=0 -p1 < "$ALPINE_PATCHES/$name"
 done
 patch --fuzz=0 -p1 < "$ROOT/patches/musl-pinecone-startup-symbol-cache.patch"
+patch --fuzz=0 -p1 < "$ROOT/patches/musl-pinecone-gnu-hash-reuse.patch"
 cd "$WORK/build"
 flags="-O2"
 [[ "$STATS" == 0 ]] || flags="$flags -DPINECONE_MUSL_STARTUP_STATS=1"

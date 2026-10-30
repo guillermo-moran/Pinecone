@@ -1773,7 +1773,12 @@ final class ARM64NativeThreadedInterpreterTests: XCTestCase {
                 &state,
                 nativeTranslationFaultProbe
             )
-            fetch()
+            var deniedPhysical: UInt64 = 0
+            var deniedInstruction: UInt32 = 0
+            XCTAssertEqual(avz_native_fast_fetch_instruction(
+                UnsafeMutableRawPointer(fastPath), virtualAddress,
+                &deniedPhysical, &deniedInstruction
+            ), 0, "EL0 must not fetch a supervisor-only kernel mapping")
             state.current_el = 1
             avz_native_memory_fast_path_set_stage1_translation(
                 fastPath,

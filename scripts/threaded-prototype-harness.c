@@ -596,13 +596,16 @@ static void memory_case(NativeMemory *a, NativeMemory *b, uint32_t raw, uint64_t
         expected = actual;
         AVZNativeCPU no_memory = actual;
         AVZNativeBlockResult no_context = avz_tp_run_with_memory(program, budget, &no_memory, NULL);
+        /* These differential cases exercise complete-helper boundaries. Hot
+         * continuation is covered by threaded-memory-continuation-regression. */
+        avz_native_memory_fast_path_invalidate_translation(a->path);
         AVZNativeBlockResult got = avz_tp_run_with_memory(program, budget, &actual, a->path);
         AVZNativeBlockResult want = reference(code, 5, 0x8000, budget < 3 ? budget : 3,
             &expected, 1, avz_native_fast_memory_read, avz_native_fast_memory_write, b->path);
         CHECK(got.steps == want.steps);
         CHECK(memcmp(&actual, &expected, sizeof(actual)) == 0);
         uint32_t status = budget >= 3 && want.steps < 3 ? AVZ_TP_STATUS_MEMORY_FAULT :
-            budget > 3 ? AVZ_TP_STATUS_REVALIDATE : AVZ_NATIVE_STATUS_MAX_STEPS;
+            budget >= 3 ? AVZ_TP_STATUS_REVALIDATE : AVZ_NATIVE_STATUS_MAX_STEPS;
         CHECK(got.status == status && got.unsupported_instruction == 0);
         CHECK(got.generic_dispatches == got.steps);
         CHECK(no_context.steps == (budget < 2 ? budget : 2));
@@ -658,8 +661,7 @@ static void store_callback_cases(void)
                         CHECK(got.steps == want.steps);
                         CHECK(memcmp(&actual, &expected, sizeof(actual)) == 0);
                         CHECK(got.status == (!budget ? AVZ_NATIVE_STATUS_MAX_STEPS :
-                            fail ? AVZ_TP_STATUS_MEMORY_FAULT : budget == 1 ?
-                            AVZ_NATIVE_STATUS_MAX_STEPS : AVZ_TP_STATUS_REVALIDATE));
+                            fail ? AVZ_TP_STATUS_MEMORY_FAULT : AVZ_TP_STATUS_REVALIDATE));
                         CHECK(got.unsupported_instruction == 0);
                         CHECK(a.writes - writes_before == (budget != 0));
                         if (budget) {

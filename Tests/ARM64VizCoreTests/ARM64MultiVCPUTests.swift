@@ -769,6 +769,7 @@ final class ARM64MultiVCPUTests: XCTestCase {
 
         for vm in [primary, secondary] {
             vm.reset(entryPoint: codeVirtual)
+            vm.cpu.pstate = ARM64PState.el1h
             vm.cpu.x[1] = dataVirtual
             vm.writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0)
             vm.writeSystemRegister(ARM64SystemRegister.tcrEL1, value: 16)

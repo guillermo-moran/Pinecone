@@ -4,6 +4,9 @@
 #define AVZ_RUNTIME_NATIVE_SOURCE "../Sources/ARM64VizNative/ARM64VizNative.c"
 #endif
 #include AVZ_RUNTIME_NATIVE_SOURCE
+#if AVZ_TEST_ASSEMBLY
+#include "assembly-test-adapter.h"
+#endif
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 

@@ -86,6 +86,37 @@ private final class ScopedTLBIRig {
 }
 
 final class ARM64ScopedTLBITests: XCTestCase {
+    func testNativeLeafPermissionsAcrossPrivilegeChanges() throws {
+        for ap: UInt64 in 0..<4 {
+            for high in [false, true] {
+                let rig = try ScopedTLBIRig()
+                let va: UInt64 = (high ? 0xffff_0000_0000_0000 : 0) | 0x4000
+                rig.store(0x8000 | 0xc03 | (ap << 6), at: 0x4000 + 4 * 8)
+                rig.sync()
+                XCTAssertEqual(rig.read(va), 11)
+                XCTAssertEqual(rig.fetch(va), 0x8000)
+                let context = UnsafeMutableRawPointer(rig.fast)
+                if ap & 2 == 0 {
+                    XCTAssertEqual(avz_native_fast_memory_write(context, va, 8, 11), 1)
+                }
+                rig.state.current_el = 0
+                rig.sync()
+                var value: UInt64 = 0
+                var physical: UInt64 = 0
+                var instruction: UInt32 = 0
+                for _ in 0..<2 {
+                    XCTAssertEqual(avz_native_fast_memory_read(context, va, 8, &value), ap & 1 == 1 ? 1 : 0)
+                    XCTAssertEqual(avz_native_fast_fetch_instruction(context, va, &physical, &instruction), ap & 1 == 1 ? 1 : 0)
+                    XCTAssertEqual(avz_native_fast_memory_write(context, va, 8, 11), ap == 1 ? 1 : 0)
+                }
+                rig.state.current_el = 1
+                rig.sync()
+                XCTAssertEqual(rig.read(va), 11)
+                XCTAssertEqual(rig.fetch(va), 0x8000)
+            }
+        }
+    }
+
     func testDecodeSupportedScopesAndConservativeFallback() {
         for crm: UInt32 in [1, 3, 7] {
             for (op2, kind): (UInt32, Int) in [
@@ -567,6 +598,7 @@ final class ARM64ScopedTLBITests: XCTestCase {
         try vm.memory.write64(11, at: dataA)
         try vm.memory.write64(44, at: dataB)
         vm.reset(entryPoint: 0x1000)
+        vm.cpu.pstate = ARM64PState.el1h
         vm.writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: base + 0x1000 | (1 << 48))
         vm.writeSystemRegister(ARM64SystemRegister.tcrEL1, value: 16)
         vm.writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1)

@@ -18,6 +18,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "ARM64VizGuestMemoryInternal.h"
 
 typedef struct TPOperation TPOperation;
 typedef struct {
@@ -25,6 +26,11 @@ typedef struct {
     uint64_t remaining;
     AVZNativeBlockResult result;
     AVZNativeMemoryFastPath *memory;
+    AVZThreadedPrototype *program;
+    const uint64_t *code_token, *shared_code_token;
+    uint64_t code_epoch, shared_code_epoch;
+    const _Atomic uint64_t *translation_token, *memory_code_token;
+    uint64_t translation_epoch, memory_code_epoch;
 } TPExecution;
 typedef void (*TPHandler)(TPExecution *, const TPOperation *);
 
@@ -50,8 +56,24 @@ struct AVZThreadedPrototype {
     uint64_t base_pc;
     size_t count;
     uint8_t uses_memory;
+    /* Cache and execution are vCPU-confined. Callbacks may drop the owner,
+     * but only the last active run may reclaim the immutable operations. */
+    uint8_t retired;
+    size_t active_runs;
     TPOperation operations[];
 };
+
+static __attribute__((always_inline)) inline int tp_is_current(const TPExecution *e)
+{
+    return !e->program->retired &&
+        (!e->code_token || *e->code_token == e->code_epoch) &&
+        (!e->shared_code_token || __atomic_load_n(e->shared_code_token,
+            __ATOMIC_ACQUIRE) == e->shared_code_epoch) &&
+        (!e->translation_token || atomic_load_explicit(e->translation_token,
+            memory_order_acquire) == e->translation_epoch) &&
+        (!e->memory_code_token || atomic_load_explicit(e->memory_code_token,
+            memory_order_acquire) == e->memory_code_epoch);
+}
 
 /* Register offsets are specialized at preparation, including SP versus XZR.
  * memcpy avoids aliasing and subobject pointer arithmetic assumptions. */
@@ -78,7 +100,12 @@ static inline void tp_write(AVZNativeCPU *cpu, uint16_t offset, uint64_t value)
 #define TP_NEXT(next_operation) do { \
     const TPOperation *next = (next_operation); \
     execution->result.steps++; \
-    if (--execution->remaining == 0) { \
+    --execution->remaining; \
+    if (!tp_is_current(execution)) { \
+        execution->result.status = AVZ_TP_STATUS_REVALIDATE; \
+        return; \
+    } \
+    if (execution->remaining == 0) { \
         execution->result.status = AVZ_NATIVE_STATUS_MAX_STEPS; \
         return; \
     } \
@@ -210,8 +237,10 @@ TP_LOGICAL(tp_orr64, uint64_t, 64, |, 0)
 TP_LOGICAL(tp_eor64, uint64_t, 64, ^, 0)
 TP_LOGICAL(tp_ands64, uint64_t, 64, &, 1)
 
-/* Memory is a terminal boundary, not a tail successor. Capture metadata before
- * invoking helpers: a store or slow callback can invalidate/free the program. */
+/* Only an existing hot-RAM proof permits continuation. The complete helper is
+ * still authoritative on misses/observers/MMIO/faults, and always terminates
+ * this invocation. A hot code store may retire the pinned program; TP_NEXT
+ * checks retirement and local/shared epochs before executing its successor. */
 #define TP_MEMORY(name, load) \
     TP_HANDLER(name) { \
         if (!execution->memory) { \
@@ -225,8 +254,10 @@ TP_LOGICAL(tp_ands64, uint64_t, 64, &, 1)
         uint64_t next_pc = op->next_pc; \
         uint8_t width = op->width; \
         uint64_t value = (load) ? 0 : tp_read(cpu, destination) & op->mask; \
-        int ok = (load) ? avz_native_fast_memory_read(execution->memory, address, width, &value) \
-                        : avz_native_fast_memory_write(execution->memory, address, width, value); \
+        int hot = (load) ? avz_native_fast_memory_try_read_hot(execution->memory, address, width, &value) \
+                        : avz_native_fast_memory_try_write_hot(execution->memory, address, width, value); \
+        int ok = hot || ((load) ? avz_native_fast_memory_read(execution->memory, address, width, &value) \
+                        : avz_native_fast_memory_write(execution->memory, address, width, value)); \
         if (!ok) { \
             execution->result.status = AVZ_TP_STATUS_MEMORY_FAULT; \
             return; \
@@ -239,9 +270,9 @@ TP_LOGICAL(tp_ands64, uint64_t, 64, &, 1)
             cpu->exclusive_valid = 0; \
         } \
         cpu->pc = next_pc; \
+        if (hot) { TP_NEXT(op->next); } \
         execution->result.steps++; \
-        execution->result.status = --execution->remaining == 0 \
-            ? AVZ_NATIVE_STATUS_MAX_STEPS : AVZ_TP_STATUS_REVALIDATE; \
+        execution->result.status = AVZ_TP_STATUS_REVALIDATE; \
     }
 TP_MEMORY(tp_load, 1)
 TP_MEMORY(tp_store, 0)
@@ -498,7 +529,12 @@ AVZThreadedPrototype *avz_tp_create(const uint32_t *words, size_t count, uint64_
     return program;
 }
 
-void avz_tp_destroy(AVZThreadedPrototype *program) { free(program); }
+void avz_tp_destroy(AVZThreadedPrototype *program)
+{
+    if (!program) return;
+    program->retired = 1;
+    if (!program->active_runs) free(program);
+}
 
 int avz_tp_program_uses_memory(const AVZThreadedPrototype *program)
 {
@@ -519,13 +555,42 @@ AVZNativeBlockResult avz_tp_run(const AVZThreadedPrototype *program,
 AVZNativeBlockResult avz_tp_run_with_memory(const AVZThreadedPrototype *program,
     uint64_t max_steps, AVZNativeCPU *cpu, AVZNativeMemoryFastPath *memory)
 {
+    AVZNativeBlockCache *cache = memory ? memory->block_cache : NULL;
+    return avz_tp_run_guarded(program, max_steps, cpu, memory, cache,
+        avz_native_block_cache_code_mutation_epoch(cache),
+        avz_native_block_cache_shared_code_mutation_epoch(cache));
+}
+
+AVZNativeBlockResult avz_tp_run_guarded(const AVZThreadedPrototype *program,
+    uint64_t max_steps, AVZNativeCPU *cpu, AVZNativeMemoryFastPath *memory,
+    AVZNativeBlockCache *cache, uint64_t code_epoch, uint64_t shared_code_epoch)
+{
     TPExecution execution = {.cpu = cpu, .remaining = max_steps, .memory = memory};
     if (!program || !cpu) execution.result.status = AVZ_TP_STATUS_INVALID_ARGUMENT;
     else if (!max_steps) execution.result.status = AVZ_NATIVE_STATUS_MAX_STEPS;
     else if (cpu->halted) execution.result.status = AVZ_NATIVE_STATUS_HALTED;
     else {
-        const TPOperation *op = tp_lookup(program, cpu->pc);
-        op->handler(&execution, op);
+        AVZThreadedPrototype *pinned = (AVZThreadedPrototype *)program;
+        pinned->active_runs++;
+        execution.program = pinned;
+        execution.code_token = avz_native_block_cache_code_mutation_epoch_token(cache);
+        execution.shared_code_token = avz_native_block_cache_shared_code_mutation_epoch_token(cache);
+        execution.code_epoch = code_epoch;
+        execution.shared_code_epoch = shared_code_epoch;
+        if (memory && memory->guest_memory) {
+            execution.translation_token = &memory->guest_memory->translation_epoch;
+            execution.translation_epoch = memory->observed_shared_translation_epoch;
+            execution.memory_code_token = &memory->guest_memory->code_mutation_epoch;
+            execution.memory_code_epoch = atomic_load_explicit(
+                execution.memory_code_token, memory_order_acquire);
+        }
+        if (!tp_is_current(&execution)) {
+            execution.result.status = AVZ_TP_STATUS_REVALIDATE;
+        } else {
+            const TPOperation *op = tp_lookup(program, cpu->pc);
+            op->handler(&execution, op);
+        }
+        if (--pinned->active_runs == 0 && pinned->retired) free(pinned);
     }
     execution.result.generic_dispatches = execution.result.steps;
     return execution.result;
@@ -571,6 +636,14 @@ AVZNativeBlockResult avz_tp_run_with_memory(const AVZThreadedPrototype *program,
 {
     (void)memory;
     return avz_tp_run(program, max_steps, cpu);
+}
+
+AVZNativeBlockResult avz_tp_run_guarded(const AVZThreadedPrototype *program,
+    uint64_t max_steps, AVZNativeCPU *cpu, AVZNativeMemoryFastPath *memory,
+    AVZNativeBlockCache *cache, uint64_t code_epoch, uint64_t shared_code_epoch)
+{
+    (void)cache; (void)code_epoch; (void)shared_code_epoch;
+    return avz_tp_run_with_memory(program, max_steps, cpu, memory);
 }
 
 #endif

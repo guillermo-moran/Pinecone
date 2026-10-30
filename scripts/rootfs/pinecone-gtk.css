@@ -27,6 +27,12 @@ phosh-lockscreen label {
   transition: none;
 }
 
+/* GTK blurs these icon shadows in guest CPU code before Pixman submission.
+ * Keep launch/activity feedback, but avoid two raster blur passes per icon. */
+.phosh-dropicon-shadow {
+  -gtk-icon-shadow: none;
+}
+
 phosh-lockscreen.pinecone-light-lockscreen * {
   animation: none;
   transition: none;

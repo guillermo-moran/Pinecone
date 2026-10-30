@@ -131,7 +131,13 @@ if [[ "${PINECONE_USE_PATCHED_GLIB:-1}" == "1" ]]; then
   register_overlay glib 2.88.3-r1 pinecone-glib
 fi
 if [[ "${PINECONE_USE_PATCHED_MUSL:-1}" == "1" ]]; then
-  register_overlay musl 1.2.6-r8 pinecone-musl
+  # r10 is the current device-test runtime; retain r8 as an explicit comparison.
+  musl_version="${PINECONE_MUSL_PACKAGE_VERSION:-1.2.6-r10}"
+  case "${musl_version}" in
+    1.2.6-r8|1.2.6-r10) ;;
+    *) echo "Unsupported Pinecone musl package version: ${musl_version}" >&2; exit 1 ;;
+  esac
+  register_overlay musl "${musl_version}" pinecone-musl
 fi
 
 repositories=(main community)

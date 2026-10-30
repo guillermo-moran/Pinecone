@@ -1,0 +1,89 @@
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -387,7 +387,8 @@
+ 	for (h1 |= 1; ; i++) {
+ 		uint32_t h2 = *hashval++;
+ 		if ((h1 == (h2|1)) && (!dso->versym || dso->versym[i] >= 0)
+-		    && !strcmp(s, dso->strings + dso->syms[i].st_name))
++		    && (s == dso->strings + dso->syms[i].st_name
++		        || !strcmp(s, dso->strings + dso->syms[i].st_name)))
+ 			return dso->syms+i;
+ 		if (h2 & 1) break;
+ 	}
+@@ -1284,7 +1285,29 @@
+ 	return 0;
+ }
+ 
+-static int startup_sym_index_add_symbol(struct dso *p, size_t index)
++static int startup_sym_index_gnu_hash(uint32_t chain_hash, uint32_t bucket,
++	uint32_t bucket_count, uint32_t *hash)
++{
++	/* GNU chains replace bit zero with an end marker. For more than one
++	 * bucket, adjacent hashes cannot belong to the same bucket, so its
++	 * index recovers that bit without reading the symbol name. */
++	if (bucket_count <= 1 || bucket >= bucket_count)
++		return 0;
++	uint32_t even = chain_hash & ~1U;
++	if (even % bucket_count == bucket) {
++		*hash = even;
++		return 1;
++	}
++	if ((even | 1U) % bucket_count == bucket) {
++		*hash = even | 1U;
++		return 1;
++	}
++	/* Inconsistent tables still use the existing name-based lookup. */
++	return 0;
++}
++
++static int startup_sym_index_add_symbol(struct dso *p, size_t index,
++	uint32_t hash, int hash_known)
+ {
+ 	STARTUP_STAT(startup_stats.visited++);
+ 	Sym *sym = p->syms + index;
+@@ -1292,7 +1315,8 @@
+ 		return 1;
+ 
+ 	const char *name = p->strings + sym->st_name;
+-	uint32_t hash = gnu_hash(name);
++	if (!hash_known)
++		hash = gnu_hash(name);
+ 	Sym *selected;
+ 	if (p->ghashtab)
+ 		selected = gnu_lookup(hash, p->ghashtab, p, name);
+@@ -1369,10 +1393,22 @@
+ 		if (p->ghashtab) {
+ 			size_t first = p->ghashtab[1];
+ 			size_t end = count_syms(p);
+-			for (size_t i = first; i < end; i++) {
+-				if (!startup_sym_index_add_symbol(p, i)) {
+-					complete = 0;
+-					break;
++			uint32_t bucket_count = p->ghashtab[0];
++			uint32_t *buckets = (void *)((size_t *)(p->ghashtab + 4)
++				+ p->ghashtab[2]);
++			uint32_t *chains = buckets + bucket_count;
++			for (uint32_t bucket = 0; bucket < bucket_count && complete;
++			    bucket++) {
++				for (size_t i = buckets[bucket]; i && i >= first && i < end; i++) {
++					uint32_t chain_hash = chains[i - first], hash = 0;
++					int known = startup_sym_index_gnu_hash(chain_hash,
++						bucket, bucket_count, &hash);
++					if (!startup_sym_index_add_symbol(p, i, hash, known)) {
++						complete = 0;
++						break;
++					}
++					if (chain_hash & 1)
++						break;
+ 				}
+ 			}
+ 		} else if (p->hashtab) {
+@@ -1385,7 +1421,7 @@
+ 				size_t steps = 0;
+ 				for (size_t i = buckets[bucket]; i && i < symbol_count &&
+ 				    steps++ < symbol_count; i = chains[i]) {
+-					if (!startup_sym_index_add_symbol(p, i)) {
++					if (!startup_sym_index_add_symbol(p, i, 0, 0)) {
+ 						complete = 0;
+ 						break;
+ 					}

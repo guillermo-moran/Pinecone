@@ -1,0 +1,8 @@
+arm64viz init: mounting persistent root /dev/vda
+arm64viz init: switching to persistent root
+arm64viz rootfs: using mounted devtmpfs
+pinecone-network: static eth0 10.0.2.15/24 via 10.0.2.2; DNS 10.0.2.3
+arm64viz rootfs: persistent /dev/vda is mounted as /
+arm64viz rootfs: write files under /root and reboot to test persistence
+arm64viz-root:~# [6nstart-pinecone-phosh
+Phosh ready after guest initialization

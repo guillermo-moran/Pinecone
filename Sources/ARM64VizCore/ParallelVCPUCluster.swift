@@ -308,6 +308,22 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         return workers.flatMap(\.hotPCProfile)
     }
 
+    /// Each backend publishes cache data on its own owner thread. These are
+    /// independently timestamped samples, not a simultaneous SMP snapshot.
+    public var secondaryAssemblyCacheDiagnostics: [String: [String: UInt64]] {
+        Dictionary(uniqueKeysWithValues: workers.compactMap { worker in
+            guard let backend = worker.vm.backend as? SoftwareARM64Backend else { return nil }
+            return (String(worker.id), backend.nativeAssemblyCacheDiagnostics)
+        })
+    }
+
+    public var secondaryAssemblyStatistics: [String: [String: UInt64]] {
+        Dictionary(uniqueKeysWithValues: workers.compactMap { worker in
+            guard let backend = worker.vm.backend as? SoftwareARM64Backend else { return nil }
+            return (String(worker.id), backend.nativeAssemblyStatistics)
+        })
+    }
+
     init(primary: VirtualMachine) {
         precondition(primary.virtualCPUCount > 1)
         self.primary = primary

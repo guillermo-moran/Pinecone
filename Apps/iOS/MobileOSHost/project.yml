@@ -22,6 +22,9 @@ targets:
       - path: ../../../artifacts/linux-shell/out/rootfs.ext4
         type: file
         buildPhase: resources
+      - path: ../../../artifacts/linux-shell/out/rootfs.ext4.sha256
+        type: file
+        buildPhase: resources
     dependencies:
       - package: ARM64Viz
         product: ARM64VizCore

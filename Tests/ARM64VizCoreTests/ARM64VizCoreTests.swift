@@ -5579,8 +5579,8 @@ final class ARM64VizCoreTests: XCTestCase {
         try memory.write64(table1 | 0x3, at: table0)
         try memory.write64(table2 | 0x3, at: table1)
         try memory.write64(table3 | 0x3, at: table2)
-        try memory.write64(codePhysical | 0x403, at: table3 + 8)
-        try memory.write64(dataPhysical | 0x403, at: table3 + 16)
+        try memory.write64(codePhysical | 0x443, at: table3 + 8)
+        try memory.write64(dataPhysical | 0x443, at: table3 + 16)
         try memory.load(program, at: codePhysical)
         try memory.write32(0, at: dataPhysical)
         try memory.write64(0, at: dataPhysical + 8)
@@ -5592,6 +5592,7 @@ final class ARM64VizCoreTests: XCTestCase {
             let vm = VirtualMachine(memory: memory, backend: backend)
             vm.reset(entryPoint: entry)
             vm.cpu.x[0] = lockAddress
+            vm.cpu.pstate = ARM64PState.el0t
             vm.cpu.x[1] = counterAddress
             vm.cpu.x[2] = iterations
             vm.writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0)
@@ -5608,6 +5609,48 @@ final class ARM64VizCoreTests: XCTestCase {
 
         let (firstVM, firstBackend) = makeVM()
         let (secondVM, secondBackend) = makeVM()
+
+        func runNativeSteps(
+            _ vm: VirtualMachine,
+            backend: SoftwareARM64Backend,
+            count: Int,
+            expectedPC: GuestAddress,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) throws {
+            let nativeStepsBefore = backend.nativeSingleInstructionSteps
+            backend.enableBasicBlockExecution = false
+            defer { backend.enableBasicBlockExecution = true }
+            let result = try vm.run(maxSteps: count)
+            XCTAssertEqual(result.steps, count, file: file, line: line)
+            XCTAssertEqual(result.stopReason, .maxSteps(count), file: file, line: line)
+            XCTAssertEqual(vm.cpu.pc, expectedPC, file: file, line: line)
+            XCTAssertEqual(backend.nativeSingleInstructionSteps - nativeStepsBefore, count, file: file, line: line)
+        }
+
+        // Both PEs reserve the unlocked word before either attempts STXR.
+        // Fixed native instruction budgets make contention independent of host scheduling.
+        try runNativeSteps(firstVM, backend: firstBackend, count: 1, expectedPC: entry + 4)
+        try runNativeSteps(secondVM, backend: secondBackend, count: 1, expectedPC: entry + 4)
+        XCTAssertEqual(firstVM.cpu.x[3], 0)
+        XCTAssertEqual(secondVM.cpu.x[3], 0)
+        try runNativeSteps(firstVM, backend: firstBackend, count: 3, expectedPC: entry + 16)
+        XCTAssertEqual(firstVM.cpu.x[4], 0)
+        XCTAssertEqual(try memory.read32(at: dataPhysical), 1)
+
+        // The winner's real store invalidates the loser's reservation; its retry
+        // then reads the held lock while the winner is paused before the critical section.
+        try runNativeSteps(secondVM, backend: secondBackend, count: 3, expectedPC: entry + 16)
+        XCTAssertEqual(secondVM.cpu.x[4], 1)
+        try runNativeSteps(secondVM, backend: secondBackend, count: 2, expectedPC: entry + 4)
+        XCTAssertEqual(secondVM.cpu.x[3], 1)
+        let deliberateContention = memory.nativeExclusiveStatistics
+        XCTAssertEqual(deliberateContention.write_successes, 1)
+        XCTAssertEqual(deliberateContention.write_conflicts, 1)
+        XCTAssertEqual(deliberateContention.nonzero_reads, 1)
+        XCTAssertEqual(try memory.read64(at: dataPhysical + 8), 0)
+
+        // Resume these same VMs with basic blocks enabled and all iterations remaining.
         let group = DispatchGroup()
         let resultLock = NSLock()
         var results: [Result<RunResult, Error>] = []
@@ -5622,7 +5665,10 @@ final class ARM64VizCoreTests: XCTestCase {
             }
         }
 
-        XCTAssertEqual(group.wait(timeout: .now() + 20), .success)
+        guard group.wait(timeout: .now() + 20) == .success else {
+            XCTFail("Parallel spinlock workers did not finish within 20 seconds")
+            return
+        }
         XCTAssertEqual(results.count, 2)
         for result in results {
             XCTAssertEqual(try result.get().stopReason, .halted)
@@ -7201,6 +7247,7 @@ final class ARM64VizCoreTests: XCTestCase {
         try machine.vm.memory.write64(0x1111_1111_1111_1111, at: dataPhysicalA)
         try machine.vm.memory.write64(0x2222_2222_2222_2222, at: dataPhysicalB)
         machine.vm.reset(entryPoint: codeVirtual)
+        machine.vm.cpu.pstate = ARM64PState.el1h
         try writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0, into: machine.vm)
         try writeSystemRegister(ARM64SystemRegister.tcrEL1, value: 16, into: machine.vm)
         try writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1, into: machine.vm)
@@ -7254,6 +7301,7 @@ final class ARM64VizCoreTests: XCTestCase {
         machine.vm.enableGuestMemoryTrace(capacity: 0)
         machine.vm.timerCyclesPerInstruction = 0
         machine.vm.nativeCheckpointBlockInterval = 1
+        machine.vm.cpu.pstate = ARM64PState.el1h
         let generation = SequencedHostGeneration()
         machine.vm.hostPreemptionGenerationProvider = { generation.read() }
 
@@ -7298,6 +7346,7 @@ final class ARM64VizCoreTests: XCTestCase {
         try machine.vm.memory.write64(0x2222_2222_2222_2222, at: dataPhysicalB)
         machine.vm.reset(entryPoint: codeVirtual)
         machine.vm.cpu.x[1] = dataVirtual
+        machine.vm.cpu.pstate = ARM64PState.el1h
         try writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0, into: machine.vm)
         try writeSystemRegister(ARM64SystemRegister.tcrEL1, value: 16, into: machine.vm)
         try writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1, into: machine.vm)
@@ -7353,8 +7402,8 @@ final class ARM64VizCoreTests: XCTestCase {
         try machine.vm.memory.write64(table1 | 0x3, at: table0)
         try machine.vm.memory.write64(table2 | 0x3, at: table1)
         try machine.vm.memory.write64(table3 | 0x3, at: table2)
-        try machine.vm.memory.write64(codePhysical | 0x403, at: table3 + 8)
-        try machine.vm.memory.write64(dataPhysical | 0x403, at: table3 + 16)
+        try machine.vm.memory.write64(codePhysical | 0x443, at: table3 + 8)
+        try machine.vm.memory.write64(dataPhysical | 0x443, at: table3 + 16)
         try machine.vm.memory.write64(vectorPhysical | 0x403, at: table3 + 32)
         try machine.vm.loadBinary(littleEndianWords([
             0xf940_0020, // ldr x0, [x1]

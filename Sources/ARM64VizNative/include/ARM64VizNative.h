@@ -1315,6 +1315,29 @@ void avz_native_execution_context_load(
     uint8_t exclusive_valid,
     uint8_t halted
 );
+/* Configure only while stopped. Opt-in bounded assembly blocks; unsupported blocks remain in native C.
+ * No Swift instruction fallback is enabled by this switch. */
+void avz_native_execution_context_set_assembly_executor(
+    AVZNativeExecutionContext *context, uint8_t enabled);
+typedef struct {
+    uint64_t enabled, blocks, steps, boundaries, faults;
+} AVZNativeAssemblyStatistics;
+AVZNativeAssemblyStatistics avz_native_execution_context_assembly_statistics(
+    const AVZNativeExecutionContext *context);
+/* Independently opt-in; requires assembly execution and native fast memory.
+ * Configure only while stopped. Non-checkpointed calls remain single-block. */
+void avz_native_execution_context_set_assembly_chaining(
+    AVZNativeExecutionContext *context, uint8_t enabled);
+/* Requires assembly and chaining. Separate opt-in for deadline-bounded native
+ * service; the generic every-visit service API remains unchanged. */
+void avz_native_execution_context_set_assembly_bounded(
+    AVZNativeExecutionContext *context, uint8_t enabled);
+typedef struct {
+    uint64_t enabled, runs, visits, steps;
+    uint64_t bounded_enabled, bounded_runs, bounded_visits, bounded_steps;
+} AVZNativeAssemblyChainStatistics;
+AVZNativeAssemblyChainStatistics avz_native_execution_context_assembly_chain_statistics(
+    const AVZNativeExecutionContext *context);
 void avz_native_execution_context_load_with_exclusive_generation(
     AVZNativeExecutionContext *context,
     const uint64_t *x31,
@@ -1656,5 +1679,6 @@ size_t avz_framebuffer_commit_dirty_tiles(
 #endif
 
 #include "ARM64VizThreadedPrototype.h"
+#include "ARM64VizCacheDiagnostics.h"
 
 #endif

@@ -30,6 +30,10 @@ int avz_tp_supports_instruction(const AVZNativeInstruction *instruction);
 int avz_tp_supports_instruction_with_memory(const AVZNativeInstruction *instruction);
 AVZThreadedPrototype *avz_tp_create(const uint32_t *words, size_t count,
                                   uint64_t base_pc);
+/* destroy drops the sole owner and retires the program immediately. Active
+ * calls pin its allocation until return; no caller may start a new run after
+ * destroy. Ownership, runs and destruction must be serialized on one vCPU,
+ * including reentrant callbacks, never concurrently across host threads. */
 void avz_tp_destroy(AVZThreadedPrototype *program);
 size_t avz_tp_program_bytes(const AVZThreadedPrototype *program);
 int avz_tp_program_uses_memory(const AVZThreadedPrototype *program);
@@ -50,17 +54,30 @@ AVZNativeBlockResult avz_tp_run(const AVZThreadedPrototype *program,
  * NULL memory preserves avz_tp_run behavior. Caller owns/synchronizes the vCPU,
  * fast-memory translation/architectural context and code validity before entry;
  * max_steps must not exceed its next checkpoint/deadline budget.
- * After ONE successful access, returns REVALIDATE (or MAX_STEPS if exhausted),
- * with that access retired. Revalidate code/mappings and process checkpoints
- * before resuming; callbacks may invalidate/destroy the program. No operation
- * metadata is read after the helper call. On helper failure returns MEMORY_FAULT
+ * Proven hot RAM accesses may continue within the original budget. Local/shared
+ * code mutations and shared TLBI publication stop dispatch at the next boundary.
+ * A miss, callback or observed store uses the complete helper and returns
+ * REVALIDATE after success, even if the budget is exhausted. Revalidate
+ * code/mappings and process checkpoints before resuming. Callbacks may destroy
+ * the program; execution pins its allocation, but never resumes a retired one.
+ * On helper failure returns MEMORY_FAULT
  * with no instruction retirement or CPU writeback; caller owns fault delivery
  * and must not retry a potentially side-effecting access as an unsupported op.
  * Helper-owned callback/fault/dirty/observation effects are not rolled back.
- * The fast-memory context and CPU must remain alive throughout the call.
+ * The fast-memory context, cache, guest RAM and CPU must remain alive throughout
+ * the call. They may not be destroyed/replaced by callbacks. Cache clear and
+ * entry/program eviction are allowed. Other vCPUs own separate caches/contexts
+ * and publish invalidation through shared guest-memory epochs, not this cache.
  */
 AVZNativeBlockResult avz_tp_run_with_memory(const AVZThreadedPrototype *program,
     uint64_t max_steps, AVZNativeCPU *cpu, AVZNativeMemoryFastPath *memory);
+
+/* Runtime adapter supplies epochs captured BEFORE selecting/validating code,
+ * closing the validation-to-entry race. Epoch mismatch retires zero instructions
+ * and returns REVALIDATE. The unguarded APIs require caller-stable code at entry. */
+AVZNativeBlockResult avz_tp_run_guarded(const AVZThreadedPrototype *program,
+    uint64_t max_steps, AVZNativeCPU *cpu, AVZNativeMemoryFastPath *memory,
+    AVZNativeBlockCache *cache, uint64_t code_epoch, uint64_t shared_code_epoch);
 
 /* Runtime adapter: returns a cache-owned program only for fully supported
  * validated blocks. Caller must own the cache/vCPU; do not retain across cache

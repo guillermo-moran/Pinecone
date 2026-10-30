@@ -42,7 +42,7 @@ verify() {
     compile_prototype -O0 -fno-optimize-sibling-calls -DAVZ_THREADED_PROTOTYPE_ENABLE=1 \
         -S -emit-llvm -o "$work/prototype.ll"
     tails=$(awk '/musttail call void %/ { n++ } END { print n+0 }' "$work/prototype.ll")
-    test "$tails" -eq 48 || { echo "expected 48 mandatory tail sites, got $tails" >&2; exit 1; }
+    test "$tails" -eq 50 || { echo "expected 50 mandatory tail sites, got $tails" >&2; exit 1; }
     compile_prototype -O3 -fno-optimize-sibling-calls -DAVZ_THREADED_PROTOTYPE_ENABLE=1 \
         -S -o "$work/prototype.s"
     # Verify actual AArch64/x86-64 handler bodies, not just a source annotation.
@@ -57,13 +57,13 @@ verify() {
             print "machine code: 48 register handlers, each indirect tail branch, zero ordinary calls" }
     ' "$work/prototype.s"
     awk '
-      /^_?tp_(load|store):/ { active=1; handlers++; helper=0; returning=0 }
-      active && /[[:space:]](br[[:space:]]+x[0-9]+|jmpq?[[:space:]]+\*)/ { bad=1 }
+      /^_?tp_(load|store):/ { active=1; handlers++; helper=0; returning=0; tail=0 }
+      active && /[[:space:]](br[[:space:]]+x[0-9]+|jmpq?[[:space:]]+\*)/ { tail=1 }
       active && /[[:space:]](bl|callq?)[[:space:]]+_?avz_native_fast_memory_(read|write)/ { helper=1 }
       active && /^[[:space:]]+ret/ { returning=1 }
-      active && /[.]cfi_endproc/ { if (!helper || !returning) bad=1; active=0 }
-      END { if (handlers != 2 || bad) { print "memory terminal verification FAILED"; exit 1 }
-            print "machine code: 2 terminal memory handlers, native helper calls, no tail successor" }
+      active && /[.]cfi_endproc/ { if (!helper || !returning || !tail) bad=1; active=0 }
+      END { if (handlers != 2 || bad) { print "memory continuation verification FAILED"; exit 1 }
+            print "machine code: 2 memory handlers, hot-RAM tail successors and terminal helper exits" }
     ' "$work/prototype.s"
     if compile_prototype -O2 -DAVZ_THREADED_PROTOTYPE_ENABLE=1 \
         -DAVZ_THREADED_PROTOTYPE_HAS_MUSTTAIL=0 -c -o "$work/rejected.o" \

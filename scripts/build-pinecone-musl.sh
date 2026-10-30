@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCH="${ROOT_DIR}/scripts/patches/musl-pinecone-startup-symbol-cache.patch"
+HASH_PATCH="${ROOT_DIR}/scripts/patches/musl-pinecone-gnu-hash-reuse.patch"
 STATS="${PINECONE_MUSL_STARTUP_STATS_BUILD:-0}"
 case "${STATS}" in
   0|1) ;;
@@ -13,7 +14,7 @@ VARIANT="pinecone-musl"
 OUTPUT_DIR="${PINECONE_MUSL_OUTPUT_DIR:-${ROOT_DIR}/artifacts/alpine-packages/${VARIANT}/aarch64}"
 INSTANCE="${PINECONE_MUSL_LIMA_INSTANCE:-pinecone-builder}"
 APORTS_COMMIT="${PINECONE_APORTS_COMMIT:-11bd4e3a5442ee6c0156c1a9fd290fb49b2f561a}"
-PACKAGE_VERSION="1.2.6-r8"
+PACKAGE_VERSION="1.2.6-r10"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -60,13 +61,17 @@ limactl shell "${INSTANCE}" git -C "${GUEST_APORTS}" checkout --detach --force "
 limactl shell "${INSTANCE}" rm -rf "${GUEST_BUILD}"
 limactl shell "${INSTANCE}" cp -R "${GUEST_APORTS}/main/musl" "${GUEST_BUILD}"
 limactl copy "${PATCH}" "${INSTANCE}:${GUEST_BUILD}/pinecone-startup-symbol-cache.patch"
+limactl copy "${HASH_PATCH}" "${INSTANCE}:${GUEST_BUILD}/pinecone-gnu-hash-reuse.patch"
 
-limactl shell "${INSTANCE}" sed -i 's/^pkgrel=2$/pkgrel=8/' "${GUEST_BUILD}/APKBUILD"
+limactl shell "${INSTANCE}" sed -i 's/^pkgrel=2$/pkgrel=10/' "${GUEST_BUILD}/APKBUILD"
 limactl shell "${INSTANCE}" sed -i \
   's#https://musl.libc.org/releases/#https://distfiles.alpinelinux.org/distfiles/edge/#' \
   "${GUEST_BUILD}/APKBUILD"
 limactl shell "${INSTANCE}" sed -i \
   '/CVE-2026-40200.patch/a pinecone-startup-symbol-cache.patch' \
+  "${GUEST_BUILD}/APKBUILD"
+limactl shell "${INSTANCE}" sed -i \
+  '/^pinecone-startup-symbol-cache.patch$/a pinecone-gnu-hash-reuse.patch' \
   "${GUEST_BUILD}/APKBUILD"
 # Instrumentation is compiled out of normal packages. Enable reports separately
 # with PINECONE_MUSL_STARTUP_STATS=1 in the guest (ignored in secure execution).

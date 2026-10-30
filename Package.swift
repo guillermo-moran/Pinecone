@@ -16,6 +16,9 @@ let package = Package(
             name: "ARM64VizNative",
             cSettings: [
                 .define("AVZ_THREADED_PROTOTYPE_ENABLE", to: "1"),
+                .define("AVZ_ASSEMBLY_EXECUTOR_ENABLE", to: "1"),
+                .define("AG_ENABLE", to: "1"),
+                .define("AG_SERVICE_CHAIN_ENABLE", to: "1"),
                 .unsafeFlags(["-O3"], .when(configuration: .debug)),
                 .unsafeFlags(["-O3"], .when(configuration: .release))
             ]
