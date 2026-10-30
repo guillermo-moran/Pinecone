@@ -2,7 +2,6 @@ import Foundation
 
 public enum BootUseCase: String, Codable, CaseIterable {
     case toyUART
-    case mobileOS
     case linuxDirect
     case aosp
     case bsd
@@ -30,8 +29,6 @@ public enum BootArtifactKind: String, Codable, CaseIterable {
     case androidProductImage
     case androidSuperImage
     case rawARM64Binary
-    case mobileOSImage
-    case mobileAppBundle
     case metadataManifest
     case restrictedPackage
     case unknown
@@ -116,10 +113,6 @@ public enum BootArtifactClassifier {
             return .restrictedPackage
         }
 
-        if lastPathComponent.hasSuffix(".mosimg") || lastPathComponent.hasSuffix(".mobileos") {
-            return .mobileOSImage
-        }
-
         if lastPathComponent.hasSuffix(".dtb") || lastPathComponent.hasSuffix(".dtbo") {
             return .deviceTreeBlob
         }
@@ -154,14 +147,7 @@ public enum BootArtifactClassifier {
             return .androidSuperImage
         }
 
-        if lastPathComponent.hasSuffix(".app.js") || lastPathComponent.hasSuffix(".mobile.js") {
-            return .mobileAppBundle
-        }
-
         if lastPathComponent.hasSuffix(".json") {
-            if lastPathComponent.contains("apps") || lastPathComponent.contains("mobile") {
-                return .mobileAppBundle
-            }
             return .metadataManifest
         }
 
@@ -182,7 +168,6 @@ public enum BootArtifactClassifier {
 public enum BootAdapterRegistry {
     public static let adapters: [any BootPlanningAdapter] = [
         ToyUARTPlanningAdapter(),
-        MobileOSPlanningAdapter(),
         RawARM64BinaryPlanningAdapter(),
         RTOSPlanningAdapter(),
         LinuxDirectBootPlanningAdapter(),
@@ -223,44 +208,6 @@ public struct ToyUARTPlanningAdapter: BootPlanningAdapter {
             findings: artifacts.isEmpty ? [] : ["toy guest does not consume dropped boot images"],
             warnings: [],
             nextSteps: ["Run: swift run arm64viz run-toy"]
-        )
-    }
-}
-
-public struct MobileOSPlanningAdapter: BootPlanningAdapter {
-    public let descriptor = BootAdapterDescriptor(
-        identifier: "mobile-os-image",
-        displayName: "MobileOS Image",
-        useCase: .mobileOS,
-        status: .disabled,
-        requiredArtifactKinds: [],
-        optionalArtifactKinds: [.mobileOSImage, .mobileAppBundle, .metadataManifest],
-        notes: ["Disabled. The active track is native Linux/postmarketOS bring-up."]
-    )
-
-    public init() {}
-
-    public func plan(for artifacts: [BootArtifactDescriptor], preferences: ARM64VizPreferences) -> BootPlan {
-        let restricted = restrictedArtifactFindings(artifacts, preferences: preferences)
-        let supported = Set(descriptor.optionalArtifactKinds)
-        let unsupported = artifacts.filter { !supported.contains($0.kind) }
-        var findings = restricted
-        for artifact in unsupported {
-            findings.append("\(artifact.name) is not a MobileOS image, mobile app bundle, or metadata manifest")
-        }
-
-        return BootPlan(
-            adapter: descriptor,
-            matchesArtifacts: findings.isEmpty,
-            canLaunchNow: false,
-            findings: findings + [RuntimeDirection.javascriptMobileOSDisabledReason],
-            warnings: artifacts.contains { $0.kind == .mobileAppBundle }
-                ? ["JavaScript app bundles are archived with the disabled MobileOS track"]
-                : ["MobileOS launch/build paths are disabled"],
-            nextSteps: [
-                "Prepare Linux: swift run arm64viz prepare-linux Image --postmarketos --initrd initrd.cpio.gz --disk rootfs.img",
-                "Complete Linux-grade MMU permissions, interrupt priority/nesting, UART console, and virtio support"
-            ]
         )
     }
 }

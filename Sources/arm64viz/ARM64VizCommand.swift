@@ -20,12 +20,6 @@ struct ARM64VizCommand {
             try runToy()
         case "benchmark-native":
             try benchmarkNative(arguments: arguments)
-        case "run-mobile":
-            try disabledJavaScriptMobileOSCommand(command)
-        case "build-mobile-image":
-            try disabledJavaScriptMobileOSCommand(command)
-        case "mobile-kernel-demo":
-            try disabledJavaScriptMobileOSCommand(command)
         case "prepare-linux":
             try prepareLinux(arguments: arguments)
         case "run-linux-trace":
@@ -126,49 +120,6 @@ struct ARM64VizCommand {
             millionsPerSecond,
             result.stopReason.description
         ))
-    }
-
-    private static func runMobile(imagePath: String?, verboseBoot: Bool) throws {
-        let machine = try MachineFactory.makeResearchMachine()
-        machine.uart.onByte = { byte in
-            FileHandle.standardOutput.write(Data([byte]))
-        }
-
-        let image = try loadMobileOSImage(path: imagePath, verboseBoot: verboseBoot)
-        if imagePath != nil, verboseBoot, !image.manifest.verboseBoot {
-            print("[arm64viz] note=--verbose requested; supplied image was not built with verboseBoot=true")
-        }
-        let bootConfig = try MobileOSImageBootAdapter(image: image).load(into: machine.vm)
-        let result = try machine.vm.run(maxSteps: 50_000)
-        print("")
-        print("[arm64viz] guest=\(bootConfig.machineName)")
-        print("[arm64viz] image=\(image.manifest.imageName) version=\(image.manifest.version) verbose=\(image.manifest.verboseBoot)")
-        print("[arm64viz] backend=\(machine.vm.backend.name)")
-        print("[arm64viz] stop=\(result.stopReason) steps=\(result.steps)")
-    }
-
-    private static func buildMobileImage(path: String, verboseBoot: Bool) throws {
-        let image = MobileOSImage.developmentImage(verboseBoot: verboseBoot)
-        let data = try Data(image.encodedArtifact())
-        try data.write(to: URL(fileURLWithPath: path))
-        print("[arm64viz] wrote \(path)")
-        print("[arm64viz] image=\(image.manifest.imageName) version=\(image.manifest.version) verbose=\(image.manifest.verboseBoot) bytes=\(data.count)")
-    }
-
-    private static func runMobileKernelDemo() throws {
-        let machine = try MachineFactory.makeResearchMachine()
-        let kernel = MobileOSKernel()
-        let report = try kernel.boot(on: machine)
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(report)
-        FileHandle.standardOutput.write(data)
-        print("")
-    }
-
-    private static func disabledJavaScriptMobileOSCommand(_ command: String) throws {
-        throw VMError.unsupportedGuest("\(command): \(RuntimeDirection.javascriptMobileOSDisabledReason). Use prepare-linux for the active native Linux/postmarketOS path.")
     }
 
     private static func prepareLinux(arguments: [String]) throws {
@@ -816,12 +767,6 @@ struct ARM64VizCommand {
               benchmark-native [--steps n]
                          Measure the trained native C execution loop without
                          tracing, timers, MMIO, or interpreter fallback.
-              run-mobile [--verbose] [path.mosimg]
-                         Disabled: JavaScript MobileOS is archived.
-              build-mobile-image [--verbose] <path.mosimg>
-                         Disabled: JavaScript MobileOS is archived.
-              mobile-kernel-demo
-                         Disabled: JavaScript MobileOS is archived.
               prepare-linux <Image> [--postmarketos] [--initrd path]
                          [--dtb path] [--disk path] [--memory-mib n]
                          [--bootargs "..."] [--minimal-devices]
@@ -1589,14 +1534,6 @@ struct ARM64VizCommand {
         }
 
         return work
-    }
-
-    private static func loadMobileOSImage(path: String?, verboseBoot: Bool) throws -> MobileOSImage {
-        guard let path else {
-            return .developmentImage(verboseBoot: verboseBoot)
-        }
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        return try MobileOSImage.decodeArtifact([UInt8](data))
     }
 
     private static func hasFlag(_ flag: String, in arguments: [String]) -> Bool {

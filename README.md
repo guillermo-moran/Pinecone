@@ -1,455 +1,292 @@
-# arm64viz
+# Pinecone
 
-`arm64viz` is a no-JIT ARM64 virtualization and emulation research platform
-written in C and Swift. Its primary guest is currently a custom ARM64 Linux
-configuration with an Alpine Linux root filesystem and the Phosh mobile shell.
-The Pinecone iOS application hosts that VM, presents its serial console and
-display, and forwards keyboard, touch, storage, and network activity.
+**A real ARM64 Linux desktop inside an iOS app, powered by our own no-JIT emulator.**
 
-The runtime is implemented in this repository. QEMU is not required or used by
-the build, test, or execution path.
+Pinecone boots Linux, mounts a persistent Alpine filesystem, and runs Phosh,
+Linux applications, and an interactive Unix shell. The iOS app hosts the VM and
+provides display, input, storage, and networking. It is not a Swift recreation
+of a Linux desktop.
 
-## Current Status
+The underlying engine is **arm64viz**, implemented in C, ARM64 assembly, and
+Swift. Guest execution requires neither QEMU nor a hypervisor entitlement.
+The former JavaScript MobileOS prototype has been removed.
 
-The project can currently:
+> **Research software.** Linux and Phosh are functional, but touch latency,
+> application startup, rendering correctness, and physical-device memory use
+> remain active work. This is not yet a production-ready or near-native desktop.
 
-- Direct-boot a custom ARM64 Linux kernel at EL1 with a generated FDT.
-- Mount a persistent Alpine Linux ext4 root filesystem through virtio-mmio.
-- Reach a BusyBox/Alpine shell on the emulated PL011 `ttyAMA0` console.
-- Start Phoc and Phosh using Pixman software rendering at a guest resolution of
-  480x1024.
-- Present the guest framebuffer through Metal in the Pinecone iOS app.
-- Deliver iOS touch and keyboard events through virtio-input.
-- Expose virtio block, network, input, keyboard, and GPU devices.
-- Run Alpine commands and `apk`; networking works through the host-side network
-  bridge but is still slower and less complete than a mature slirp stack.
-- Execute the tested Linux and Phosh workload without using the legacy Swift
-  interpreter as a normal execution fallback.
+## Current Capabilities
 
-Phosh is functional, but first-frame time, complex compositing, and interactive
-frame rate remain active performance work. This is a research platform, not a
-production mobile-device VM.
+- Direct ARM64 Linux boot with a generated device tree, GIC, timers, and PL011 console.
+- Two parallel vCPUs in the iOS host.
+- Persistent ext4 storage through virtio-block.
+- BusyBox/Alpine shell utilities, `apk`, and a graphical **Packages** application.
+- Phosh with a Home grid, favorites dock, Recent Apps, and All Apps.
+- A lightweight guest lock screen with **Tap to unlock**.
+- Firefox, NetSurf, Files, Settings, and additional desktop utilities.
+- Host-backed TCP/UDP networking and DNS.
+- Touch and keyboard forwarding, plus a separate serial terminal.
+- Paravirtual 2D graphics with eligible Pixman operations executed by Metal.
+
+The guest is a project-built Linux kernel and customized Alpine userspace, not
+an official postmarketOS image. Android, Waydroid, LineageOS, and iOS guests are
+not supported boot targets.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph Host["Host: macOS or iOS"]
-        CLI["arm64viz CLI"]
-        Pinecone["Pinecone iOS app"]
-        Terminal["SwiftUI ttyAMA0 terminal"]
-        Metal["Metal guest display"]
-        Input["iOS touch and keyboard"]
-        HostNet["Network.framework bridge"]
-        DiskFile["Persistent rootfs.ext4 copy"]
+    subgraph App["Pinecone · iOS host"]
+        Controls["SwiftUI lifecycle and controls"]
+        Terminal["ttyAMA0 terminal"]
+        Input["Touch and keyboard"]
+        Display["Metal display presentation"]
+        Network["Network.framework bridge"]
+        Disk["Writable rootfs.ext4"]
     end
 
-    subgraph Core["ARM64VizCore: Swift VM and platform model"]
-        Boot["LinuxDirectBootAdapter"]
-        VM["VirtualMachine"]
-        Scheduler["Cooperative vCPU scheduler"]
-        VCPU0["vCPU 0 state"]
-        VCPU1["vCPU 1 state"]
-        PSCI["PSCI v1.1 over HVC"]
-        FDT["Generated flattened device tree"]
-        MMIO["MMIO bus"]
-        IRQ["GIC and generic timer"]
-        UART["PL011 UART"]
-        VirtIO["virtio-mmio transport"]
-        Debug["Trace, counters, snapshots"]
+    subgraph Core["ARM64VizCore · Swift platform model"]
+        Boot["Linux loader and generated FDT"]
+        Runtime["VM lifecycle and parallel vCPU scheduling"]
+        Devices["MMIO · GIC · timers · PL011 · virtio"]
+        Graphics["Resource validation, fences and damage"]
     end
 
-    subgraph Native["ARM64VizNative: C execution engine"]
-        Decoder["AArch64 decoder"]
-        Blocks["Block cache and superblocks"]
-        CPU["Native threaded interpreter"]
-        Memory["Guest memory and MMU fast paths"]
-        Pixels["Framebuffer and Pixman hot paths"]
+    subgraph Native["ARM64VizNative · C and ARM64 assembly"]
+        Execute["Assembly-backed handlers + native C executor"]
+        Cache["Decoder, block caches and validated chains"]
+        Memory["Guest RAM and MMU/TLB fast paths"]
+        Raster["Host C raster backend"]
     end
 
-    subgraph Devices["Virtual devices"]
-        VBlock["virtio-block"]
-        VNet["virtio-net"]
-        VInput["virtio-input touch and keyboard"]
-        VGPU["virtio-gpu 480x1024 scanout"]
+    subgraph Guest["ARM64 Linux guest"]
+        Kernel["Linux kernel"]
+        Root["Alpine ext4 root · BusyBox · apk"]
+        Desktop["Phosh / Phoc / wlroots · Linux applications"]
+        Bridge["Patched Pixman / Cairo · shared DRM surfaces"]
     end
 
-    subgraph Guest["ARM64 guest"]
-        Kernel["Custom Linux kernel"]
-        Initrd["Minimal Alpine initramfs"]
-        Alpine["Persistent Alpine Linux rootfs"]
-        Shell["BusyBox and apk"]
-        Session["Phoc + Phosh + mobile apps"]
-    end
-
-    CLI --> Boot
-    Pinecone --> Boot
-    Pinecone --> Terminal
-    Pinecone --> Metal
-    Input --> VInput
-    HostNet --> VNet
-    DiskFile --> VBlock
-
-    Boot --> FDT
-    Boot --> VM
-    VM --> Scheduler
-    Scheduler --> VCPU0
-    Scheduler --> VCPU1
-    PSCI --> VCPU1
-    VCPU0 --> CPU
-    VCPU1 --> CPU
-    CPU --> Decoder
-    Decoder --> Blocks
-    CPU --> Memory
-    VM --> MMIO
-    VM --> IRQ
-    MMIO --> UART
-    MMIO --> VirtIO
-    VirtIO --> VBlock
-    VirtIO --> VNet
-    VirtIO --> VInput
-    VirtIO --> VGPU
-    VGPU --> Pixels
-    VGPU --> Metal
-    UART --> Terminal
-    VM --> Debug
-
-    FDT --> Kernel
-    CPU --> Kernel
-    Kernel --> Initrd
-    Initrd --> Alpine
-    Alpine --> Shell
-    Alpine --> Session
-    VBlock --> Alpine
-    VNet --> Kernel
-    VInput --> Session
-    Session --> VGPU
+    Controls --> Boot
+    Boot --> Runtime
+    Runtime --> Execute
+    Execute <--> Cache
+    Execute <--> Memory
+    Execute <--> Devices
+    Devices <--> Kernel
+    Boot --> Kernel
+    Kernel --> Root
+    Root --> Desktop
+    Desktop --> Bridge
+    Bridge --> Graphics
+    Graphics --> Display
+    Graphics --> Raster
+    Raster --> Display
+    Input --> Devices
+    Devices --> Terminal
+    Devices <--> Network
+    Devices <--> Disk
 ```
 
-### Execution Boundary
+### Execution
 
-- **ARM64VizNative** is the hot execution layer. It contains the AArch64
-  decoder and threaded interpreter, C-side block caches and superblocks, guest
-  memory primitives, MMU-related fast paths, and framebuffer operations.
-- **ARM64VizCore** owns architectural CPU state, exception routing, device
-  models, Linux loading, FDT generation, tracing, policy, and snapshots.
-- **Pinecone** is the iOS host. Swift manages application lifecycle and bridges
-  native iOS services; Linux and Phosh execute inside the ARM64 guest.
-- **The guest** is open-source ARM64 Linux and Alpine userspace. Phosh renders
-  through Phoc, wlroots, Pixman, DRM, and the virtual GPU.
+Pinecone emulates the CPU even when the host is ARM64. Matching instruction
+sets do not let a sandboxed iOS app directly execute an entire guest kernel.
 
-The backend is an interpreter, not a JIT. The native engine caches decoded
-blocks, links hot control-flow paths, executes fused superblocks, uses direct
-guest-memory access where valid, and includes carefully validated semantic fast
-paths for common guest loops. The older Swift instruction path is retained for
-diagnostics, but unsupported native instructions are treated as implementation
-gaps rather than silently relying on it during normal Linux execution.
+The native layer decodes and caches instructions, maintains validated execution
+paths, and accelerates memory access where translation and permissions allow it.
+Swift owns the surrounding VM, devices, boot, and diagnostic machinery.
 
-## Virtual Machine Layout
+| Current default | Physical iOS device | iOS Simulator |
+| --- | --- | --- |
+| Executor | Assembly-backed handlers plus native C | Same |
+| vCPUs | 2, parallel | 2, parallel |
+| Guest RAM | 384 MiB | 1024 MiB |
+| Legacy Swift instruction fallback | Disabled for normal guest execution | Same |
+| Older threaded prototype | Off | Off |
+| Assembly service/bounded chaining | Off | Off |
+| Hot-PC profiling | Off | Off |
 
-The generic research-machine API defaults to one vCPU for compatibility. The
-Pinecone runtime configures two Linux-visible vCPUs with separate architectural,
-system-register, MMU-cache, timer, and interrupt-interface state. Linux starts
-vCPU 1 through PSCI v1.1 over `HVC`; the current host scheduler runs vCPUs
-cooperatively rather than on parallel host threads. RAM begins at `0x40000000`.
-Its Linux-visible devices include:
+Instructions outside the assembly subset continue through native C, not the
+older Swift interpreter. Unsupported native instructions remain implementation
+gaps. The desktop CLI retains its established C default unless overridden.
 
-| Device | Guest address | Purpose |
-| --- | ---: | --- |
-| GICv2 | `0x08000000` | Banked CPU interfaces, SGIs/PPIs, and targeted SPIs |
-| PL011 UART | `0x09000000` | Linux boot and interactive console |
-| virtio-block | `0x0a000000` | Persistent Alpine root filesystem |
-| virtio-net | `0x0a001000` | Host-bridged guest networking |
-| virtio-input | `0x0a002000` | Absolute touchscreen events |
-| virtio-gpu | `0x0a003000` | 480x1024 DRM scanout |
-| virtio-input | `0x0a004000` | Keyboard events |
+Guest RAM is only part of host memory use: graphics resources, caches, and app
+overhead also count toward the iOS process limit.
 
-The Linux boot adapter places the raw kernel `Image`, initramfs, and generated
-FDT in RAM, sets `x0` to the FDT address, enters masked EL1h, and attaches the
-ext4 image as `/dev/vda`.
+### Graphics
 
-## Repository Structure
+Patched Pixman, Cairo, and wlroots use registered DRM surfaces and a versioned
+Pinecone 2D protocol over virtio-gpu. The host validates resources, tracks fences,
+executes eligible batches with Metal, and presents damaged regions.
 
-```text
-.
-├── Apps/iOS/MobileOSHost       Pinecone SwiftUI/Metal iOS host
-├── Sources/ARM64VizNative      C decoder, interpreter, caches, memory, pixels
-├── Sources/ARM64VizCore        VM, Linux boot, MMIO, virtio, FDT, debugging
-├── Sources/arm64viz            Desktop command-line tools
-├── Scripts                     Kernel, initramfs, Alpine and Phosh image builds
-├── Tests/ARM64VizCoreTests     CPU, MMU, device and regression tests
-├── artifacts                   Generated/downloaded guest build products
-├── docs                        Architecture, roadmap and scope documents
-├── arm64viz.preferences.json   User restrictions layered over fixed policy
-└── Package.swift               Swift Package Manager definition
-```
+This is **2D paravirtual acceleration, not a guest OpenGL/Vulkan GPU**.
+Unsupported guest operations still execute in Pixman. Host C rasterization is
+also available for submitted operations that cannot use Metal. Neither is the
+legacy CPU instruction fallback.
 
-## Requirements
+Eligible physical-device buffers share backing with Metal. Simulator,
+caller-owned, and unsupported buffer paths can still require uploads or copies;
+the pipeline is not universally zero-copy.
 
-The current guest-image scripts target Apple Silicon macOS. They require:
+See [the graphics protocol and ownership model](docs/PINECONE_GRAPHICS.md).
 
-- Xcode and its command-line tools
-- Swift 5.9 or newer
-- XcodeGen when regenerating the iOS project
-- LLVM/Clang, LLD, and GNU Make
-- `libelf`, `curl`, `perl`, `awk`, and `bsdtar`
-- `mke2fs` from e2fsprogs or Android platform tools
-- `glib-compile-schemas` and `update-mime-database` for the Phosh image
-- Network access to kernel.org and Alpine Linux package repositories
+### Virtual Hardware
 
-The kernel script currently defaults Homebrew tools to `/opt/homebrew`, though
-the relevant paths can be overridden with its environment variables.
+RAM begins at `0x40000000`. The current guest display is **480 x 1024**, scaled
+into the available iOS display area.
 
-## Prepare the Alpine + Phosh Guest
+| Device | MMIO base | Role |
+| --- | --- | --- |
+| GICv2 | `0x08000000` | Interrupt distribution and CPU interfaces |
+| PL011 | `0x09000000` | Boot output and serial shell |
+| virtio-block | `0x0a000000` | Root disk, exposed as `/dev/vda` |
+| virtio-net | `0x0a001000` | Host-backed networking |
+| virtio-input | `0x0a002000` | Touchscreen |
+| virtio-gpu | `0x0a003000` | DRM scanout and Pinecone 2D commands |
+| virtio-input | `0x0a004000` | Keyboard |
 
-Guest binaries are generated locally and are not normal source files. From the
-repository root:
+The Linux adapter stages `Image`, initramfs, and FDT in RAM, passes the FDT
+address in `x0`, and enters EL1h. Secondary CPU startup uses PSCI over HVC.
+
+## Quick Start: Core And CLI
+
+Use macOS with Xcode command-line tools and Swift 5.9 or newer. Guest images are
+not needed for the core tests or toy UART smoke test.
+
+All commands below run from the repository root unless stated otherwise.
 
 ```sh
-# Fetch an Alpine ARM64 virt kernel/initramfs used as build input.
-Scripts/fetch-alpine-aarch64.sh
-
-# Build the project-specific ARM64 Linux kernel and minimal initramfs.
-Scripts/build-arm64-shell-kernel.sh
-
-# Build the persistent Alpine edge rootfs. The graphical profile defaults to Phosh.
-# The guest now requires the tested Pinecone GLib MIME-search package.
-bash scripts/build-pinecone-glib.sh
-Scripts/build-arm64-rootfs-image.sh
+swift build -c release
+swift test -c release
+swift run -c release arm64viz run-toy
 ```
 
-The final files consumed by Pinecone are:
+The toy guest exercises the emulator and UART; it is not the Alpine desktop.
+
+```sh
+swift run -c release arm64viz --help
+swift run -c release arm64viz adapters
+```
+
+The CLI also supports Linux handoff preparation, bounded execution traces,
+instruction auditing, differential execution, FDT inspection, policy validation,
+and diagnostic snapshots. Snapshots are not a complete resumable Phosh boot feature.
+
+## Build And Run The iOS App
+
+### Guest Assets
+
+The checked-in Xcode project expects these generated files:
 
 ```text
 artifacts/linux-shell/out/Image
 artifacts/linux-shell/out/initramfs-minimal-ttyinit.cpio
 artifacts/linux-shell/out/rootfs.ext4
+artifacts/linux-shell/out/rootfs.ext4.sha256
 ```
 
-The rootfs builder resolves and stages Alpine edge packages for Phoc, Phosh,
-Portfolio, GNOME Calculator, Calendar, Clocks, Text Editor, Foot, and their
-runtime dependencies. Downloaded APKs are cached under
-`artifacts/alpine-packages/edge-aarch64/`.
+Use a matching kernel, initramfs, rootfs, and checksum from the same prepared
+build. A source checkout alone does not include a ready-to-run desktop.
+See [Building The Guest](#building-the-guest) to generate the assets.
 
-The graphical image also includes the native GTK3 **Packages** app. Its builder
-requires `gtk+3.0-dev`, `json-glib-dev`, and a C toolchain in the Alpine/aarch64
-build VM (`PINECONE_CACHE_LIMA_INSTANCE`, normally `pinecone-builder`). The image
-build uses APK itself to verify archives and generate the installed-package
-database; it does not merely extract files and leave APK unaware of them.
-
-To build a smaller non-graphical rootfs:
-
-```sh
-ARM64VIZ_GRAPHICAL_ROOTFS=0 Scripts/build-arm64-rootfs-image.sh
-```
-
-Other supported staging profiles are `cage` and `phoc`:
-
-```sh
-ARM64VIZ_GRAPHICAL_PROFILE=phoc Scripts/build-arm64-rootfs-image.sh
-```
-
-## Artifact Policy
-
-Do not commit `artifacts/` as a whole. It contains downloaded packages, an
-extracted Linux tree, compiler output, experimental initramfs variants, and a
-large writable ext4 disk image. At present, the Xcode project references the
-three final files listed above directly, so they must exist before Pinecone is
-built.
-
-For shared builds or CI, publish those final guest images as versioned build
-assets with checksums, or regenerate them from `Scripts/`. Do not place the
-entire artifact workspace in ordinary Git history.
-
-## Build and Run Pinecone
-
-The checked-in Xcode project uses the application identifier
-`me.gmoran.pinecone` and requires iOS 17 or newer.
-
-Regenerate the project only after changing `project.yml`:
-
-```sh
-cd Apps/iOS/MobileOSHost
-xcodegen generate --spec project.yml
-```
-
-Validate an unsigned device build:
+### Simulator
 
 ```sh
 xcodebuild \
-  -project MobileOSHost.xcodeproj \
+  -project Apps/iOS/MobileOSHost/MobileOSHost.xcodeproj \
   -scheme MobileOSHost \
-  -destination 'generic/platform=iOS' \
-  CODE_SIGNING_ALLOWED=NO \
-  -derivedDataPath .DerivedData \
-  build
+  -configuration Release \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath Apps/iOS/MobileOSHost/.DerivedData \
+  CODE_SIGNING_ALLOWED=NO build
 ```
 
-For a physical iPhone, open `MobileOSHost.xcodeproj`, select a development
-team, choose the connected device, and run. Pinecone remains a normal sandboxed
-iOS application; it does not modify the phone boot chain or replace iOS.
+With the desired Simulator booted:
 
-Pinecone copies the bundled root filesystem into Application Support and uses
-that copy as file-backed virtio storage. Guest writes therefore survive VM
-restarts. The app provides:
+```sh
+xcrun simctl install booted \
+  Apps/iOS/MobileOSHost/.DerivedData/Build/Products/Release-iphonesimulator/Pinecone.app
+xcrun simctl launch booted me.gmoran.pinecone
+```
 
-- A scrollable `ttyAMA0` console with keyboard and paste support
-- VM reset, power, and stop controls
-- A full-screen-scaled guest display surface
-- Touch forwarding with guest-coordinate conversion
-- Incremental framebuffer presentation through Metal
-- Runtime counters for native execution, devices, display, and input latency
+If multiple Simulators are booted, replace `booted` with the device UUID.
 
-Inside the guest, start the graphical session with:
+### Physical iPhone
+
+Open `Apps/iOS/MobileOSHost/MobileOSHost.xcodeproj` in Xcode. Select your
+development team, the **MobileOSHost** scheme, a connected iPhone, and the
+**Release** build configuration, then Run.
+
+The app requires iOS 17 or newer and normal Apple developer signing. Its bundle
+identifier is `me.gmoran.pinecone`. No prototype launch flags are required.
+`MobileOSHost` is the internal project/scheme name, not the removed JavaScript OS.
+
+XcodeGen is needed only when regenerating the project:
+
+```sh
+(cd Apps/iOS/MobileOSHost && xcodegen generate --spec project.yml)
+```
+
+Recheck signing settings after regeneration.
+
+## Using Pinecone
+
+Linux boots, mounts the persistent root, and reaches its shell. Pinecone then
+automatically runs `start-pinecone-phosh` and switches to Display on the Phosh
+readiness marker. The default lock screen offers **Tap to unlock**; existing
+guest authentication policy still applies.
+
+The right-side slide-out menu contains terminal/display selection, keyboard,
+restart, power, and stop controls. The terminal supports scrollback and paste.
+Its iOS keyboard is separate from the guest's Wayland on-screen keyboard.
+
+Home, the dock, Recent Apps, All Apps, and the bottom navigation strip are part
+of patched Phosh inside Linux, not host overlays. Home icon preloading is
+best-effort, not a guarantee of immediate application startup.
+
+To start a graphical session manually from the guest shell:
 
 ```sh
 start-pinecone-phosh
 ```
 
-## Guest Launcher
+### Networking And Browsers
 
-Pinecone's guest Home screen is part of the patched Phosh shell, not an iOS
-overlay. It provides a four-column app grid, a four-app dock, and a persistent
-bottom navigation strip: **Recent Apps**, **Home**, and **All Apps**. Narrow
-displays reduce the Home grid's column count without shrinking the icons.
+| Endpoint | Address |
+| --- | --- |
+| Guest | `10.0.2.15` |
+| Gateway | `10.0.2.2` |
+| DNS | `10.0.2.3` |
 
-The dock uses the first four Phosh favorites. Fresh images seed Browser, Files,
-Packages, and Settings; long-press an app to change its favorite status. Extra
-favorites remain on Home. All Apps includes dock apps and search, and desktop
-entries installed or removed by the package manager update through Phosh's
-existing application monitor. Recents uses real running windows, including the
-existing close and activate actions.
+The bridge uses Apple networking for outbound TCP/UDP and DNS. On an iPhone it
+follows the host's available Wi-Fi or cellular connection. Guest NetworkManager
+exposes virtual Ethernet; it does not control the phone's radios.
 
-The navigation surface reserves its own space so applications are not obscured,
-does not take keyboard focus, and is hidden while the guest is locked. These are
-shell navigation controls, not a synthetic Android-style Back key.
-`PINECONE_PHOSH_LAUNCHER=0 start-pinecone-phosh` retains upstream Phosh's overview
-for comparison. The normal guest session enables the Pinecone launcher.
+`pinecone-network status` reports guest configuration. A successful local ping
+does not prove Internet access, and ICMP behavior is not equivalent to a mature
+slirp stack. Package downloads and general network performance remain work areas.
 
-Rebuild the patched shell before rebuilding the rootfs:
+Firefox is bundled, with NetSurf as a smaller alternative. Inside the graphical
+session:
 
 ```sh
-PINECONE_WLROOTS_LIMA_INSTANCE=pinecone-builder bash scripts/build-pinecone-phosh.sh
+pinecone-launch-firefox https://example.com/
+pinecone-launch-browser https://example.com/
 ```
 
-The build runs upstream Phosh tests plus the launcher model/lifecycle tests.
+Firefox uses native Wayland and software WebRender, not hardware 3D. It requires
+the project's kernel namespace/seccomp support; its integration does not disable
+browser sandboxing or site isolation. NetSurf has limited modern-web
+compatibility and no renderer sandbox. TLS validation remains enabled.
 
-## Desktop Tools
+**The current desktop is a root demo session.** Use trusted test content and
+avoid sensitive credentials; this is not a hardened browsing environment.
 
-Build and test the core:
+### Packages
 
-```sh
-swift build -c release
-swift test
-```
-
-Run the small UART architecture smoke test:
-
-```sh
-swift run -c release arm64viz run-toy
-```
-
-Prepare and inspect the generated Linux handoff without executing it:
-
-```sh
-swift run -c release arm64viz prepare-linux \
-  artifacts/linux-shell/out/Image \
-  --initrd artifacts/linux-shell/out/initramfs-minimal-ttyinit.cpio \
-  --disk artifacts/linux-shell/out/rootfs.ext4 \
-  --memory-mib 512 \
-  --bootargs "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 root=/dev/vda rw rootwait rdinit=/init loglevel=7"
-```
-
-Run a bounded Linux trace through the native backend:
-
-```sh
-swift run -c release arm64viz run-linux-trace \
-  artifacts/linux-shell/out/Image \
-  --initrd artifacts/linux-shell/out/initramfs-minimal-ttyinit.cpio \
-  --disk artifacts/linux-shell/out/rootfs.ext4 \
-  --memory-mib 512 \
-  --symbols artifacts/linux-shell/out/System.map \
-  --trace-depth 256 \
-  --max-steps 100000000 \
-  --bootargs "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 root=/dev/vda rw rootwait rdinit=/init loglevel=7"
-```
-
-Additional tools include instruction coverage auditing, differential SIMD
-tests, DTS/FDT inspection, VM snapshots, boot-adapter planning, and policy
-validation. Run `swift run arm64viz --help` for the current command list.
-
-## Networking
-
-The guest uses a private IPv4 network:
-
-```text
-guest:   10.0.2.15
-gateway: 10.0.2.2
-DNS:     10.0.2.3
-```
-
-The virtio-net backend bridges guest traffic to host networking using Apple
-Network.framework. TCP and UDP flows used by Alpine package operations are the
-primary supported path. This implementation is independent of QEMU slirp and
-is still under optimization; `apk update` can be noticeably slower than on a
-native Linux machine, and ICMP behavior should not be treated as a complete
-measure of Internet connectivity.
-
-Early boot configures this address without waiting for desktop services.
-When Phosh starts, NetworkManager adopts the matching `Pinecone Internet`
-profile and becomes the network configuration owner. It exposes virtual
-Ethernet in Settings; it does not control the host's Wi-Fi or cellular radios.
-`pinecone-network status` reports the guest connection. A connected interface
-is not itself proof of Internet reachability.
-
-Public hostnames resolve through the host resolver. The optional package
-proxy remains explicitly available at `http://10.0.2.2/alpine/`; public Alpine
-hostnames are not redirected to that HTTP-only endpoint.
-
-### Web Browser
-
-The Phosh image includes **Firefox**, with NetSurf GTK3 retained as a lightweight
-alternative. Fresh images put Firefox in the dock. From a terminal inside the
-Phosh session, run `pinecone-launch-firefox https://example.com/`, or
-`pinecone-launch-browser https://example.com/` for NetSurf. TLS certificate
-validation remains enabled, and both retain their profiles on the persistent root filesystem.
-No on-device package installation is needed.
-
-Firefox uses native Wayland and software WebRender because this virtual GPU
-does not expose OpenGL/Vulkan. Its launcher requires a kernel with user
-namespaces and seccomp; rebuild the kernel as well as the root image when
-upgrading an older bundle. It does not disable browser sandboxing or site
-isolation. See [Firefox integration](docs/firefox-browser-2026-10-28.md) for
-package compatibility, verification, and remaining limitations.
-
-NetSurf is a basic HTML/CSS browser, not a Chromium/WebKit replacement. JavaScript
-is disabled in the initial profile and many modern web apps will not work.
-NetSurf has no renderer sandbox, and the current demo desktop runs as root:
-use trusted test pages only, without sensitive credentials. Browser isolation
-and modern web-app compatibility remain separate work; TLS validation is not
-disabled to obtain connectivity.
-
-### Package Manager
-
-Open **Packages** from Phosh's app grid, or run `pinecone-launch-packages` inside
-the guest desktop. Its mobile, Cydia-inspired interface has Home, Sources,
-Updates, Installed, and Search tabs. Home offers curated app categories;
-package pages show real APK metadata, dependencies, sizes, and installed versions.
-Queue packages, open the queue in the header, and review APK's proposed changes
-before applying them. Activity streams transaction output and errors. Search
-uses the guest Wayland keyboard, not an iOS overlay.
-
-The bundled runtime is retained by the `.pinecone-platform` metapackage with
-exact dependency versions. Bundled packages are separated from added packages;
-additional packages can be installed, updated, and removed. A package requiring newer
-platform libraries may be rejected until the base image is rebuilt. This is
-intentional: an unrestricted rolling-edge upgrade could overwrite the patched
-musl, GLib, Pixman, Cairo, wlroots, Phoc, or Phosh implementation. A queue batches
-one transaction type at a time (install, remove, or update); it does not perform
-whole-system upgrades. Sources can be added, enabled, and disabled without
-replacing trusted keys. Neither the build nor the UI disables APK signature checks. These
-pins are compatibility constraints, not a security boundary against guest root.
-The CLI remains available:
+The **Packages** app provides Home, Sources, Updates, Installed, Search,
+transaction previews, and activity output backed by real APK metadata.
+The command line remains available:
 
 ```sh
 apk update
@@ -457,79 +294,205 @@ apk add tree
 apk del tree
 ```
 
-Packages and the APK database live on persistent `rootfs.ext4`. Use Pinecone's
-normal stop/reboot controls to flush that disk; force-killing the host is not a
-durability guarantee. The builder seeds the explicit host package-proxy URLs;
-boot no longer overwrites a user's repository configuration. This package UI
-uses the current root demo session, not a new privilege-escalation service.
+The `.pinecone-platform` metapackage pins bundled runtime dependencies so package
+operations do not silently replace patched libraries. Additional packages can
+be managed when their dependencies are compatible. Unrestricted `apk upgrade`
+is not the supported way to update the base image.
 
-## Debugging and Performance
+APK signature checks remain enabled. Platform pins are compatibility constraints,
+not a security boundary against guest root. See [Packages](docs/package-manager.md)
+and [Firefox integration](docs/firefox-browser-2026-10-28.md).
 
-The native backend exposes counters for decoded blocks, cache hits, linked
-blocks, superblocks, page translations, direct memory access, semantic fast
-paths, and unsupported instructions. Pinecone keeps guest UART output separate
-from host diagnostics.
+## Persistence And Updates
 
-The simulator supports opt-in diagnostic environment variables, including:
+The bundled rootfs is copied into Application Support and attached as writable,
+file-backed virtio storage. Files and installed packages survive normal VM
+restarts. Use the app's stop/reboot controls; force-killing the host is not a
+guarantee that all writes have reached durable storage.
 
-| Variable | Effect |
+**A changed bundled rootfs checksum reseeds the writable disk.** The previous
+disk is retained as `rootfs.previous.ext4`, but files and packages are not
+automatically migrated. Only one previous disk is kept. Back up important data
+before another image update, and do not uninstall the app to preserve its data.
+
+Allow space for the bundled, writable, and previous images. Always bundle the
+checksum matching the actual rootfs bytes.
+
+## Building The Guest
+
+Guest builds target Apple Silicon macOS. Beyond Xcode, the scripts use:
+
+- LLVM/Clang, LLD, GNU Make, and libelf.
+- Python 3, Meson, Ninja, pkg-config, curl, patch, and archive tools.
+- e2fsprogs: `mke2fs`, `e2fsck`, and `dumpe2fs`.
+- GLib and shared-mime-info utilities for schema and MIME caches.
+- Lima with an Alpine/aarch64 builder and APK build tooling.
+- Compatible Cairo/GTK development dependencies inside that builder.
+
+Homebrew tool defaults commonly use `/opt/homebrew`; script headers expose
+overrides. Builders modify their dedicated VM's package configuration, so do not
+point them at a general-purpose Linux environment.
+
+This is a staged developer build, not a hermetic one-command bootstrap.
+Retain selected-package manifests, signed APKs, and public build keys. Rolling
+Alpine repositories may no longer serve an older selected version.
+
+### Kernel And Initramfs
+
+```sh
+bash scripts/fetch-alpine-aarch64.sh
+bash scripts/build-arm64-shell-kernel.sh
+```
+
+The second script builds the project kernel and initramfs variants, including
+the minimal initramfs bundled by Pinecone.
+
+### Patched Packages
+
+The graphical image requires locally built wlroots, Phoc, Phosh, Settings,
+GLib, and musl packages. Use the same dedicated builder:
+
+```sh
+export PINECONE_WLROOTS_LIMA_INSTANCE=pinecone-builder
+export PINECONE_GLIB_LIMA_INSTANCE=pinecone-builder
+export PINECONE_MUSL_LIMA_INSTANCE=pinecone-builder
+export PINECONE_SETTINGS_LIMA_INSTANCE=pinecone-builder
+export PINECONE_CACHE_LIMA_INSTANCE=pinecone-builder
+export PINECONE_CAIRO_LIMA_INSTANCE=pinecone-builder
+
+bash scripts/build-pinecone-wlroots.sh
+bash scripts/build-pinecone-phoc.sh
+bash scripts/build-pinecone-phosh.sh
+bash scripts/build-pinecone-gnome-control-center.sh
+bash scripts/build-pinecone-glib.sh
+bash scripts/build-pinecone-musl.sh
+```
+
+The wlroots builder can create the named Lima VM with the repository mounted;
+the others expect it to exist. The current musl overlay is `1.2.6-r10`.
+Required runtime revisions and dependency validation are defined in
+`scripts/stage-alpine-graphical-rootfs.sh`.
+
+### Root Filesystem
+
+With overlays and build dependencies prepared:
+
+```sh
+PINECONE_CACHE_LIMA_INSTANCE=pinecone-builder \
+  PINECONE_CAIRO_LIMA_INSTANCE=pinecone-builder \
+  bash scripts/build-arm64-rootfs-image.sh
+```
+
+This stages Phosh, builds the Pixman bridge and patched Pixman/Cairo, builds
+Packages, generates guest caches, registers packages with APK, validates ext4,
+and emits the root image and checksum.
+
+Not every helper installs prerequisites automatically. Pixman needs cached ARM64
+`musl` and `musl-dev` APKs under `artifacts/alpine-packages/edge-aarch64`.
+Cairo needs a compatible development sysroot or builder libraries. Packages
+needs `gtk+3.0-dev`, `json-glib-dev`, pkg-config, and a C compiler in the builder.
+Resolve missing dependencies rather than disabling verification.
+
+For incremental builds with existing verified library artifacts, add
+`PINECONE_REUSE_PIXMAN_LIBRARY=1 PINECONE_REUSE_CAIRO_LIBRARY=1`. Do not reuse
+them after changing their source or patches.
+
+For a shell-only image:
+
+```sh
+ARM64VIZ_GRAPHICAL_ROOTFS=0 bash scripts/build-arm64-rootfs-image.sh
+```
+
+This omits Phosh, so normal graphical autostart cannot succeed. Simulator tests
+can override the startup command as described below.
+
+Do not commit `artifacts/` wholesale. It contains downloads, source trees,
+packages, build products, and large disk images. Share final assets with their
+checksums and build provenance instead.
+
+## Diagnostics And Performance
+
+Capture an unsupported instruction with its opcode, PC, triggering command,
+and guest/build configuration. Enabling an unrelated fallback is not a
+correctness fix.
+
+Useful Xcode launch environment variables:
+
+| Variable | Purpose |
 | --- | --- |
-| `PINECONE_SIMULATOR_AUTORUN_COMMAND` | Runs a guest command after shell startup |
-| `PINECONE_SIMULATOR_DUMP_UART=1` | Writes captured UART diagnostics |
-| `PINECONE_SIMULATOR_DUMP_PERFORMANCE=1` | Writes runtime performance data |
-| `PINECONE_SIMULATOR_DUMP_FRAMEBUFFER=1` | Dumps framebuffer diagnostics |
-| `PINECONE_SIMULATOR_HOT_PC_PROFILE=1` | Enables sampled native hot-PC profiling |
-| `PINECONE_GUEST_MEMORY_MB` | Overrides configured guest RAM |
+| `PINECONE_VERBOSE_BOOT=1` | Detailed kernel output and early console |
+| `PINECONE_ASSEMBLY_EXECUTOR=0` | Compare against the established C executor |
+| `PINECONE_GUEST_MEMORY_MB` | Guest RAM override, clamped to 128-1024 MiB |
+| `PINECONE_SIMULATOR_AUTORUN_COMMAND` | Replace Phosh autostart in Simulator; use `true` for shell-only work |
+| `PINECONE_SIMULATOR_DUMP_UART=1` | Capture guest UART diagnostics |
+| `PINECONE_SIMULATOR_WRITE_PERFORMANCE_METRICS=1` | Write structured performance metrics |
+| `PINECONE_SIMULATOR_HOT_PC_PROFILE=1` | Enable sampled native PC profiling |
+| `PINECONE_SIMULATOR_DUMP_FRAMEBUFFER=1` | Dump framebuffer diagnostics |
 
-Hot-PC profiling is disabled by default so diagnostics do not affect normal VM
-performance.
+Remove stale threaded/chaining overrides before comparing current defaults.
+Profiling and competing VMs can materially change results.
+
+Performance work follows [roadmap.md](roadmap.md): measure unlock, input-to-frame,
+and cold/warm application launch separately; preserve baseline configuration;
+verify pixels, input, and persistence before promoting changes. Instruction
+counts and synthetic throughput alone do not establish UI responsiveness.
 
 ## Known Limitations
 
-- The VM currently exposes one virtual CPU.
-- Execution is interpreted and does not use JIT compilation, HVF, or KVM.
-- AArch64 coverage is driven by Linux/Alpine/Phosh and is not yet a formal
-  implementation of every optional architectural extension.
-- Phosh software rendering is functional but still CPU-intensive and can be
-  choppy during complex redraws.
-- The host network bridge is less complete and slower than mature QEMU/UTM
-  networking.
-- Audio, cameras, sensors, telephony, suspend/resume, and hardware 3D
-  acceleration are not implemented as guest devices.
-- The root filesystem is an Alpine edge image assembled by project scripts,
-  not an official postmarketOS or distribution image.
+- No JIT, guest hardware virtualization, or guest OpenGL/Vulkan acceleration.
+- ARM64 instruction coverage is substantial but not architecturally complete.
+- Phosh still has delayed input, choppy transitions, and slow application launches.
+- Settings can intermittently render without its title bar.
+- Firefox is demanding under interpretation and software rendering.
+- Physical-device memory pressure can terminate the host; more guest RAM is not
+  automatically an improvement.
+- Networking is less complete than mature VM networking implementations.
+- No guest audio, camera, telephony, or sensor platform.
+- No claim of a hardened multi-user desktop or production mobile OS.
 
-## Scope and Guardrails
+The assembly-backed default is a device-test promotion, not evidence that these
+limitations are resolved. See [device-test notes](docs/device-test-promotion.md)
+and [graphics profiling findings](docs/phosh-graphics-priority-profile.md).
 
-This repository implements generic virtualization infrastructure and
-open-source guest support. It does not provide or request proprietary mobile OS
-images, firmware blobs, boot ROM code, device keys, certificates, secure
-processor secrets, activation material, attestation bypasses, or proprietary
-service impersonation.
+## Repository Map
 
-Guest adapters are pluggable, but the implemented boot path is for open Linux
-guests. The proprietary-guest adapter is a metadata boundary validator only; it
-does not ingest, extract, decrypt, or boot proprietary OS packages. Built-in
-prohibitions cannot be disabled by `arm64viz.preferences.json`; preferences can
-only add restrictions.
+```text
+Apps/iOS/MobileOSHost/   Pinecone iOS app and Xcode project
+Sources/ARM64VizNative/  C/assembly execution, caches, memory and rasterization
+Sources/ARM64VizCore/    VM platform, devices, Linux boot and diagnostics
+Sources/arm64viz/        macOS CLI
+Tests/ARM64VizCoreTests/ Core and regression tests
+scripts/                Kernel, guest package, rootfs and validation tooling
+scripts/patches/        Linux and userspace integration patches
+scripts/rootfs/         Guest services, launchers and Packages source
+artifacts/              Generated/downloaded build inputs and outputs
+experiments/            Benchmark captures and experimental evidence
+ui/                     Browser boot-planning tool, not a guest OS
+docs/                   Architecture, protocols and investigation reports
+roadmap.md              Active priorities and historical performance phases
+```
 
-See:
+## Scope And Guardrails
 
-- [Architecture notes](docs/architecture.md)
-- [Roadmap](docs/roadmap.md)
-- [Proprietary guest boundaries](docs/proprietary-guest-boundaries.md)
+Pinecone is generic ARM64 infrastructure for open-source guest research. It does
+not replace iOS, modify the phone's boot chain, or use private hypervisor
+entitlements. QEMU is not the execution engine; Lima is a separate guest-build
+tool, not part of the iOS runtime.
 
-## QEMU, HVF, and KVM
+The proprietary-guest adapter validates metadata only. It does not ingest,
+extract, decrypt, or boot IPSWs or other proprietary OS packages. The project
+does not supply proprietary firmware, boot ROMs, device keys, activation
+materials, attestation bypasses, or service impersonation.
 
-- **Current software backend:** portable, deterministic, inspectable, and able
-  to run inside an ordinary iOS app, at the cost of interpreter overhead.
-- **QEMU:** useful as an external behavioral reference, but not a dependency or
-  runtime component of arm64viz.
-- **HVF:** a possible macOS-only acceleration backend; it does not provide a
-  general App Store-compatible iOS execution path.
-- **KVM:** appropriate for a future Linux-hosted accelerated backend, requiring
-  Linux and hardware virtualization support.
+`arm64viz.preferences.json` may add restrictions; it cannot remove built-in
+guardrails. See [guest boundaries](docs/proprietary-guest-boundaries.md).
 
-The immediate engineering focus is native AArch64 completeness, lower guest
-CPU cost, faster Pixman compositing, reduced Phosh first-frame time, and a more
-complete host network bridge.
+## Further Reading
+
+- [Active performance roadmap](roadmap.md)
+- [iOS host and installation notes](Apps/iOS/MobileOSHost/README.md)
+- [VM architecture](docs/architecture.md)
+- [Paravirtual graphics](docs/PINECONE_GRAPHICS.md)
+- [Guest package manager](docs/package-manager.md)
+- [Firefox integration](docs/firefox-browser-2026-10-28.md)
+- [Lightweight lock screen](docs/lightweight-lockscreen-2026-10-28.md)

@@ -12,7 +12,7 @@
 
 - Keep the proprietary guest boundary in metadata-only mode while generic VM
   capabilities are developed and tested against open guests.
-- Keep the JavaScript MobileOS track disabled as archived reference code.
+- Use native ARM64 Linux guests; the former JavaScript MobileOS track has been removed.
 - Add decode/execute coverage for more AArch64 integer, branch, load/store, and
   system instructions.
 - Extend the implemented exception levels, vector routing, banked timer state,

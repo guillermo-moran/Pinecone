@@ -139,7 +139,6 @@ function classify(name) {
   if (lower === "vendor.img") return "androidVendorImage";
   if (lower === "product.img") return "androidProductImage";
   if (lower === "super.img") return "androidSuperImage";
-  if (lower.endsWith(".app.js") || lower.endsWith(".mobile.js")) return "mobileAppBundle";
   if (lower.endsWith(".json")) return "metadataManifest";
   if (lower.endsWith(".bin")) return "rawARM64Binary";
   if (lower.endsWith(".img") || lower.endsWith(".raw") || lower.endsWith(".qcow2")) return "diskImage";

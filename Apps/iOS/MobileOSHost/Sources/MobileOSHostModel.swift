@@ -69,7 +69,6 @@ final class HostPerformanceFeed: ObservableObject {
 final class MobileOSHostModel: ObservableObject {
     @Published private(set) var vmBootLog: String = ""
     @Published private(set) var terminalText: String = ""
-    @Published private(set) var kernelReport: MobileOSKernelReport?
     @Published private(set) var linuxReport: LinuxHostReport?
     @Published private(set) var status: HostStatus = .idle
     @Published private(set) var lastError: String?
@@ -110,22 +109,7 @@ final class MobileOSHostModel: ObservableObject {
         case failed = "Failed"
     }
 
-    var processRows: [MobileOSProcess] {
-        kernelReport?.processes ?? []
-    }
-
-    var appRows: [MobileOSAppInstance] {
-        kernelReport?.apps ?? []
-    }
-
-    var surfaceRows: [MobileOSSurface] {
-        kernelReport?.surfaces ?? []
-    }
-
     var bootLines: [String] {
-        if let kernelReport {
-            return kernelReport.bootLog
-        }
         return vmBootLog
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map(String.init)
@@ -158,7 +142,6 @@ final class MobileOSHostModel: ObservableObject {
             fallbackSteps: 0,
             summary: "loading guest image"
         )
-        kernelReport = nil
         linuxReport = nil
         terminalText = ""
         vmBootLog = ""

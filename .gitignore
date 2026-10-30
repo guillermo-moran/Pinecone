@@ -8,7 +8,16 @@ DerivedData/
 .DerivedData/
 .DerivedDataAutoInit/
 .DerivedData*/
-/artifacts
+/artifacts/
+
+# Local HOME used by sandboxed Xcode/SwiftPM builds (caches and symlinks)
+.sandbox-home/
+.sandbox-home-*/
+
+# Xcode test results, archives, and exported apps
+*.xcresult/
+*.xcarchive/
+*.ipa
 
 # Personal Xcode user preferences (window layouts, open tabs)
 xcuserdata/
@@ -38,6 +47,21 @@ xcuserdata/
 # Ignore local build artifacts but KEEP Package.resolved to lock versions
 .build/
 
+# Python tooling and regression-test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Compiler coverage/profiling output, not curated benchmark reports
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+
 # CocoaPods
 # Un-comment Pods/ if you prefer to download them fresh on every machine
 # Pods/
@@ -58,3 +82,15 @@ fastlane/test_output
 # Local configuration / Environment variables
 .env
 .env.*
+!.env.example
+!.env.sample
+
+# Local signing identities and provisioning profiles; keep public build keys
+*.p12
+*.pfx
+*.p8
+*.mobileprovision
+*.provisionprofile
+
+# Do not blanket-ignore logs, JSON, PNG, or archives: curated evidence in
+# experiments/ and docs/performance-evidence/ is intentionally versioned.

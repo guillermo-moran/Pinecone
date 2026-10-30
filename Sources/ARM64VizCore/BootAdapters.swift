@@ -33,56 +33,6 @@ public struct ToyUARTGuestAdapter: GuestBootAdapter {
     }
 }
 
-public struct MobileOSToyGuestAdapter: GuestBootAdapter {
-    public let identifier = "mobile-os-image"
-    public let entryPoint: GuestAddress
-    public let uartBase: GuestAddress
-    public let appRuntime: String
-
-    public init(
-        entryPoint: GuestAddress = ARM64VizMachineLayout.toyEntryPoint,
-        uartBase: GuestAddress = ARM64VizMachineLayout.uartBase,
-        appRuntime: String = "javascript"
-    ) {
-        self.entryPoint = entryPoint
-        self.uartBase = uartBase
-        self.appRuntime = appRuntime
-    }
-
-    public func load(into vm: VirtualMachine) throws -> BootConfiguration {
-        try RuntimeDirection.requireJavaScriptMobileOSEnabled(operation: identifier)
-        return try MobileOSImageBootAdapter(
-            image: .developmentImage(
-                runtime: appRuntime,
-                loadAddress: entryPoint,
-                uartBase: uartBase
-            )
-        ).load(into: vm)
-    }
-}
-
-public extension MobileOSImageBootAdapter {
-    init(
-        runtime: String,
-        loadAddress: GuestAddress = ARM64VizMachineLayout.toyEntryPoint,
-        uartBase: GuestAddress = ARM64VizMachineLayout.uartBase
-    ) {
-        self.init(
-            image: .developmentImage(
-                runtime: runtime,
-                loadAddress: loadAddress,
-                uartBase: uartBase
-            )
-        )
-    }
-}
-
-public enum MobileOSBootLog {
-    public static func message(runtime: String) -> String {
-        MobileOSImageBootTranscript.render(manifest: MobileOSImage.developmentImage(runtime: runtime).manifest)
-    }
-}
-
 public enum ToyUARTProgram {
     public static func image(message: String, uartBase: GuestAddress) -> [UInt8] {
         var instructions: [UInt32] = []

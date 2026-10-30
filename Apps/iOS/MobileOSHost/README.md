@@ -1,7 +1,7 @@
 # Pinecone
 
-Pinecone is an internal iOS hardware test harness for arm64viz. The JavaScript
-MobileOS runtime is disabled. The app boots ARM64 Alpine Linux and Phosh through
+Pinecone is an internal iOS hardware test harness for arm64viz.
+The app boots ARM64 Alpine Linux and Phosh through
 ARM64VizCore, with a full-screen guest display and a PL011 `ttyAMA0` terminal.
 
 It does not replace iOS, alter the device boot chain, use private entitlements,

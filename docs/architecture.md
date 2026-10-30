@@ -147,20 +147,12 @@ the same Linux/postmarketOS handoff, enables a bounded instruction trace inside
 recent fetched instructions, recent routed exceptions, and the backend feature
 that likely blocks the next step.
 
-## Archived MobileOS Track
+## Guest Runtime
 
-The JavaScript MobileOS track is disabled. `RuntimeDirection` marks native
-Linux/postmarketOS as the active track, and the old launch paths now return
-`unsupportedGuest` instead of building or booting a JavaScript OS.
-
-The archived files remain useful as reference models for scheduler, IPC,
-compositor, VFS, PTY, and shell-contract tests, but they are not the runtime
-direction:
-
-- `MobileOSImageBootAdapter` refuses `.mosimg` boot.
-- `MobileOSKernel.boot` refuses the JavaScript runtime demo.
-- `run-mobile`, `build-mobile-image`, and `mobile-kernel-demo` are disabled.
-- `ui/mobile-os.html` is a static archived-track page.
+Pinecone boots ARM64 Alpine Linux and Phosh. The former JavaScript MobileOS
+prototype, simulated kernel/shell, image format, and CLI commands have been
+removed. Guest processes, filesystems, and applications run inside Linux;
+the Swift iOS layer hosts the VM and presents its console and display.
 
 ## iOS Hardware Test Host
 

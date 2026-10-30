@@ -1878,220 +1878,6 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try uart.read(offset: 0x48, width: .word), 0x7)
     }
 
-    func testMobileOSPrototypeGuestIsDisabled() throws {
-        let machine = try MachineFactory.makeResearchMachine()
-
-        XCTAssertThrowsError(try MobileOSToyGuestAdapter().load(into: machine.vm)) { error in
-            guard case VMError.unsupportedGuest = error else {
-                XCTFail("expected unsupportedGuest, got \(error)")
-                return
-            }
-            XCTAssertTrue(String(describing: error).contains("JavaScript MobileOS is disabled"))
-        }
-    }
-
-    func testMobileOSImageArtifactRoundTrips() throws {
-        let image = MobileOSImage.developmentImage()
-        let encoded = try image.encodedArtifact()
-        let decoded = try MobileOSImage.decodeArtifact(encoded)
-
-        XCTAssertEqual(decoded.manifest, image.manifest)
-        XCTAssertFalse(decoded.manifest.verboseBoot)
-        XCTAssertEqual(decoded.payload, image.payload)
-        XCTAssertEqual(Array(encoded.prefix(MobileOSImage.magic.count)), MobileOSImage.magic)
-    }
-
-    func testMobileOSVerboseImageBootIsDisabled() throws {
-        let machine = try MachineFactory.makeResearchMachine()
-        let image = MobileOSImage.developmentImage(verboseBoot: true)
-
-        XCTAssertTrue(image.manifest.verboseBoot)
-        XCTAssertThrowsError(try MobileOSImageBootAdapter(image: image).load(into: machine.vm)) { error in
-            guard case VMError.unsupportedGuest = error else {
-                XCTFail("expected unsupportedGuest, got \(error)")
-                return
-            }
-        }
-    }
-
-    func testMobileOSImageBootAdapterIsDisabled() throws {
-        let machine = try MachineFactory.makeResearchMachine()
-        let image = MobileOSImage.developmentImage(runtime: "javascript")
-
-        XCTAssertThrowsError(try MobileOSImageBootAdapter(image: image).load(into: machine.vm)) { error in
-            guard case VMError.unsupportedGuest = error else {
-                XCTFail("expected unsupportedGuest, got \(error)")
-                return
-            }
-            XCTAssertTrue(String(describing: error).contains(RuntimeDirection.javascriptMobileOSDisabledReason))
-        }
-    }
-
-    func testMobileOSSchedulerRunsProcessesRoundRobin() {
-        let scheduler = MobileOSScheduler()
-        let first = scheduler.spawn(name: "first", kind: .app)
-        let second = scheduler.spawn(name: "second", kind: .app)
-
-        XCTAssertEqual(scheduler.tick()?.pid, first)
-        XCTAssertEqual(scheduler.tick()?.pid, second)
-        XCTAssertEqual(scheduler.tick()?.pid, first)
-    }
-
-    func testMobileOSIPCWakesWaitingProcess() throws {
-        let scheduler = MobileOSScheduler()
-        let sender = scheduler.spawn(name: "sender", kind: .systemService)
-        let receiver = scheduler.spawn(name: "receiver", kind: .app)
-
-        XCTAssertNil(try scheduler.receive(pid: receiver))
-        try scheduler.send(MobileOSMessage(from: sender, to: receiver, topic: "ping", payload: "hello"))
-        let message = try scheduler.receive(pid: receiver)
-
-        XCTAssertEqual(message?.topic, "ping")
-        XCTAssertEqual(message?.payload, "hello")
-    }
-
-    func testMobileOSAppLaunchCreatesProcessAndSurface() throws {
-        let scheduler = MobileOSScheduler()
-        let compositor = MobileOSCompositor()
-        let registry = MobileOSAppRegistry()
-        try registry.register(MobileOSAppManifest(
-            identifier: "dev.arm64viz.test",
-            displayName: "Test",
-            entryPoint: "test.app.js"
-        ))
-
-        let app = try registry.launch(identifier: "dev.arm64viz.test", scheduler: scheduler, compositor: compositor)
-
-        XCTAssertEqual(app.manifest.displayName, "Test")
-        XCTAssertEqual(scheduler.allProcesses.count, 1)
-        XCTAssertEqual(compositor.orderedSurfaces.count, 1)
-    }
-
-    func testMobileOSCompositorDispatchesTouchToTopSurface() {
-        let compositor = MobileOSCompositor()
-        _ = compositor.createSurface(
-            ownerPID: 1,
-            title: "Bottom",
-            frame: MobileOSRect(x: 0, y: 0, width: 200, height: 200),
-            color: MobileOSColor(red: 0, green: 0, blue: 0)
-        )
-        let top = compositor.createSurface(
-            ownerPID: 2,
-            title: "Top",
-            frame: MobileOSRect(x: 40, y: 40, width: 200, height: 200),
-            color: MobileOSColor(red: 255, green: 0, blue: 0)
-        )
-
-        let dispatch = compositor.dispatchTouch(TouchEvent(x: 80, y: 80, isDown: true))
-
-        XCTAssertEqual(dispatch.targetSurfaceID, top.id)
-        XCTAssertEqual(dispatch.targetPID, 2)
-    }
-
-    func testMobileOSCompositorBringToFrontUpdatesTouchTarget() {
-        let compositor = MobileOSCompositor()
-        let bottom = compositor.createSurface(
-            ownerPID: 1,
-            title: "Bottom",
-            frame: MobileOSRect(x: 0, y: 0, width: 200, height: 200),
-            color: MobileOSColor(red: 0, green: 0, blue: 0)
-        )
-        let top = compositor.createSurface(
-            ownerPID: 2,
-            title: "Top",
-            frame: MobileOSRect(x: 40, y: 40, width: 200, height: 200),
-            color: MobileOSColor(red: 255, green: 0, blue: 0)
-        )
-
-        XCTAssertEqual(compositor.dispatchTouch(TouchEvent(x: 80, y: 80, isDown: true)).targetSurfaceID, top.id)
-
-        XCTAssertEqual(compositor.bringToFront(surfaceID: bottom.id), bottom)
-
-        XCTAssertEqual(compositor.orderedSurfaces.last?.id, bottom.id)
-        XCTAssertEqual(compositor.dispatchTouch(TouchEvent(x: 80, y: 80, isDown: true)).targetSurfaceID, bottom.id)
-    }
-
-    func testMobileOSKernelBootIsDisabled() throws {
-        let machine = try MachineFactory.makeResearchMachine()
-
-        XCTAssertThrowsError(try MobileOSKernel().boot(on: machine)) { error in
-            guard case VMError.unsupportedGuest = error else {
-                XCTFail("expected unsupportedGuest, got \(error)")
-                return
-            }
-        }
-    }
-
-    func testMobileOSUnixSyscallsUseFileDescriptors() throws {
-        let unix = MobileOSUnixEnvironment()
-        let pid = try unix.spawn(executable: "/bin/msh", argv: ["msh"])
-
-        let created = try unix.syscall(
-            pid: pid,
-            MobileOSSyscall(number: .open, path: "/tmp/hello.txt", flags: [.create, .readWrite, .truncate])
-        )
-        XCTAssertTrue(created.succeeded)
-
-        let fd = MobileOSFileDescriptor(created.returnValue)
-        let write = try unix.syscall(
-            pid: pid,
-            MobileOSSyscall(number: .write, fileDescriptor: fd, text: "hello unix")
-        )
-        XCTAssertEqual(write.returnValue, 10)
-        XCTAssertTrue(try unix.syscall(pid: pid, MobileOSSyscall(number: .close, fileDescriptor: fd)).succeeded)
-
-        let opened = try unix.syscall(pid: pid, MobileOSSyscall(number: .open, path: "/tmp/hello.txt", flags: [.readOnly]))
-        let read = try unix.syscall(
-            pid: pid,
-            MobileOSSyscall(number: .read, fileDescriptor: MobileOSFileDescriptor(opened.returnValue), byteCount: 64)
-        )
-
-        XCTAssertEqual(read.text, "hello unix")
-    }
-
-    func testMobileOSUnixPipesAndProcessLifecycle() throws {
-        let unix = MobileOSUnixEnvironment()
-        let pid = try unix.spawn(executable: "/bin/msh", argv: ["msh"])
-
-        let pipe = try unix.syscall(pid: pid, MobileOSSyscall(number: .pipe))
-        XCTAssertEqual(pipe.fileDescriptors.count, 2)
-        XCTAssertEqual(try unix.syscall(
-            pid: pid,
-            MobileOSSyscall(number: .write, fileDescriptor: pipe.fileDescriptors[1], text: "through-pipe")
-        ).returnValue, 12)
-        XCTAssertEqual(try unix.syscall(
-            pid: pid,
-            MobileOSSyscall(number: .read, fileDescriptor: pipe.fileDescriptors[0], byteCount: 64)
-        ).text, "through-pipe")
-
-        let fork = try unix.syscall(pid: pid, MobileOSSyscall(number: .fork))
-        let childPID = try XCTUnwrap(fork.pid)
-        XCTAssertTrue(try unix.syscall(pid: childPID, MobileOSSyscall(number: .execve, path: "/bin/true", argv: ["true"])).succeeded)
-        XCTAssertTrue(try unix.syscall(pid: childPID, MobileOSSyscall(number: .exit, exitStatus: 7)).succeeded)
-
-        let waited = try unix.syscall(pid: pid, MobileOSSyscall(number: .wait4))
-        XCTAssertEqual(waited.pid, childPID)
-        XCTAssertEqual(waited.text, "7")
-    }
-
-    func testMobileOSUnixPTYRunsShellCommands() throws {
-        let unix = MobileOSUnixEnvironment()
-        let session = try unix.openPTY()
-        let banner = try unix.readPTY(id: session.id)
-        XCTAssertTrue(banner.contains("MobileOS UNIX tty0"))
-
-        try unix.writePTY(id: session.id, input: "pwd\ncd /tmp\npwd\n")
-        let output = try unix.readPTY(id: session.id)
-
-        XCTAssertTrue(output.contains("/home/mobile"))
-        XCTAssertTrue(output.contains("/tmp"))
-        XCTAssertEqual(unix.report.ptySessions.first?.foregroundPID, session.foregroundPID)
-        XCTAssertEqual(
-            unix.report.processes.first { $0.pid == session.foregroundPID }?.openFileDescriptors,
-            [0, 1, 2]
-        )
-    }
-
     func testBootConfigurationRendersDevices() throws {
         let machine = try MachineFactory.makeResearchMachine()
         let config = try ToyUARTGuestAdapter().load(into: machine.vm)
@@ -8006,26 +7792,27 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(linuxPlan?.warnings, ["adapter can prepare VM state; full guest execution awaits Linux-grade MMU/device/interrupt completeness"])
     }
 
-    func testBootAdapterRegistryDisablesMobileOSImage() {
+    func testBootAdapterRegistryExcludesRemovedJavaScriptOS() {
         let plans = BootAdapterRegistry.plans(for: [])
-        let mobilePlan = plans.first { $0.adapter.identifier == "mobile-os-image" }
 
-        XCTAssertEqual(mobilePlan?.matchesArtifacts, true)
-        XCTAssertEqual(mobilePlan?.adapter.status, .disabled)
-        XCTAssertEqual(mobilePlan?.canLaunchNow, false)
-        XCTAssertTrue(mobilePlan?.findings.contains(RuntimeDirection.javascriptMobileOSDisabledReason) == true)
+        XCTAssertFalse(plans.contains { $0.adapter.identifier == "mobile-os-image" })
+        XCTAssertTrue(plans.contains { $0.adapter.identifier == "linux-direct" })
+        XCTAssertTrue(plans.contains { $0.adapter.identifier == "toy-uart" && $0.canLaunchNow })
     }
 
-    func testMobileOSImageArtifactClassification() {
-        let artifact = BootArtifactDescriptor(name: "MobileOS.mosimg", byteCount: 4096)
+    func testRemovedJavaScriptOSArtifactsAreNotBootable() {
+        for name in ["MobileOS.mosimg", "demo.mobileos", "mail.app.js", "mail.mobile.js"] {
+            let artifact = BootArtifactDescriptor(name: name, byteCount: 4096)
 
-        XCTAssertEqual(artifact.kind, .mobileOSImage)
+            XCTAssertEqual(artifact.kind, .unknown, name)
+            XCTAssertTrue(BootAdapterRegistry.plans(for: [artifact]).allSatisfy { !$0.canLaunchNow }, name)
+        }
     }
 
-    func testMobileOSAppBundleClassification() {
-        let artifact = BootArtifactDescriptor(name: "mail.app.js", byteCount: 512)
-
-        XCTAssertEqual(artifact.kind, .mobileAppBundle)
+    func testJSONArtifactsAreMetadataNotJavaScriptApps() {
+        for name in ["apps.json", "mobile.json", "manifest.json"] {
+            XCTAssertEqual(BootArtifactClassifier.classify(name: name), .metadataManifest, name)
+        }
     }
 
     func testBootPlansRejectRestrictedArtifactsAcrossAdapters() {
