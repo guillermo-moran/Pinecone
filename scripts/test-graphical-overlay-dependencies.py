@@ -17,9 +17,10 @@ spec.loader.exec_module(fixtures)
 
 OVERLAYS = {
     "WLROOTS": ("wlroots0.20", "0.20.2-r6", "pinecone-wlroots"),
-    "PHOC": ("phoc", "0.57.0-r7", "pinecone-phoc"),
-    "PHOSH": ("phosh", "0.57.0-r8", "pinecone-phosh"),
+    "PHOC": ("phoc", "0.57.0-r8", "pinecone-phoc"),
+    "PHOSH": ("phosh", "0.57.0-r9", "pinecone-phosh"),
     "SETTINGS": ("gnome-control-center", "50.4-r2", "pinecone-gnome-control-center"),
+    "TEXT_EDITOR": ("gnome-text-editor", "50.1-r1", "pinecone-gnome-text-editor"),
     "GLIB": ("glib", "2.88.3-r1", "pinecone-glib"),
     "MUSL": ("musl", "1.2.6-r10", "pinecone-musl"),
 }
@@ -53,6 +54,7 @@ class OverlayTests(unittest.TestCase):
         shutil.copyfile(fixtures.STAGE, self.stage)
         (self.repo / "scripts/rootfs").symlink_to(fixtures.ASSETS, target_is_directory=True)
         self.env = dict(self.fixture.env)
+        self.env["PINECONE_USE_PATCHED_TEXT_EDITOR"] = "0"
         # The older browser fixtures exercise metadata only. Give their pinned
         # library a real file for the new post-extraction SONAME guard.
         base = self.cache / "base+libs-1-r0.apk"
@@ -105,6 +107,31 @@ class OverlayTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.dest / "overlay/musl").read_text(), "1.2.6-r8")
 
+    def test_text_editor_default_and_opt_out_preserve_stock_pin(self):
+        self.selection.write_text(self.selection.read_text() +
+                                  "community|gnome-text-editor|50.1-r0\n")
+        apk(self.cache, "gnome-text-editor", "50.1-r0",
+            files={"overlay/stock-editor": "50.1-r0"})
+        self.overlay("TEXT_EDITOR", ("so:libexisting.so.1",))
+        self.env.pop("PINECONE_USE_PATCHED_TEXT_EDITOR")
+        result = self.run_stage()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.dest / "overlay/gnome-text-editor").read_text(), "50.1-r1")
+        self.assertFalse((self.dest / "overlay/stock-editor").exists())
+        before = self.selection.read_bytes()
+        shutil.rmtree(self.dest)
+        self.dest.mkdir()
+        self.env["PINECONE_USE_PATCHED_TEXT_EDITOR"] = "0"
+        result = self.run_stage()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.dest / "overlay/gnome-text-editor").exists())
+        self.assertEqual((self.dest / "overlay/stock-editor").read_text(), "50.1-r0")
+        self.assertEqual(self.selection.read_bytes(), before)
+
+    def test_default_text_editor_requires_built_overlay(self):
+        self.env.pop("PINECONE_USE_PATCHED_TEXT_EDITOR")
+        self.assert_rejected("Missing Pinecone overlay:")
+
     def test_unknown_musl_version_rejected_before_extraction(self):
         self.env["PINECONE_USE_PATCHED_MUSL"] = "1"
         self.env["PINECONE_MUSL_PACKAGE_VERSION"] = "unexpected"
@@ -122,7 +149,7 @@ class OverlayTests(unittest.TestCase):
         self.assertTrue(selected.startswith(self.fixture.pin))
         self.assertIn("community|overlay-lib|1-r0\n", selected)
         self.assertIn("community|transitive-lib|1-r0\n", selected)
-        self.assertEqual((self.dest / "overlay/phoc").read_text(), "0.57.0-r7")
+        self.assertEqual((self.dest / "overlay/phoc").read_text(), "0.57.0-r8")
         self.assertEqual(self.run_stage().returncode, 0)
         self.assertEqual(self.selection.read_text(), selected)
 

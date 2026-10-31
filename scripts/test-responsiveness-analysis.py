@@ -12,6 +12,12 @@ analysis = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(analysis)
 
 
+def checkpoint(pid=1, total=1, creates=1):
+    return (f"pinecone-pixman-shm: pid={pid} total={total} creates={creates} initial_bytes=16 "
+            "updates=0 update_bytes=0 empty_updates=0 direct_draws=0 invalid=0 "
+            "budget_rejects=0 alloc_failures=0 update_rejects=0 releases=0\n")
+
+
 class ResponsivenessAnalysisTests(unittest.TestCase):
     def test_empty_and_invalid_distributions(self):
         self.assertEqual(analysis.distribution([-1, float("nan")]), {"count": 0})
@@ -31,6 +37,49 @@ class ResponsivenessAnalysisTests(unittest.TestCase):
         result = analysis.summarize({"hotPCs": [{"pc": "0x1234"}, {"pc": "0x2000"}]}, uart)
         self.assertEqual(result["hotspots"][0]["candidates"][0]["fileOffset"], "0x4234")
         self.assertEqual(result["hotspots"][1]["candidates"], [])
+
+    def test_checkpoints_not_summed(self):
+        result = analysis.snapshot_counters(checkpoint() + checkpoint(total=2) + checkpoint(pid=2))
+        self.assertEqual(result[1]["creates"], 1)
+        self.assertEqual(result[1]["total"], 2)
+        self.assertEqual(len(result), 2)
+
+    def test_resets_and_truncation_rejected(self):
+        with self.assertRaises(ValueError):
+            analysis.snapshot_counters(checkpoint(total=2) + checkpoint())
+        with self.assertRaises(ValueError):
+            analysis.snapshot_counters(checkpoint(creates=2) + checkpoint(total=2))
+        with self.assertRaises(ValueError):
+            analysis.snapshot_counters(checkpoint().replace(" releases=0", ""))
+
+    def test_input_clock_and_phase_separation(self):
+        result = analysis.input_admission({"inputAttribution": [
+            {"phase": "down", "captureNanoseconds": 1000000, "queuedNanoseconds": 2000000,
+             "injectedNanoseconds": 5000000, "disposition": "expiredUncorrelated"},
+            {"phase": "up", "queuedNanoseconds": 7000000, "disposition": "queued"},
+            {"phase": "move", "captureNanoseconds": 10000000, "queuedNanoseconds": 100,
+             "injectedNanoseconds": 99, "disposition": "coalesced"}]})
+        self.assertEqual(result["hostPhases"]["down"]["captureToQueueMs"]["p50Ms"], 1)
+        self.assertEqual(result["hostPhases"]["down"]["queueToInjectionMs"]["p50Ms"], 3)
+        self.assertEqual(result["hostPhases"]["up"]["queueToInjectionMs"]["count"], 0)
+        self.assertEqual(result["hostPhases"]["move"]["queueToInjectionMs"]["count"], 0)
+
+    def test_guest_identity_duplicates_and_conflicts(self):
+        event = {"event": "touch", "version": 2, "epoch": 2**63, "inputSequence": 1,
+                 "phase": "down", "guestUs": 12}
+        self.assertEqual(analysis.input_admission({"guestGraphics": [event, event]})["guestPhases"], {"down": 1})
+        result = analysis.input_admission({"guestGraphics": [event, {**event, "guestUs": 13}]})
+        self.assertEqual(result["guestPhases"], {})
+        self.assertEqual(result["conflictingGuestIdentities"], 1)
+
+    def test_validated_guest_stages_keep_wall_and_cpu_separate(self):
+        report = {"guestFrameStages": [
+            {"renderToSubmitMilliseconds": 100, "renderToSubmitCPUMilliseconds": 12},
+            {"renderToSubmitMilliseconds": 50, "renderToSubmitCPUMilliseconds": None}]}
+        stages = analysis.summarize(report)["validatedGuestFrameStages"]
+        self.assertEqual(stages["renderToSubmitMilliseconds"]["count"], 2)
+        self.assertEqual(stages["renderToSubmitCPUMilliseconds"]["p95Ms"], 12)
+        self.assertEqual(stages["submitToCommitMilliseconds"]["count"], 0)
 
 
 if __name__ == "__main__":

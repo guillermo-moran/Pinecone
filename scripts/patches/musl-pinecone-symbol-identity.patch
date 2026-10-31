@@ -1,0 +1,12 @@
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -278,6 +278,9 @@
+ 
+ static int dl_strcmp(const char *l, const char *r)
+ {
++	/* Relocations often refer to the index's original ELF string. No bytes
++	 * need to be read when both names have the same address. */
++	if (l == r) return 0;
+ 	for (; *l==*r && *l; l++, r++);
+ 	return *(unsigned char *)l - *(unsigned char *)r;
+ }

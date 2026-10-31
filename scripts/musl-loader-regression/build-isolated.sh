@@ -7,7 +7,9 @@ ALPINE_PATCHES="${2:?missing Alpine patch directory}"
 WORK="${3:?missing new work directory}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATS="${PINECONE_MUSL_STARTUP_STATS_BUILD:-0}"
+IDENTITY="${PINECONE_MUSL_SYMBOL_IDENTITY:-0}"
 case "$STATS" in 0|1) ;; *) echo "stats build must be 0 or 1" >&2; exit 2 ;; esac
+case "$IDENTITY" in 0|1) ;; *) echo "symbol identity must be 0 or 1" >&2; exit 2 ;; esac
 [[ "$(uname -s)" == Linux && "$(uname -m)" == aarch64 ]] || {
   echo "Requires native Linux/aarch64" >&2; exit 2;
 }
@@ -26,6 +28,9 @@ for name in handle-aux-at_base.patch \
 done
 patch --fuzz=0 -p1 < "$ROOT/patches/musl-pinecone-startup-symbol-cache.patch"
 patch --fuzz=0 -p1 < "$ROOT/patches/musl-pinecone-gnu-hash-reuse.patch"
+if [[ "$IDENTITY" == 1 ]]; then
+  patch --fuzz=0 -p1 < "$ROOT/patches/musl-pinecone-symbol-identity.patch"
+fi
 cd "$WORK/build"
 flags="-O2"
 [[ "$STATS" == 0 ]] || flags="$flags -DPINECONE_MUSL_STARTUP_STATS=1"

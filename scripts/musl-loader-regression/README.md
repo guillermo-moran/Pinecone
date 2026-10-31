@@ -13,8 +13,9 @@ unchanged. The reverted r7 eager-index removal is not repeated.
 Build packages with `PINECONE_MUSL_STARTUP_STATS_BUILD=1` using
 `scripts/build-pinecone-musl.sh`. Instrumented packages go to
 `artifacts/alpine-packages/pinecone-musl-stats/aarch64`; normal packages go to
-`artifacts/alpine-packages/pinecone-musl/aarch64`. Both use release r8 and must not
-be confused. Package output in the builder is also separated by variant.
+`artifacts/alpine-packages/pinecone-musl/aarch64`. Both use the builder's current
+package release and must not be confused. Package output in the builder is also
+separated by variant.
 
 Only the instrumented build recognizes `PINECONE_MUSL_STARTUP_STATS=1` at runtime.
 Unset, `0`, or any other value is silent. Secure execution ignores the setting.
@@ -201,3 +202,23 @@ Packaged loader SHA-256:
 The pinned Alpine security patches and package signature checks remain enabled.
 See `docs/phosh-graphics-priority-profile.md` for Simulator results and limitations;
 native loader tests alone are not evidence of improved UI latency.
+
+### r11 Identity Experiment (Not Promoted)
+
+`PINECONE_MUSL_SYMBOL_IDENTITY=1` enables the comparator's equal-pointer fast
+path in both the package builder (r11) and isolated builder. It is off by
+default: normal builds and graphical staging remain on r10. Explicitly staging
+the experiment requires `PINECONE_MUSL_PACKAGE_VERSION=1.2.6-r11`.
+
+The isolated and signed loaders pass the semantic matrix. Test the actual
+patched comparator with:
+
+```sh
+python3 scripts/musl-loader-regression/test-symbol-identity.py /path/to/source/ldso/dynlink.c
+```
+
+The host test uses UBSan, distinct/identical strings, high bytes, prefixes, and
+protected pages. Simulator Settings launches were inconsistent: r10 took
+33.101/38.830 seconds; r11 took 24.612/57.159 seconds. The promising first result
+did not replicate, so this is not an accepted responsiveness optimization.
+See the 2026-10-30 section of `docs/phosh-graphics-priority-profile.md`.

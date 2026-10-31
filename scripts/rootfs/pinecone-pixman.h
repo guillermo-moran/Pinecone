@@ -14,6 +14,20 @@ pixman_image_t *pinecone_pixman_create_bits(
     int clear
 );
 
+/* Copy a committed ARGB/XRGB SHM buffer into independently owned storage.
+ * Caller must hold its source READ scope through this call. NULL leaves the
+ * caller's source untouched and requires the original renderer path. */
+pixman_image_t *pinecone_pixman_snapshot_bits(
+    pixman_format_code_t format, int width, int height,
+    const void *data, size_t stride);
+
+/* Update only damaged pixels in a private snapshot; waits for its GPU users.
+ * rectangles is an array of Pixman box32 records (x1,y1,x2,y2 int32 values).
+ * All rectangles are checked before writing. Failure leaves the image unchanged.
+ * Caller holds source READ access and exclusive ownership of the texture. */
+int pinecone_pixman_update_snapshot(pixman_image_t *image,
+    const void *data, size_t stride, const void *rectangles, int count);
+
 void pinecone_pixman_begin_cpu_access(void);
 /* flags: bit 0 reads, bit 1 writes. End every successful begin scope. */
 void pinecone_pixman_begin_cpu_access_flags(uint32_t flags);

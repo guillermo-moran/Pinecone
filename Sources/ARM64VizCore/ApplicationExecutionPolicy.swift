@@ -42,6 +42,11 @@ public struct ApplicationExecutionPolicy: Sendable {
         case ignored, requested, presented, ended
     }
 
+    public struct PacingSuppression: Equatable, Sendable {
+        public let primary: Bool
+        public let secondary: Bool
+    }
+
     private struct Launch: Sendable {
         let identity: ApplicationLaunchEvent
         let requestedAt: UInt64
@@ -72,11 +77,27 @@ public struct ApplicationExecutionPolicy: Sendable {
     public var pendingCount: Int { pending.count }
 
     public mutating func isLatencySensitive(at now: UInt64) -> Bool {
+        pacingSuppression(at: now).secondary
+    }
+
+    /// A slow first frame must not be treated as idle work after the short
+    /// high-throughput quantum expires. Keep normal quanta, but suppress host
+    /// duty-cycle sleeps until presentation or the bounded lifecycle deadline.
+    public mutating func isAwaitingPresentation(at now: UInt64) -> Bool {
+        pacingSuppression(at: now).primary
+    }
+
+    /// Sample both decisions against the same lifecycle state and host time.
+    /// Extended primary execution does not extend secondary or quantum boosts.
+    public mutating func pacingSuppression(at now: UInt64) -> PacingSuppression {
         expire(at: now)
-        return pending.contains {
-            !$0.observedPresentation && now >= $0.requestedAt &&
-                now - $0.requestedAt < watchdogNanoseconds
+        var primary = false
+        var secondary = false
+        for launch in pending where !launch.observedPresentation {
+            primary = true
+            secondary = secondary || now - launch.requestedAt < watchdogNanoseconds
         }
+        return PacingSuppression(primary: primary, secondary: secondary)
     }
 
     /// Terminal callbacks are token-scoped. A late failure never cancels a newer
@@ -128,7 +149,7 @@ public struct ApplicationExecutionPolicy: Sendable {
 
         case .applicationPresented(let appID):
             guard ApplicationLaunchEvent.validID(appID), let index = pending.firstIndex(where: {
-                $0.identity.appIDs.contains(appID)
+                !$0.observedPresentation && $0.identity.appIDs.contains(appID)
             }) else { return .ignored }
             // GIO's D-Bus callback can arrive after the first actual frame.
             // Keep that evidence, but do not confuse it with launch success.

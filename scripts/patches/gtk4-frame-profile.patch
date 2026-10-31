@@ -1,0 +1,107 @@
+--- /dev/null
++++ b/gsk/pineconeframeprivate.h
+@@ -0,0 +1,12 @@
++/* Optional diagnostic-only hooks. No pixel, damage, or ownership changes. */
++#ifndef PINECONE_FRAME_PRIVATE_H
++#define PINECONE_FRAME_PRIVATE_H
++extern void pinecone_gtk_frame_mark (const char *, int)
++  __attribute__((weak, visibility("default")));
++#define PINECONE_FRAME_MARK(stage, entering) \
++  G_STMT_START { \
++    if (pinecone_gtk_frame_mark) \
++      pinecone_gtk_frame_mark (stage, entering); \
++  } G_STMT_END
++#endif
++
+--- a/gsk/gskrenderer.c
++++ b/gsk/gskrenderer.c
+@@ -33,6 +33,7 @@
+ #include "config.h"
+ 
+ #include "gskrendererprivate.h"
++#include "pineconeframeprivate.h"
+ 
+ #include "gskcairorenderer.h"
+ #include "gskdebugprivate.h"
+@@ -473,7 +474,9 @@
+     }
+   else
+     {
++      PINECONE_FRAME_MARK ("gsk_diff", 1);
+       gsk_render_node_diff (priv->prev_node, root, &(GskDiffData) { clip, NULL, priv->surface });
++      PINECONE_FRAME_MARK ("gsk_diff", 0);
+     }
+ 
+   renderer_class->render (renderer, root, clip);
+--- a/gsk/gskcairorenderer.c
++++ b/gsk/gskcairorenderer.c
+@@ -21,6 +21,7 @@
+ #include "config.h"
+ 
+ #include "gskcairorenderer.h"
++#include "pineconeframeprivate.h"
+ 
+ #include "gskdebugprivate.h"
+ #include "gskrendererprivate.h"
+@@ -155,6 +156,7 @@
+   const graphene_rect_t *opaque;
+   cairo_t *cr;
+ 
++  PINECONE_FRAME_MARK ("cairo_begin", 1);
+   if (gsk_render_node_get_opaque_rect (root, &opaque_tmp))
+     opaque = &opaque_tmp;
+   else
+@@ -167,6 +169,7 @@
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   cr = gdk_cairo_context_cairo_create (self->cairo_context);
+ G_GNUC_END_IGNORE_DEPRECATIONS
++  PINECONE_FRAME_MARK ("cairo_begin", 0);
+ 
+   g_return_if_fail (cr != NULL);
+ 
+@@ -184,11 +187,15 @@
+       cairo_restore (cr);
+     }
+ 
++  PINECONE_FRAME_MARK ("cairo_draw", 1);
+   gsk_render_node_draw_with_color_state (root, cr, gdk_draw_context_get_color_state (GDK_DRAW_CONTEXT (self->cairo_context)));
++  PINECONE_FRAME_MARK ("cairo_draw", 0);
+ 
++  PINECONE_FRAME_MARK ("cairo_end", 1);
+   cairo_destroy (cr);
+ 
+   gdk_draw_context_end_frame_full (GDK_DRAW_CONTEXT (self->cairo_context), NULL);
++  PINECONE_FRAME_MARK ("cairo_end", 0);
+ }
+ 
+ static void
+--- a/gsk/gsktexturenode.c
++++ b/gsk/gsktexturenode.c
+@@ -19,6 +19,7 @@
+ #include "config.h"
+ 
+ #include "gsktexturenode.h"
++#include "pineconeframeprivate.h"
+ 
+ #include "gskrendernodeprivate.h"
+ #include "gskrectprivate.h"
+@@ -144,7 +145,9 @@
+       return;
+     }
+ 
++  PINECONE_FRAME_MARK ("texture_download", 1);
+   surface = gdk_texture_download_surface (self->texture, data->ccs);
++  PINECONE_FRAME_MARK ("texture_download", 0);
+   pattern = cairo_pattern_create_for_surface (surface);
+   cairo_pattern_set_extend (pattern, CAIRO_EXTEND_PAD);
+ 
+@@ -185,7 +188,9 @@
+     return;
+ 
+   sub = cairo_region_create ();
++  PINECONE_FRAME_MARK ("texture_diff", 1);
+   gdk_texture_diff (self1->texture, self2->texture, sub);
++  PINECONE_FRAME_MARK ("texture_diff", 0);
+   gdk_cairo_region_union_affine (data->region,
+                                  sub,
+                                  node1->bounds.size.width / gdk_texture_get_width (self1->texture),

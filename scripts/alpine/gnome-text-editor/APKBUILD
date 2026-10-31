@@ -1,0 +1,49 @@
+# Alpine 50.1 source/recipe with Pinecone's literal display-path fix.
+maintainer="team/gnome <achill@achill.org>"
+pkgname=gnome-text-editor
+pkgver=50.1
+pkgrel=1
+pkgdesc="A simple text editor for GNOME"
+url="https://apps.gnome.org/TextEditor"
+arch="aarch64"
+license="GPL-3.0-or-later"
+makedepends="
+	desktop-file-utils
+	editorconfig-dev
+	enchant2-dev
+	glib-dev
+	gtk4.0-dev
+	gtksourceview5-dev
+	itstool
+	libadwaita-dev
+	libspelling-dev
+	meson
+	"
+checkdepends="appstream appstream-glib"
+subpackages="$pkgname-doc $pkgname-lang"
+source="
+	https://gitlab.gnome.org/GNOME/gnome-text-editor/-/archive/$pkgver/gnome-text-editor-$pkgver.tar.gz
+	editor-path-literal.patch
+	"
+
+build() {
+	# Upstream bounds APIs to GLib 2.80, GTK 4.20, Adwaita 1.8 and SourceView 5.16.
+	abuild-meson \
+		-Db_lto=true \
+		-Dbugreport_url="https://gitlab.alpinelinux.org/alpine/aports/-/issues" \
+		. output
+	meson compile -C output -j "${PINECONE_TEXT_EDITOR_JOBS:-4}"
+}
+
+check() {
+	meson test --no-rebuild --print-errorlogs -C output
+}
+
+package() {
+	DESTDIR="$pkgdir" meson install --no-rebuild -C output
+}
+
+sha512sums="
+2a2dbe8de9a32fb003efad9bd9715f4af663a0a153eb35b0cc36bccbdbce0678ba85dce0782c1234d9c4d95d7815aa57a6d01c7d7e92a30f310cef6ff2d4c90f  gnome-text-editor-50.1.tar.gz
+344afa5cc857d4cace050259632ea6c556af3071e762d6075da12ac6562e747316aff2212240ca270c3010ab1280464405d4b7de48266fbdb4cbc020c13a06fc  editor-path-literal.patch
+"

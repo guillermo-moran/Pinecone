@@ -47,6 +47,64 @@ final class ApplicationExecutionPolicyTests: XCTestCase {
         return Array("\u{1e}PINECONE_APP_LIFECYCLE ".utf8) + Array(try JSONEncoder().encode(event)) + [10]
     }
 
+    func testPrimaryAndSecondaryPacingHaveIndependentBoundedWindows() {
+        var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100,
+                                                lifecycleRetentionNanoseconds: 1_000)
+        XCTAssertEqual(policy.pacingSuppression(at: 0), .init(primary: false, secondary: false))
+        policy.handle(event(), at: 10)
+        XCTAssertEqual(policy.pacingSuppression(at: 109), .init(primary: true, secondary: true))
+        XCTAssertEqual(policy.pacingSuppression(at: 110), .init(primary: true, secondary: false))
+        policy.handle(event(.launched), at: 900)
+        XCTAssertEqual(policy.pacingSuppression(at: 1_009), .init(primary: true, secondary: false))
+        XCTAssertEqual(policy.pacingSuppression(at: 1_010), .init(primary: false, secondary: false))
+        policy.handle(event(), at: 1_011)
+        XCTAssertEqual(policy.pacingSuppression(at: 1_011), .init(primary: false, secondary: false))
+    }
+
+    func testOverlappingPresentationsConsumeDistinctPendingLaunches() {
+        var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100)
+        policy.handle(event(), at: 10)
+        policy.handle(event(.requested, "second"), at: 20)
+        XCTAssertEqual(policy.handle(.applicationPresented("editor-window"), at: 30), .ignored)
+        policy.handle(event(.launched, "second"), at: 40)
+        XCTAssertEqual(policy.handle(.applicationPresented("editor-window"), at: 50), .presented)
+        XCTAssertEqual(policy.pendingCount, 1)
+        XCTAssertEqual(policy.pacingSuppression(at: 50), .init(primary: false, secondary: false))
+        XCTAssertEqual(policy.handle(event(.launched), at: 60), .presented)
+        XCTAssertEqual(policy.pendingCount, 0)
+    }
+
+    func testNewLaunchBoostDoesNotRenewOlderPrimaryDeadline() {
+        var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100,
+                                                lifecycleRetentionNanoseconds: 1_000)
+        policy.handle(event(), at: 10)
+        policy.handle(event(.requested, "second"), at: 950)
+        XCTAssertEqual(policy.pacingSuppression(at: 1_010), .init(primary: true, secondary: true))
+        XCTAssertEqual(policy.pendingCount, 1)
+        XCTAssertEqual(policy.pacingSuppression(at: 1_050), .init(primary: true, secondary: false))
+        policy.handle(event(.cancelled, "second"), at: 1_051)
+        XCTAssertEqual(policy.pacingSuppression(at: 1_051), .init(primary: false, secondary: false))
+    }
+
+    func testPrimarySuppressionEndsOnAllTerminalPathsAfterShortBoost() {
+        for terminal in [event(.failed), event(.cancelled), .applicationPresented("editor-window")] {
+            var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100)
+            policy.handle(event(), at: 10)
+            policy.handle(event(.launched), at: 20)
+            XCTAssertEqual(policy.pacingSuppression(at: 110), .init(primary: true, secondary: false))
+            policy.handle(terminal, at: 120)
+            XCTAssertEqual(policy.pacingSuppression(at: 120), .init(primary: false, secondary: false))
+        }
+        var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100)
+        policy.handle(event(), at: 10)
+        policy.cancelAll()
+        XCTAssertEqual(policy.pacingSuppression(at: 110), .init(primary: false, secondary: false))
+        policy.handle(event(.launched), at: 111)
+        XCTAssertEqual(policy.pacingSuppression(at: 111), .init(primary: false, secondary: false))
+        policy.handle(event(.requested, "second"), at: 200)
+        XCTAssertEqual(policy.pacingSuppression(at: 199), .init(primary: false, secondary: false))
+    }
+
     func testAliasesAndUnrelatedPresentations() {
         var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100)
         XCTAssertEqual(policy.handle(event(), at: 10), .requested)
@@ -68,6 +126,55 @@ final class ApplicationExecutionPolicyTests: XCTestCase {
         XCTAssertTrue(policy.isLatencySensitive(at: 109))
         XCTAssertFalse(policy.isLatencySensitive(at: 110))
         XCTAssertEqual(policy.handle(event(), at: 111), .ignored)
+    }
+
+    func testSlowLaunchSuppressesPacingWithoutExtendingPriorityQuantum() {
+        var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100,
+                                                lifecycleRetentionNanoseconds: 1_000)
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 0))
+        policy.handle(event(), at: 10)
+        policy.handle(event(.launched), at: 20)
+        XCTAssertTrue(policy.isLatencySensitive(at: 109))
+        XCTAssertFalse(policy.isLatencySensitive(at: 110))
+        XCTAssertTrue(policy.isAwaitingPresentation(at: 110))
+        policy.handle(.applicationPresented("unrelated-window"), at: 120)
+        XCTAssertTrue(policy.isAwaitingPresentation(at: 120))
+        XCTAssertEqual(policy.handle(.applicationPresented("editor-window"), at: 800), .presented)
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 800))
+        XCTAssertFalse(policy.isLatencySensitive(at: 800))
+    }
+
+    func testPacingSuppressionEndsOnFailureCancellationTimeoutAndClockRollback() {
+        for phase in [ApplicationLaunchEvent.Phase.failed, .cancelled] {
+            var policy = ApplicationExecutionPolicy()
+            policy.handle(event(), at: 10)
+            XCTAssertTrue(policy.isAwaitingPresentation(at: 20))
+            policy.handle(event(phase), at: 21)
+            XCTAssertFalse(policy.isAwaitingPresentation(at: 21))
+        }
+        var policy = ApplicationExecutionPolicy(watchdogNanoseconds: 100,
+                                                lifecycleRetentionNanoseconds: 1_000)
+        policy.handle(event(), at: 10)
+        policy.handle(event(.launched), at: 900)
+        XCTAssertTrue(policy.isAwaitingPresentation(at: 1_009))
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 1_010))
+        XCTAssertEqual(policy.handle(event(), at: 1_011), .ignored)
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 1_011))
+        policy.handle(event(.requested, "second"), at: 2_000)
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 1_999))
+        policy.handle(event(.requested, "third"), at: 3_000)
+        policy.cancelAll()
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 3_001))
+    }
+
+    func testPresentationBeforeLaunchCallbackEndsPacingSuppression() {
+        var policy = ApplicationExecutionPolicy()
+        policy.handle(event(), at: 10)
+        XCTAssertEqual(policy.handle(.applicationPresented("editor-window"), at: 20), .ignored)
+        XCTAssertEqual(policy.pendingCount, 1)
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 21))
+        XCTAssertEqual(policy.handle(event(.launched), at: 22), .presented)
+        XCTAssertFalse(policy.isAwaitingPresentation(at: 22))
     }
 
     func testLateSettingsPresentationAfterBoostDeadlineForStructuredAndLegacyRequests() {

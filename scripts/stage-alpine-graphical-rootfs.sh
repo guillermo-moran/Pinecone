@@ -119,13 +119,16 @@ if [[ "${PINECONE_USE_PATCHED_WLROOTS:-1}" == "1" ]]; then
   register_overlay wlroots0.20 0.20.2-r6 pinecone-wlroots
 fi
 if [[ "${PROFILE}" != cage && "${PINECONE_USE_PATCHED_PHOC:-1}" == "1" ]]; then
-  register_overlay phoc 0.57.0-r7 pinecone-phoc
+  register_overlay phoc 0.57.0-r8 pinecone-phoc
 fi
 if [[ "${PROFILE}" == phosh && "${PINECONE_USE_PATCHED_PHOSH:-1}" == "1" ]]; then
-  register_overlay phosh 0.57.0-r8 pinecone-phosh
+  register_overlay phosh 0.57.0-r9 pinecone-phosh
 fi
 if [[ "${PROFILE}" == phosh && "${PINECONE_USE_PATCHED_SETTINGS:-1}" == "1" ]]; then
   register_overlay gnome-control-center 50.4-r2 pinecone-gnome-control-center
+fi
+if [[ "${PROFILE}" == phosh && "${PINECONE_USE_PATCHED_TEXT_EDITOR:-1}" == "1" ]]; then
+  register_overlay gnome-text-editor 50.1-r1 pinecone-gnome-text-editor
 fi
 if [[ "${PINECONE_USE_PATCHED_GLIB:-1}" == "1" ]]; then
   register_overlay glib 2.88.3-r1 pinecone-glib
@@ -134,7 +137,7 @@ if [[ "${PINECONE_USE_PATCHED_MUSL:-1}" == "1" ]]; then
   # r10 is the current device-test runtime; retain r8 as an explicit comparison.
   musl_version="${PINECONE_MUSL_PACKAGE_VERSION:-1.2.6-r10}"
   case "${musl_version}" in
-    1.2.6-r8|1.2.6-r10) ;;
+    1.2.6-r8|1.2.6-r10|1.2.6-r11) ;;
     *) echo "Unsupported Pinecone musl package version: ${musl_version}" >&2; exit 1 ;;
   esac
   register_overlay musl "${musl_version}" pinecone-musl

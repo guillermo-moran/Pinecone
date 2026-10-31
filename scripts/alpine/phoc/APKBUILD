@@ -3,7 +3,7 @@
 maintainer="team/phosh <newbie13xd@gmail.com>"
 pkgname=phoc
 pkgver=0.57.0
-pkgrel=7
+pkgrel=8
 pkgdesc="wlroots based Phone compositor for the Phosh shell"
 arch="all"
 url="https://gitlab.gnome.org/World/Phosh/phoc"
@@ -53,6 +53,7 @@ source="
 	wlroots-pinecone-0.20.2.patch.embed
 	wlroots-pinecone-dmabuf.patch.embed
 	wlroots-pinecone-ownership.patch.embed
+	wlroots-pinecone-shm-snapshot.patch.embed
 	"
 replaces="wlroots-phosh"
 builddir="$srcdir/$pkgname-$pkgver"
@@ -66,6 +67,8 @@ prepare() {
 	patch -Np1 < "$srcdir"/wlroots-pinecone-dmabuf.patch.embed \
 		-d subprojects/wlroots-0.20.x
 	patch -Np1 < "$srcdir"/wlroots-pinecone-ownership.patch.embed \
+		-d subprojects/wlroots-0.20.x
+	patch -Np1 < "$srcdir"/wlroots-pinecone-shm-snapshot.patch.embed \
 		-d subprojects/wlroots-0.20.x
 }
 
@@ -101,4 +104,5 @@ edc159fe5cb84bbdc3fc91c766b052d2716bbc43a0410f08fea18db9ac4fa36151828214e0a89c95
 3d6f04c77b8c005e5bd18efc35e323451c3e55c6cbf3be35adb20e1323b2edbec15df44e10da87e06f20e573492b0803dd705b1521e782c1cc3684462db72ef2  wlroots-pinecone-0.20.2.patch.embed
 df08a4eaa3100e43d58051d694651a8660699460a539a535e889918466896d29357136188e1cf98998355e80c8bec4078c94a638abdc7c05c84426b3a66b515b  wlroots-pinecone-dmabuf.patch.embed
 e84376c11d095e5b096214c40cdd9c9938c1f8f7effd5844b077739a8e06265b41051bd37fa345b4cdb3a050ef9688ad5ff3f85109ec1d8510a3263687d56da0  wlroots-pinecone-ownership.patch.embed
+68a124a0daa27e9add0d8f0a5dd3f6455dfc2fb04a12e5678018117adff315c175b7e7339356d2e6b785692a9861b1d28e7a0d7208b80f03520859781c511b98  wlroots-pinecone-shm-snapshot.patch.embed
 "

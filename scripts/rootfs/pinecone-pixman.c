@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include "pinecone-pixel-copy.h"
 
 typedef struct pixman_image pixman_image_t;
 typedef int pixman_bool_t;
@@ -270,7 +271,12 @@ struct pinecone_upload_surface {
     uint32_t width;
     uint32_t height;
     uint32_t pitch;
+    int snapshot_accounted;
 };
+
+static size_t pinecone_snapshot_bytes;
+static const size_t pinecone_snapshot_budget = 16u * 1024u * 1024u;
+pixman_bool_t pixman_image_unref(pixman_image_t *image);
 
 enum pinecone_fallback_reason {
     PINECONE_FALLBACK_OPERATION,
@@ -354,6 +360,8 @@ static int pinecone_register_thread(void) {
 }
 static int pinecone_owned_graphics_fd = -1;
 static int pinecone_packed_a8_enabled = 1;
+static int pinecone_cpu_foreign_fill = 1;
+static int pinecone_cpu_small_composite = 1;
 static uint64_t pinecone_composite_count;
 static uint64_t pinecone_accelerated_count;
 static uint64_t pinecone_accelerated_pixels;
@@ -369,10 +377,20 @@ static uint64_t pinecone_source_copy_bytes;
 static uint64_t pinecone_mask_copy_bytes;
 static uint64_t pinecone_destination_copy_bytes;
 static uint64_t pinecone_copyback_bytes;
+static uint64_t pinecone_cpu_fill_count;
+static uint64_t pinecone_cpu_fill_bytes;
+static uint64_t pinecone_cpu_small_count;
+static uint64_t pinecone_cpu_small_pixels;
 static uint64_t pinecone_source_region_saved_bytes;
 static uint64_t pinecone_source_cache_hits;
 static uint64_t pinecone_mask_cache_hits;
 static uint64_t pinecone_snapshot_hazard_refreshes;
+static uint64_t pinecone_shm_creates, pinecone_shm_initial_bytes;
+static uint64_t pinecone_shm_updates, pinecone_shm_update_bytes, pinecone_shm_empty_updates;
+static uint64_t pinecone_shm_invalid, pinecone_shm_budget_rejects, pinecone_shm_alloc_failures;
+static uint64_t pinecone_shm_update_rejects, pinecone_shm_direct_draws;
+static uint64_t pinecone_shm_releases;
+static uint64_t pinecone_shm_copy_calls;
 static uint64_t pinecone_image_sync_requests;
 static uint64_t pinecone_handle_blocking_waits;
 static const size_t pinecone_spare_budget = 16u * 1024u * 1024u;
@@ -610,11 +628,12 @@ static void pinecone_release_upload_locked(
     upload->fd = -1;
 }
 
-static int pinecone_ensure_upload_locked(
+static int pinecone_ensure_upload_layout_locked(
     struct pinecone_upload_surface *upload,
     int fd,
     uint32_t required_width,
-    uint32_t required_height
+    uint32_t required_height,
+    int exact_dimensions
 ) {
     for (size_t i = 0; i < PINECONE_UPLOAD_COUNT; ++i) {
         if (upload != &pinecone_uploads[i]) continue;
@@ -628,11 +647,16 @@ static int pinecone_ensure_upload_locked(
     }
     pinecone_release_upload_locked(upload);
 
-    uint32_t width = required_width < 64u ? 64u : required_width;
-    uint32_t height = required_height < 64u ? 64u : required_height;
-    if (width > UINT32_MAX - 63u)
+    uint32_t width = required_width;
+    uint32_t height = required_height;
+    if (!exact_dimensions) {
+        width = width < 64u ? 64u : width;
+        height = height < 64u ? 64u : height;
+        if (width > UINT32_MAX - 63u) return 0;
+        width = (width + 63u) & ~63u;
+    }
+    if (!width || !height || width > UINT32_MAX / 4u)
         return 0;
-    width = (width + 63u) & ~63u;
 
     struct pinecone_drm_mode_create_dumb create = {
         .height = height,
@@ -692,6 +716,12 @@ static int pinecone_ensure_upload_locked(
     return 1;
 }
 
+static int pinecone_ensure_upload_locked(struct pinecone_upload_surface *upload,
+    int fd, uint32_t width, uint32_t height)
+{
+    return pinecone_ensure_upload_layout_locked(upload, fd, width, height, 0);
+}
+
 static int pinecone_open_graphics_locked(void) {
     if (pinecone_owned_graphics_fd >= 0)
         return pinecone_owned_graphics_fd;
@@ -712,8 +742,8 @@ static int pinecone_existing_graphics_fd_locked(void) {
     return -1;
 }
 
-static struct pinecone_upload_surface *pinecone_allocate_image_surface_locked(
-    int fd, uint32_t width, uint32_t height
+static struct pinecone_upload_surface *pinecone_allocate_image_surface_layout_locked(
+    int fd, uint32_t width, uint32_t height, int exact_dimensions
 ) {
     if (fd < 0)
         fd = pinecone_existing_graphics_fd_locked();
@@ -726,7 +756,7 @@ static struct pinecone_upload_surface *pinecone_allocate_image_surface_locked(
     if (surface == NULL)
         return NULL;
     surface->fd = -1;
-    if (!pinecone_ensure_upload_locked(surface, fd, width, height) ||
+    if (!pinecone_ensure_upload_layout_locked(surface, fd, width, height, exact_dimensions) ||
         !pinecone_record_mapping_locked(
             surface->address, surface->length, surface->fd, surface->handle)) {
         pinecone_release_upload_locked(surface);
@@ -740,11 +770,21 @@ static struct pinecone_upload_surface *pinecone_allocate_image_surface_locked(
     return surface;
 }
 
+static struct pinecone_upload_surface *pinecone_allocate_image_surface_locked(
+    int fd, uint32_t width, uint32_t height)
+{
+    return pinecone_allocate_image_surface_layout_locked(fd, width, height, 0);
+}
+
 static void pinecone_release_image_surface_locked(
     struct pinecone_upload_surface *surface
 ) {
     if (surface == NULL)
         return;
+    if (surface->snapshot_accounted) {
+        pinecone_snapshot_bytes -= surface->length;
+        __atomic_add_fetch(&pinecone_shm_releases, 1u, __ATOMIC_RELAXED);
+    }
     __atomic_sub_fetch(&pinecone_live_shared_surfaces, 1u, __ATOMIC_RELAXED);
     __atomic_sub_fetch(
         &pinecone_live_shared_bytes, surface->length, __ATOMIC_RELAXED);
@@ -810,30 +850,35 @@ static int pinecone_upload_mask_locked(
         return 0;
     if (pinecone_wait_handle_locked(fd, upload->handle) != 0)
         return 0;
+    /* Scalar A8 coverage is already a supported wire format. Keep it packed;
+     * expanding every glyph to ARGB burns interpreted CPU cycles and writes
+     * four times as much memory. Component-alpha A8 retains the alpha-only
+     * ARGB representation, whose RGB coverage is zero, not replicated alpha. */
+    const int packed_a8 = format == PINECONE_FORMAT_A8 && !component_alpha;
+    const size_t row_bytes = (size_t)width * (packed_a8 ? 1u : 4u);
     for (uint32_t row = 0; row < height; row++) {
         const uint8_t *source_row = source +
             (size_t)(source_y + row) * source_stride;
         uint8_t *destination_row = (uint8_t *)upload->address +
             (size_t)row * upload->pitch;
+        if (packed_a8 || format != PINECONE_FORMAT_A8) {
+            /* Non-component ARGB consumers read only alpha; copying RGB too
+             * is safe and avoids a scalar extraction/expansion loop. */
+            memcpy(destination_row, source_row +
+                (size_t)source_x * (packed_a8 ? 1u : 4u), row_bytes);
+            continue;
+        }
         for (uint32_t column = 0; column < width; column++) {
             uint8_t *destination_pixel =
                 destination_row + (size_t)column * 4u;
-            if (component_alpha && format != PINECONE_FORMAT_A8) {
-                memcpy(destination_pixel,
-                    source_row + (size_t)(source_x + column) * 4u, 4u);
-            } else {
-                uint8_t alpha = format == PINECONE_FORMAT_A8
-                    ? source_row[source_x + column]
-                    : source_row[(size_t)(source_x + column) * 4u + 3u];
-                destination_pixel[0] = 0;
-                destination_pixel[1] = 0;
-                destination_pixel[2] = 0;
-                destination_pixel[3] = alpha;
-            }
+            destination_pixel[0] = 0;
+            destination_pixel[1] = 0;
+            destination_pixel[2] = 0;
+            destination_pixel[3] = source_row[source_x + column];
         }
     }
     __atomic_add_fetch(&pinecone_mask_copy_bytes,
-        (uint64_t)width * height * 4u, __ATOMIC_RELAXED);
+        (uint64_t)row_bytes * height, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -1138,7 +1183,7 @@ static void pinecone_record_composite(
     length = snprintf(line, sizeof(line),
         "pinecone-pixman-copies: pid=%ld total=%llu source_bytes=%llu mask_bytes=%llu destination_bytes=%llu "
         "copyback_bytes=%llu region_saved_bytes=%llu hits(source=%llu mask=%llu) "
-        "hazard_refresh=%llu image_sync=%llu handle_wait=%llu\n",
+        "hazard_refresh=%llu image_sync=%llu handle_wait=%llu cpu_fills=%llu cpu_fill_bytes=%llu cpu_small=%llu cpu_small_pixels=%llu\n",
         (long)getpid(), (unsigned long long)total,
         (unsigned long long)__atomic_load_n(&pinecone_source_copy_bytes, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&pinecone_mask_copy_bytes, __ATOMIC_RELAXED),
@@ -1149,7 +1194,40 @@ static void pinecone_record_composite(
         (unsigned long long)__atomic_load_n(&pinecone_mask_cache_hits, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&pinecone_snapshot_hazard_refreshes, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&pinecone_image_sync_requests, __ATOMIC_RELAXED),
-        (unsigned long long)__atomic_load_n(&pinecone_handle_blocking_waits, __ATOMIC_RELAXED));
+        (unsigned long long)__atomic_load_n(&pinecone_handle_blocking_waits, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_cpu_fill_count, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_cpu_fill_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_cpu_small_count, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_cpu_small_pixels, __ATOMIC_RELAXED));
+    if (length > 0) {
+        size_t count = (size_t)length < sizeof(line) ? (size_t)length : sizeof(line) - 1u;
+        pinecone_syscall6(PINECONE_SYSCALL_WRITE, STDERR_FILENO,
+            (long)line, (long)count, 0, 0, 0);
+        int console = open("/dev/ttyAMA0", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (console >= 0) {
+            pinecone_syscall6(PINECONE_SYSCALL_WRITE, console,
+                (long)line, (long)count, 0, 0, 0);
+            close(console);
+        }
+    }
+
+    length = snprintf(line, sizeof(line),
+        "pinecone-pixman-shm: pid=%ld total=%llu creates=%llu initial_bytes=%llu "
+        "updates=%llu update_bytes=%llu empty_updates=%llu direct_draws=%llu "
+        "invalid=%llu budget_rejects=%llu alloc_failures=%llu update_rejects=%llu releases=%llu copy_calls=%llu\n",
+        (long)getpid(), (unsigned long long)total,
+        (unsigned long long)__atomic_load_n(&pinecone_shm_creates, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_initial_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_updates, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_update_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_empty_updates, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_direct_draws, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_invalid, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_budget_rejects, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_alloc_failures, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_update_rejects, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_releases, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&pinecone_shm_copy_calls, __ATOMIC_RELAXED));
     if (length > 0) {
         size_t count = (size_t)length < sizeof(line) ? (size_t)length : sizeof(line) - 1u;
         pinecone_syscall6(PINECONE_SYSCALL_WRITE, STDERR_FILENO,
@@ -1268,6 +1346,11 @@ static void pinecone_resolve_symbols(void) {
     const char *packed_a8 = getenv("PINECONE_PIXMAN_PACKED_A8");
     pinecone_packed_a8_enabled = packed_a8 == NULL ||
         strcmp(packed_a8, "0") != 0;
+    const char *cpu_foreign_fill = getenv("PINECONE_PIXMAN_CPU_FOREIGN_FILL");
+    pinecone_cpu_foreign_fill = cpu_foreign_fill == NULL ||
+        strcmp(cpu_foreign_fill, "0") != 0;
+    const char *cpu_small = getenv("PINECONE_PIXMAN_CPU_SMALL_COMPOSITE");
+    pinecone_cpu_small_composite = cpu_small == NULL || strcmp(cpu_small, "0") != 0;
     real_get_data = dlsym(RTLD_NEXT, "pixman_image_get_data");
     real_get_stride = dlsym(RTLD_NEXT, "pixman_image_get_stride");
     real_get_width = dlsym(RTLD_NEXT, "pixman_image_get_width");
@@ -2247,6 +2330,22 @@ static int pinecone_enqueue_locked(
     return 1;
 }
 
+static int pinecone_prefer_cpu_composite_locked(
+    pixman_op_t op, const struct pinecone_image_state *source,
+    const struct pinecone_image_state *mask, pixman_format_code_t destination_format,
+    pixman_format_code_t mask_format, uint32_t width, uint32_t height
+) {
+    /* Guest measurements favor CPU for these tiny standalone draws. Do not
+     * split a compositor pass or a batch already amortizing GPU submission.
+     * The normal CPU-return path still fences and invalidates every image. */
+    return pinecone_cpu_small_composite && !pinecone_render_pass_depth &&
+        !pinecone_thread_batch.command_count && op == PINECONE_PIXMAN_OP_OVER &&
+        width && height && (uint64_t)width * height <= 256 &&
+        destination_format == PINECONE_FORMAT_A8R8G8B8 &&
+        source && source->is_solid && !source->unsafe_state &&
+        (!mask || (!mask->unsafe_state && mask_format == PINECONE_FORMAT_A8));
+}
+
 static int pinecone_try_composite(
     pixman_op_t op, pixman_image_t *source, pixman_image_t *mask,
     pixman_image_t *destination, int32_t source_x, int32_t source_y,
@@ -2304,6 +2403,16 @@ static int pinecone_try_composite(
             destination, destination_x, destination_y, width, height)) {
         pthread_mutex_unlock(&pinecone_lock);
         *fallback_reason = PINECONE_FALLBACK_CLIP;
+        return 0;
+    }
+    if ((mask == NULL || mask_state != NULL) &&
+        pinecone_prefer_cpu_composite_locked(op, source_state, mask_state,
+            destination_format, mask ? real_get_format(mask) : 0, width, height)) {
+        __atomic_add_fetch(&pinecone_cpu_small_count, 1u, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&pinecone_cpu_small_pixels, (uint64_t)width * height,
+            __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&pinecone_lock);
+        *fallback_reason = PINECONE_FALLBACK_REASON_COUNT; /* Deliberate routing. */
         return 0;
     }
     struct pinecone_mapping *destination_mapping = pinecone_mapping_for(
@@ -2388,6 +2497,7 @@ static int pinecone_try_composite(
     }
 
     uint32_t source_handle = 0;
+    int direct_snapshot = 0;
     uint32_t solid_color = 0;
     uint32_t flags = 0;
     if (destination_format == PINECONE_FORMAT_A8)
@@ -2469,6 +2579,7 @@ static int pinecone_try_composite(
              source_owned->fd == graphics_fd &&
              source_owned->handle != destination_handle));
         if (source_is_direct) {
+            direct_snapshot = source_owned && source_owned->snapshot_accounted;
             const void *surface_address = source_mapping != NULL
                 ? source_mapping->address : source_owned->address;
             size_t surface_length = source_mapping != NULL
@@ -2660,6 +2771,7 @@ static int pinecone_try_composite(
                 ? mask_mapping->fd
                 : (mask_owned != NULL ? mask_owned->fd : -1);
             if (!pinecone_image_has_cpu_hazard(mask_state, 0) &&
+                !(mask_format == PINECONE_FORMAT_A8 && component_alpha) &&
                 direct_mask_handle != 0 && direct_mask_fd == graphics_fd &&
                 direct_mask_handle != destination_handle &&
                 direct_mask_handle != source_handle &&
@@ -2707,6 +2819,8 @@ static int pinecone_try_composite(
                 __atomic_add_fetch(
                     &pinecone_mask_counts[PINECONE_MASK_UPLOADED],
                     1u, __ATOMIC_RELAXED);
+                if (mask_format == PINECONE_FORMAT_A8 && !component_alpha)
+                    flags |= PINECONE_MASK_PACKED_A8;
             }
         }
     }
@@ -2800,6 +2914,8 @@ static int pinecone_try_composite(
             );
         }
     }
+    if (result == 0 && direct_snapshot)
+        __atomic_add_fetch(&pinecone_shm_direct_draws, 1u, __ATOMIC_RELAXED);
     if (result == 0 && destination_upload != NULL) {
         const size_t row_bytes =
             (size_t)width * destination_bytes_per_pixel;
@@ -2833,7 +2949,7 @@ static int pinecone_try_composite(
 
 static pixman_image_t *pinecone_create_bits_image(
     pixman_format_code_t format, int width, int height, uint32_t *bits,
-    int rowstride_bytes, int clear, int permit_pixman_fallback
+    int rowstride_bytes, int clear, int permit_pixman_fallback, int exact_dimensions
 ) {
     pinecone_resolve();
     pixman_image_t *(*create_image)(
@@ -2853,8 +2969,8 @@ static pixman_image_t *pinecone_create_bits_image(
 
     pthread_mutex_lock(&pinecone_lock);
     struct pinecone_upload_surface *surface =
-        pinecone_allocate_image_surface_locked(
-            -1, (uint32_t)width, (uint32_t)height);
+        pinecone_allocate_image_surface_layout_locked(
+            -1, (uint32_t)width, (uint32_t)height, exact_dimensions);
     pthread_mutex_unlock(&pinecone_lock);
     if (surface == NULL || surface->pitch > INT_MAX) {
         if (surface != NULL) {
@@ -2901,7 +3017,122 @@ pixman_image_t *pinecone_pixman_create_bits(
     pixman_format_code_t format, int width, int height, pixman_bool_t clear
 ) {
     return pinecone_create_bits_image(
-        format, width, height, NULL, 0, clear != 0, 0);
+        format, width, height, NULL, 0, clear != 0, 0, 0);
+}
+
+/* The compositor calls this inside the client's READ scope. Never attach an
+ * ownership lease to foreign SHM: capture its bytes into a private DRM surface
+ * instead, then render that immutable texture without repeated guest uploads. */
+pixman_image_t *pinecone_pixman_snapshot_bits(
+    pixman_format_code_t format, int width, int height,
+    const void *data, size_t stride
+) {
+    if (data == NULL || width <= 0 || height <= 0 ||
+        (format != PINECONE_FORMAT_A8R8G8B8 &&
+         format != PINECONE_FORMAT_X8R8G8B8) ||
+        (size_t)width > SIZE_MAX / 4u || stride < (size_t)width * 4u ||
+        stride > SIZE_MAX / (size_t)height ||
+        (uint64_t)width * (uint64_t)height > pinecone_snapshot_budget / 4u) {
+        __atomic_add_fetch(&pinecone_shm_invalid, 1u, __ATOMIC_RELAXED);
+        return NULL;
+    }
+    pixman_image_t *image = pinecone_create_bits_image(
+        format, width, height, NULL, 0, 0, 0, 1);
+    if (image == NULL) {
+        __atomic_add_fetch(&pinecone_shm_alloc_failures, 1u, __ATOMIC_RELAXED);
+        return NULL;
+    }
+    pthread_mutex_lock(&pinecone_lock);
+    struct pinecone_image_state *state = pinecone_image_state(image, 0);
+    struct pinecone_upload_surface *surface = state ? state->owned_surface : NULL;
+    if (!surface || surface->length > pinecone_snapshot_budget - pinecone_snapshot_bytes) {
+        __atomic_add_fetch(&pinecone_shm_budget_rejects, 1u, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&pinecone_lock);
+        pixman_image_unref(image);
+        return NULL;
+    }
+    surface->snapshot_accounted = 1;
+    pinecone_snapshot_bytes += surface->length;
+    pthread_mutex_unlock(&pinecone_lock);
+    /* This unpublished image has no queued users or exported CPU aliases. */
+    uint8_t *destination = (uint8_t *)real_get_data(image);
+    const size_t destination_stride = (size_t)real_get_stride(image);
+    size_t calls = pinecone_copy_pixel_rows(destination, destination_stride,
+        data, stride, (size_t)width * 4u, (size_t)height);
+    __atomic_add_fetch(&pinecone_shm_copy_calls, calls, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pinecone_source_copy_bytes,
+        (uint64_t)width * (uint64_t)height * 4u, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pinecone_shm_initial_bytes,
+        (uint64_t)width * (uint64_t)height * 4u, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pinecone_shm_creates, 1u, __ATOMIC_RELAXED);
+    return image;
+}
+
+int pinecone_pixman_update_snapshot(pixman_image_t *image,
+    const void *data, size_t stride, const void *rectangles, int count)
+{
+    if (!image || !data || count < 0 || count > 4096 || (count && !rectangles)) {
+        __atomic_add_fetch(&pinecone_shm_update_rejects, 1u, __ATOMIC_RELAXED);
+        return 0;
+    }
+    pinecone_resolve();
+    pthread_mutex_lock(&pinecone_lock);
+    struct pinecone_image_state *state = pinecone_image_state(image, 0);
+    if (!state || !state->owned_surface || !state->owned_surface->snapshot_accounted ||
+        pinecone_image_has_cpu_hazard(state, 1)) {
+        __atomic_add_fetch(&pinecone_shm_update_rejects, 1u, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&pinecone_lock);
+        return 0;
+    }
+    int width = real_get_width(image), height = real_get_height(image);
+    if (width <= 0 || height <= 0 || stride < (size_t)width * 4u ||
+        stride > SIZE_MAX / (size_t)height ||
+        pinecone_ranges_overlap(data, stride * (size_t)height,
+            state->owned_surface->address, state->owned_surface->length)) {
+        __atomic_add_fetch(&pinecone_shm_update_rejects, 1u, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&pinecone_lock);
+        return 0;
+    }
+    /* Validate the complete damage list before modifying any prior contents. */
+    for (int i = 0; i < count; ++i) {
+        pixman_box32_t box;
+        memcpy(&box, (const uint8_t *)rectangles + (size_t)i * sizeof(box), sizeof(box));
+        if (box.x1 < 0 || box.y1 < 0 || box.x2 < box.x1 || box.y2 < box.y1 ||
+            box.x2 > width || box.y2 > height) {
+            __atomic_add_fetch(&pinecone_shm_update_rejects, 1u, __ATOMIC_RELAXED);
+            pthread_mutex_unlock(&pinecone_lock);
+            return 0;
+        }
+    }
+    if (count && pinecone_sync_image_locked(image) != 0) {
+        __atomic_add_fetch(&pinecone_shm_update_rejects, 1u, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&pinecone_lock);
+        return 0;
+    }
+    /* Waiting may unlock/re-enter and rehash the image table. */
+    state = pinecone_image_state(image, 0);
+    uint8_t *destination = (uint8_t *)real_get_data(image);
+    size_t pitch = (size_t)real_get_stride(image);
+    uint64_t copied = 0;
+    for (int i = 0; i < count; ++i) {
+        pixman_box32_t box;
+        memcpy(&box, (const uint8_t *)rectangles + (size_t)i * sizeof(box), sizeof(box));
+        size_t bytes = (size_t)(box.x2 - box.x1) * 4u;
+        if (!bytes || box.y1 == box.y2) continue;
+        size_t calls = pinecone_copy_pixel_rows(
+            destination + (size_t)box.y1 * pitch + (size_t)box.x1 * 4u, pitch,
+            (const uint8_t *)data + (size_t)box.y1 * stride + (size_t)box.x1 * 4u,
+            stride, bytes, (size_t)(box.y2 - box.y1));
+        __atomic_add_fetch(&pinecone_shm_copy_calls, calls, __ATOMIC_RELAXED);
+        copied += (uint64_t)bytes * (uint64_t)(box.y2 - box.y1);
+    }
+    if (copied) pinecone_invalidate_image_locked(state);
+    __atomic_add_fetch(&pinecone_source_copy_bytes, copied, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pinecone_shm_update_bytes, copied, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pinecone_shm_updates, 1u, __ATOMIC_RELAXED);
+    if (!copied) __atomic_add_fetch(&pinecone_shm_empty_updates, 1u, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&pinecone_lock);
+    return 1;
 }
 
 int pinecone_pixman_export_dmabuf(
@@ -2957,7 +3188,7 @@ pixman_image_t *pixman_image_create_bits(
     int rowstride_bytes
 ) {
     return pinecone_create_bits_image(
-        format, width, height, bits, rowstride_bytes, 1, 1);
+        format, width, height, bits, rowstride_bytes, 1, 1, 0);
 }
 
 pixman_image_t *pixman_image_create_bits_no_clear(
@@ -2965,7 +3196,7 @@ pixman_image_t *pixman_image_create_bits_no_clear(
     int rowstride_bytes
 ) {
     return pinecone_create_bits_image(
-        format, width, height, bits, rowstride_bytes, 0, 1);
+        format, width, height, bits, rowstride_bytes, 0, 1, 0);
 }
 
 void pinecone_pixman_created_solid(
@@ -2974,13 +3205,13 @@ void pinecone_pixman_created_solid(
 ) {
     if (image == NULL || color == NULL)
         return;
-    uint32_t alpha = (uint32_t)((color->alpha + 128u) / 257u);
-    uint32_t red = ((uint32_t)color->red * color->alpha + 0x8000u) / 0xffffu;
-    uint32_t green = ((uint32_t)color->green * color->alpha + 0x8000u) / 0xffffu;
-    uint32_t blue = ((uint32_t)color->blue * color->alpha + 0x8000u) / 0xffffu;
-    red = (red + 128u) / 257u;
-    green = (green + 128u) / 257u;
-    blue = (blue + 128u) / 257u;
+    /* Pixman's solid color is already premultiplied. Match color_to_uint32
+     * in pixman-solid-fill.c: take the high byte, without multiplying or
+     * rounding again (including for solid masks). */
+    uint32_t alpha = color->alpha >> 8u;
+    uint32_t red = color->red >> 8u;
+    uint32_t green = color->green >> 8u;
+    uint32_t blue = color->blue >> 8u;
 
     pthread_mutex_lock(&pinecone_lock);
     struct pinecone_image_state *state = pinecone_image_state(image, 1);
@@ -3234,6 +3465,7 @@ pixman_bool_t pixman_fill(
     }
 
     int accelerated = 0;
+    int cpu_direct = 0;
     pthread_mutex_lock(&pinecone_lock);
     struct pinecone_mapping *mapping = pinecone_mapping_for(bits, 1u);
     struct pinecone_mapping mapping_value;
@@ -3241,7 +3473,15 @@ pixman_bool_t pixman_fill(
         mapping_value = *mapping;
         mapping = &mapping_value;
     }
-    if (mapping != NULL) {
+    if (mapping != NULL && bpp == 32 && (filler >> 24u) != 0xffu) {
+        /* pixman_fill writes raw bits, even transparent/non-premultiplied ones.
+         * DRM XRGB normalization cannot represent that contract. Synchronize
+         * all readers of this handle before the exact CPU write. */
+        if (pinecone_flush_and_wait_locked() != 0 ||
+            pinecone_wait_handle_locked(mapping->fd, mapping->handle) != 0)
+            abort();
+        cpu_direct = 1;
+    } else if (mapping != NULL) {
         uintptr_t byte_offset = (uintptr_t)bits - (uintptr_t)mapping->address;
         size_t start_x = byte_offset % row_stride;
         size_t start_y = byte_offset / row_stride;
@@ -3301,7 +3541,7 @@ pixman_bool_t pixman_fill(
         }
         if (!accelerated && pinecone_flush_and_wait_locked() != 0)
             abort(); /* No safe CPU fallback after an unsuccessful fence. */
-    } else if (bpp == 32) {
+    } else if (bpp == 32 && !pinecone_cpu_foreign_fill && (filler >> 24u) == 0xffu) {
         int graphics_fd = pinecone_graphics_fd_locked();
         struct pinecone_upload_surface *upload =
             &pinecone_uploads[PINECONE_UPLOAD_DESTINATION];
@@ -3351,23 +3591,31 @@ pixman_bool_t pixman_fill(
         if (!accelerated && pinecone_flush_and_wait_locked() != 0)
             abort();
     } else {
-        /* CPU-owned A8 scratch buffers have no host resource to target. Wait
-         * for any commands that may feed this Pixman operation before the CPU
-         * fallback writes them. */
+        /* Ordinary CPU buffers have no host resource to fill directly. Avoid
+         * a GPU scratch fill followed by an interpreted memcpy back to RAM.
+         * Preserve the CPU-write barrier before using Pixman's native fill;
+         * eligible registered GPU mappings still take the branch above. */
         if (pinecone_flush_and_wait_locked() != 0)
             abort();
+        cpu_direct = 1;
     }
     pthread_mutex_unlock(&pinecone_lock);
 
+    pixman_bool_t result = accelerated ? 1
+        : real_fill(bits, stride, bpp, x, y, width, height, filler);
+    if (cpu_direct && result) {
+        __atomic_add_fetch(&pinecone_cpu_fill_count, 1u, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&pinecone_cpu_fill_bytes,
+            (uint64_t)(uint32_t)width * (uint32_t)height * bytes_per_pixel,
+            __ATOMIC_RELAXED);
+    }
     pinecone_record_composite(
         PINECONE_PIXMAN_OP_SRC, accelerated,
         accelerated ? PINECONE_FALLBACK_REASON_COUNT
                     : PINECONE_FALLBACK_DESTINATION,
         (uint32_t)width, (uint32_t)height
     );
-    return accelerated
-        ? 1
-        : real_fill(bits, stride, bpp, x, y, width, height, filler);
+    return result;
 }
 
 pixman_bool_t pinecone_pixman_composite(
@@ -3402,6 +3650,7 @@ pixman_bool_t pinecone_pixman_composite(
             abort(); /* Returning false would let Pixman touch unsynced bytes. */
         struct pinecone_image_state *state = pinecone_image_state(destination, 0);
         if (state && state->buffer) pinecone_invalidate_buffer_locked(state->buffer);
+        else if (state) pinecone_invalidate_image_locked(state);
         pthread_mutex_unlock(&pinecone_lock);
     }
     pinecone_record_composite(

@@ -3,7 +3,7 @@
 maintainer="team/phosh <newbyte@postmarketos.org>"
 pkgname=phosh
 pkgver=0.57.0
-pkgrel=8
+pkgrel=9
 pkgdesc="Wayland shell for GNOME on mobile devices"
 arch="all !armhf"
 url="https://gitlab.gnome.org/World/Phosh/phosh"
@@ -79,6 +79,8 @@ source="
 	phosh-pinecone-launcher.patch
 	phosh-pinecone-launcher-polish.patch
 	phosh-pinecone-light-lockscreen.patch
+	phosh-pinecone-window-lifecycle.patch
+	phosh-pinecone-tracker-ownership.patch
 	pinecone-launcher.css
 	"
 builddir="$srcdir/$pkgname-$pkgver"
@@ -91,6 +93,7 @@ prepare() {
 
 build() {
 	abuild-meson \
+		-Dc_args="$CFLAGS -DGLIB_VERSION_MIN_REQUIRED=GLIB_VERSION_2_80 -DGLIB_VERSION_MAX_ALLOWED=GLIB_VERSION_2_88 -Werror=deprecated-declarations" \
 		-Db_lto=true \
 		-Dphoc_tests=disabled \
 		-Dman=true \
@@ -138,5 +141,7 @@ bb941dbcc332698dac3af264dd370b9381d87a2bb7630fd9a6173396962724c03cf6c811923b05d8
 be2c41e9f0105aefbabeb888676f80acf6bfb2fd3438be3b93c3315064c272643b13d895a1a70c954d6dc60649393b248f05d84db083f2c2d86ea3e07d34d489  phosh-pinecone-launcher.patch
 3bf3e40c51706a9de5c10cc8c5104b9146fe7194446fe8f049c848428817807b9859a330f5fadfc290a3aed5adb4fae58360eb5e5cfe960a8a290fde618b7898  phosh-pinecone-launcher-polish.patch
 bedcbfe4a335e01947e9e574dbc397c9a72a3a9cbd436a863a72a222c0e1caa520b031a714f304a2fa9fee89e29961d256b69aa12a26d7167507c2703ece786c  phosh-pinecone-light-lockscreen.patch
+4308c94c51c48f424219b29eab4f099b9d4c1a8ac894c20484b9029ac711f80ec8074ef2ee9f77a067dea139f8bb5ade7fc71a79392d053c279c1847f5382fa2  phosh-pinecone-window-lifecycle.patch
+c40eee6f73c2c5871ea91dd71ca6d63987fe63f05b9808a0177c38bfde021e174dfc107494d81adebfa91c39082734bfea4e2626defe76d4e08774b1205f4082  phosh-pinecone-tracker-ownership.patch
 034adfe5928128df266033689e8ddcc3b52b9e4628062ee67ccff2d94ea02c1528c9f6d057938b7e21bb66b85384c2eb914edab04aa36ad1a507391dc92a5604  pinecone-launcher.css
 "

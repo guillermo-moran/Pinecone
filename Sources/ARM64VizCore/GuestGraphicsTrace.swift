@@ -80,8 +80,8 @@ public struct GuestGraphicsTraceDecoder {
                     }) {
                         events.append(.applicationPresented(String(decoding: bytes, as: UTF8.self)))
                     }
-                } else if !dropping, line.starts(with: Self.launchPrefix) {
-                    let name = String(decoding: line.dropFirst(Self.launchPrefix.count), as: UTF8.self)
+                } else if !dropping, traceLine.starts(with: Self.launchPrefix) {
+                    let name = String(decoding: traceLine.dropFirst(Self.launchPrefix.count), as: UTF8.self)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     if ApplicationLaunchEvent.validID(name) { events.append(.applicationLaunch(name)) }
                 }

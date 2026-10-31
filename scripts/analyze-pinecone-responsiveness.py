@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import re
+from collections import Counter
 from pathlib import Path
 
 
@@ -26,6 +27,61 @@ def mappings_from_uart(text):
         if process and match and "x" in match[3]:
             mappings.append((int(match[1], 16), int(match[2], 16), int(match[4], 16), process, match[5]))
     return mappings
+
+
+def snapshot_counters(text):
+    """Last power-of-two checkpoint per process; never sum cumulative samples."""
+    latest = {}
+    for line in text.splitlines():
+        if not line.startswith("pinecone-pixman-shm: "):
+            continue
+        fields = dict(re.findall(r"(\w+)=(\d+)", line))
+        required = {"pid", "total", "creates", "initial_bytes", "updates", "update_bytes",
+                    "empty_updates", "direct_draws", "invalid", "budget_rejects",
+                    "alloc_failures", "update_rejects", "releases"}
+        if not required <= fields.keys() or fields.keys() - required - {"copy_calls"}:
+            raise ValueError("Incomplete SHM diagnostic record")
+        record = {key: int(value) for key, value in fields.items()}
+        pid = record.pop("pid")
+        previous = latest.get(pid)
+        if previous and any(record[key] < previous[key] for key in record.keys() & previous.keys()):
+            raise ValueError("SHM counters reset: analyze a single VM run")
+        latest[pid] = record
+    return latest
+
+
+def input_admission(report):
+    phases = {}
+    for entry in report.get("inputAttribution", []):
+        phase = entry.get("phase") or "unknown"
+        values = phases.setdefault(phase, {"capture": [], "queue": [], "dispositions": Counter()})
+        values["dispositions"][entry["disposition"]] += 1
+        capture, queued, injected = (entry.get(key) for key in (
+            "captureNanoseconds", "queuedNanoseconds", "injectedNanoseconds"))
+        if capture is not None and queued is not None and queued >= capture:
+            values["capture"].append((queued - capture) / 1e6)
+        if queued is not None and injected is not None and injected >= queued:
+            values["queue"].append((injected - queued) / 1e6)
+    guest = {}
+    conflicts = set()
+    for event in report.get("guestGraphics", []):
+        if event.get("version") != 2 or event.get("event") != "touch":
+            continue
+        key = (event.get("epoch"), event.get("inputSequence"))
+        if None in key or 0 in key:
+            continue
+        if key in guest and guest[key] != event:
+            conflicts.add(key)
+        guest[key] = event
+    return {
+        "hostPhases": {phase: {"captureToQueueMs": distribution(values["capture"]),
+            "queueToInjectionMs": distribution(values["queue"]),
+            "dispositions": dict(values["dispositions"])} for phase, values in phases.items()},
+        "guestPhases": dict(Counter(event.get("phase", "unknown") for key, event in guest.items()
+                                    if key not in conflicts)),
+        "conflictingGuestIdentities": len(conflicts),
+        "note": "Independent bounded rings: injection is not delivery; counts do not prove end-to-end correspondence or lost taps.",
+    }
 
 
 def summarize(report, uart=""):
@@ -54,6 +110,13 @@ def summarize(report, uart=""):
                       for start, end, offset, process, path in mappings if start <= pc < end]
         hotspots.append({**entry, "candidates": candidates})
     return {"host": host, "guest": {key: distribution(values) for key, values in spans.items()},
+            "inputAdmission": input_admission(report), "shmCheckpoints": snapshot_counters(uart),
+            "validatedGuestFrameStages": {field: distribution([
+                entry[field] for entry in report.get("guestFrameStages", [])
+                if entry.get(field) is not None]) for field in (
+                    "renderToSubmitMilliseconds", "renderToSubmitCPUMilliseconds",
+                    "submitToCommitMilliseconds", "submitToCommitCPUMilliseconds",
+                    "commitToPresentCallbackMilliseconds")},
             "hotspots": hotspots,
             "notes": ["Guest spans are not causally matched to individual host touches.",
                       "Hot-PC counts are approximate; file offsets are not ELF symbol addresses.",

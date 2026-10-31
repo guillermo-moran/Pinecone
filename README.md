@@ -128,6 +128,16 @@ Eligible physical-device buffers share backing with Metal. Simulator,
 caller-owned, and unsupported buffer paths can still require uploads or copies;
 the pipeline is not universally zero-copy.
 
+Normal Phosh startup enables damage-aware private SHM texture snapshots. The
+bridge also defaults to direct CPU fills for ordinary guest buffers and CPU
+Pixman for eligible tiny solid composites, avoiding disproportionate device
+submission costs. These do not require Simulator or Xcode launch overrides.
+For diagnostic comparisons only, set `PINECONE_WLROOTS_SHM_SNAPSHOT=0`,
+`PINECONE_PIXMAN_CPU_FOREIGN_FILL=0`, or
+`PINECONE_PIXMAN_CPU_SMALL_COMPOSITE=0` in the guest session environment.
+The snapshot budget and original rendering path remain in place for unsupported
+surfaces or allocation failures.
+
 See [the graphics protocol and ownership model](docs/PINECONE_GRAPHICS.md).
 
 ### Virtual Hardware

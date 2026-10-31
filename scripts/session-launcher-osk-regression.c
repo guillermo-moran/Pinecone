@@ -31,6 +31,7 @@ static int osk_setpriority(int, id_t, int);
 static unsigned int osk_sleep(unsigned int);
 static int osk_execl(const char *, const char *, ...);
 static _Noreturn void osk_exit(int);
+static int osk_mkdir(const char *path, mode_t mode);
 
 #define access osk_access
 #define fork osk_fork
@@ -38,6 +39,8 @@ static _Noreturn void osk_exit(int);
 #define sleep osk_sleep
 #define execl osk_execl
 #define _exit osk_exit
+#define mkdir osk_mkdir
+#define chmod osk_mkdir
 #define main session_launcher_main
 #include "rootfs/pinecone-session-launcher.c"
 #undef main
@@ -47,6 +50,36 @@ static _Noreturn void osk_exit(int);
 #undef sleep
 #undef execl
 #undef _exit
+#undef mkdir
+#undef chmod
+
+static int osk_mkdir(const char *path, mode_t mode)
+{
+    (void)path;
+    assert(mode == 0755 || mode == 0700);
+    return 0;
+}
+
+static void test_graphics_defaults(void)
+{
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child != 0) {
+        int status;
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        return;
+    }
+    unsetenv("PINECONE_WLROOTS_SHM_SNAPSHOT");
+    configure_environment();
+    assert(strcmp(getenv("PINECONE_WLROOTS_SHM_SNAPSHOT"), "1") == 0);
+    setenv("PINECONE_WLROOTS_SHM_SNAPSHOT", "0", 1);
+    configure_environment();
+    assert(strcmp(getenv("PINECONE_WLROOTS_SHM_SNAPSHOT"), "0") == 0);
+    unsetenv("PINECONE_WLROOTS_SHM_SNAPSHOT");
+    puts("Graphics defaults: SHM snapshots enabled without launch overrides; diagnostic opt-out preserved");
+    exit(0);
+}
 
 static jmp_buf exited;
 static int available, priority_error, priority_calls, exec_calls, exit_status;
@@ -162,6 +195,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--check-priority") == 0)
         return getpriority(PRIO_PROCESS, 0) == 0 ? 0 : 1;
     test_executable = argv[0];
+    test_graphics_defaults();
     reset();
     available = 0;
     assert(start_osk() == -1);

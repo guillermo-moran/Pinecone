@@ -350,13 +350,15 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         guard totalPixelCount >= minimumMetalPixelCount else {
             return false
         }
+        // Serial dispatch with tracked buffers preserves RAW, WAR and WAW
+        // dependencies without optional compute-memory-barrier support (which
+        // the iOS Simulator may lack). Keep the whole batch in one submission.
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+              let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else {
             return false
         }
         let isFirstGuestSubmission = claimFirstGuestSubmission()
 
-        var gpuWrittenResources = Set<UInt32>()
 #if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
         var dirtyDestinations: [UInt32: DirtyDestination] = [:]
         var synchronizedInputs: [UInt32: [PineconeGraphicsRectangle]] = [:]
@@ -366,7 +368,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
 #endif
 
         encoder.setComputePipelineState(pipeline)
-        for (workIndex, item) in workItems.enumerated() {
+        for item in workItems {
             let command = item.command
             let source = item.source
             let mask = item.mask
@@ -419,16 +421,6 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
             copiedInputNanoseconds &+= DispatchTime.now().uptimeNanoseconds &- copyStarted
 #endif
 
-            let hasGPUDependency = gpuWrittenResources.contains(destination.resourceID) ||
-                source.map { gpuWrittenResources.contains($0.resourceID) } == true ||
-                mask.map { gpuWrittenResources.contains($0.resourceID) } == true
-            if workIndex != 0 && hasGPUDependency {
-                // Independent dispatches need no global visibility barrier.
-                // Preserve Pixman's ordering only when this command consumes
-                // or overwrites a resource written earlier in the frame.
-                encoder.memoryBarrier(scope: .buffers)
-            }
-
             var parameters = Parameters(
                 operation: UInt32(command.blendOperator.rawValue),
                 sourceStridePixels: UInt32(source?.stride ?? destination.stride) / 4,
@@ -471,7 +463,6 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
                 geometry.threadgroups,
                 threadsPerThreadgroup: geometry.threadsPerThreadgroup
             )
-            gpuWrittenResources.insert(destination.resourceID)
 #if targetEnvironment(simulator) || PINECONE_TEST_SIMULATOR_COPY
             // A GPU write initializes precisely these pixels. Later commands may
             // still need guest pixels from other parts of the same resource.
@@ -805,7 +796,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         }
         guard let buffer = device.makeBuffer(
             length: surface.allocationByteCount,
-            options: .storageModeShared
+            options: [.storageModeShared, .hazardTrackingModeTracked]
         ) else {
             return nil
         }
@@ -827,7 +818,7 @@ final class PineconeMetalGraphicsAccelerator: PineconeGraphicsAccelerator {
         guard let buffer = device.makeBuffer(
             bytesNoCopy: baseAddress,
             length: surface.allocationByteCount,
-            options: .storageModeShared,
+            options: [.storageModeShared, .hazardTrackingModeTracked],
             deallocator: nil
         ) else {
             return nil

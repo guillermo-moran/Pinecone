@@ -1,0 +1,43 @@
+--- a/src/editor-path.c
++++ b/src/editor-path.c
+@@ -29,7 +29,6 @@
+ #ifdef G_OS_UNIX
+ # include <unistd.h>
+-# include <wordexp.h>
+ #endif
+ 
+ #include "editor-path-private.h"
+ 
+@@ -39,19 +38,14 @@
+ _editor_path_expand (const gchar *path)
+ {
+ #ifdef G_OS_UNIX
+-  wordexp_t state = { 0 };
+-  char *escaped = NULL;
+-  char *ret = NULL;
+-  int r;
++  char *ret;
+ 
+   if (path == NULL)
+     return NULL;
+ 
+-  escaped = g_shell_quote (path);
+-  r = wordexp (escaped, &state, WRDE_NOCMD);
+-  if (r == 0 && state.we_wordc > 0)
+-    ret = g_strdup (state.we_wordv [0]);
+-  wordfree (&state);
++  /* Shell-quoting the entire path made wordexp return this literal string.
++   * Keep that behavior without starting a shell for display-only paths. */
++  ret = g_strdup (path);
+ 
+   if (!g_path_is_absolute (ret))
+     {
+@@ -60,8 +54,6 @@
+       ret = g_build_filename (g_get_home_dir (), freeme, NULL);
+     }
+ 
+-  g_free (escaped);
+-
+   return ret;
+ #else
+   return g_strdup (path);

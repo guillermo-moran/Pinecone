@@ -212,15 +212,16 @@ func run(_ test: GoldenCase, accelerator: PineconeMetalGraphicsAccelerator) -> S
     return nil
 }
 
-func runOrderedBatch(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
-    let width = 2
-    let height = 2
-    let stride = 16
+func runOrderedBatch(accelerator: PineconeMetalGraphicsAccelerator, asynchronous: Bool) -> String? {
+    // Span multiple workgroups and partial edge groups; retain row padding.
+    let width = 65
+    let height = 33
+    let stride = 272
 
     func makeAllocation(_ pixels: [UInt32]) -> Allocation {
         let allocation = Allocation(byteCount: stride * height)
-        for (index, pixel) in pixels.enumerated() {
-            write(pixel, format: .argb, x: index % width, y: index / width,
+        for index in 0..<(width * height) {
+            write(pixels[index % pixels.count], format: .argb, x: index % width, y: index / width,
                   stride: stride, to: allocation.pointer)
         }
         return allocation
@@ -268,6 +269,16 @@ func runOrderedBatch(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
             destination: destination)
     }
 
+    func maskedWork(mask: PineconeGraphicsSurface, destination: PineconeGraphicsSurface) -> PineconeGraphicsWorkItem {
+        PineconeGraphicsWorkItem(command: PineconeGraphicsCommand(
+            operation: .fillOver, sourceResourceID: 0,
+            destinationResourceID: destination.resourceID,
+            sourceX: 0, sourceY: 0,
+            destinationRectangle: PineconeGraphicsRectangle(x: 0, y: 0, width: width, height: height),
+            color: 0x80402010, maskResourceID: mask.resourceID,
+            blendOperator: .sourceOver, sourceIsSolid: true),
+            source: nil, mask: mask, destination: destination)
+    }
     let sequentialItems = [
         work(operation: .source,
              source: surface(sequentialSource, id: 900_001),
@@ -278,6 +289,12 @@ func runOrderedBatch(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
         work(operation: .add,
              source: surface(sequentialOverlay, id: 900_004),
              destination: surface(sequentialDestination, id: 900_003)),
+        // Overwrite a previously read source, then consume it as an image mask.
+        work(operation: .source,
+             source: surface(sequentialOverlay, id: 900_004),
+             destination: surface(sequentialSource, id: 900_001)),
+        maskedWork(mask: surface(sequentialSource, id: 900_001),
+                   destination: surface(sequentialDestination, id: 900_003)),
     ]
     for item in sequentialItems {
         guard accelerator.execute(
@@ -297,17 +314,56 @@ func runOrderedBatch(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
         work(operation: .add,
              source: surface(batchOverlay, id: 910_004),
              destination: surface(batchDestination, id: 910_003)),
+        work(operation: .source,
+             source: surface(batchOverlay, id: 910_004),
+             destination: surface(batchSource, id: 910_001)),
+        maskedWork(mask: surface(batchSource, id: 910_001),
+                   destination: surface(batchDestination, id: 910_003)),
     ]
-    guard accelerator.executeBatch(batchItems) else {
+    let before = accelerator.performanceCounters
+    if asynchronous {
+        final class Result: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = false
+            func record(_ succeeded: Bool) {
+                lock.lock()
+                value = succeeded
+                lock.unlock()
+            }
+            func read() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                return value
+            }
+        }
+        let done = DispatchSemaphore(value: 0)
+        let result = Result()
+        guard accelerator.executeBatchAsync(batchItems, completion: { success in
+            result.record(success)
+            done.signal()
+        }) else { return "async ordered batch rejected" }
+        guard done.wait(timeout: .now() + 30) == .success else {
+            // Do not release guest buffers still owned by the GPU on failure.
+            fputs("async ordered batch timed out\n", stderr)
+            exit(1)
+        }
+        guard result.read() else { return "async ordered batch failed" }
+    } else if !accelerator.executeBatch(batchItems) {
         return "ordered Metal batch was rejected"
     }
-    let sequentialResult = Data(
-        bytes: sequentialDestination.pointer,
-        count: sequentialDestination.byteCount)
-    let batchResult = Data(
-        bytes: batchDestination.pointer, count: batchDestination.byteCount)
-    return sequentialResult == batchResult
-        ? nil : "ordered Metal batch violated a read-after-write dependency"
+    let after = accelerator.performanceCounters
+    guard after["completedBatches"]! - before["completedBatches"]! == 1 else {
+        return "ordered work was split into multiple command buffers"
+    }
+    for (sequential, batch) in [(sequentialSource, batchSource),
+                                (sequentialIntermediate, batchIntermediate),
+                                (sequentialDestination, batchDestination)] {
+        if Data(bytes: sequential.pointer, count: sequential.byteCount) !=
+            Data(bytes: batch.pointer, count: batch.byteCount) {
+            return "ordered Metal batch violated source/mask/write ordering or padding"
+        }
+    }
+    return nil
 }
 
 func runPartialBatch(accelerator: PineconeMetalGraphicsAccelerator) -> String? {
@@ -545,9 +601,11 @@ for test in cases {
         if failures >= 40 { break }
     }
 }
-if let failure = runOrderedBatch(accelerator: accelerator) {
-    fputs(failure + "\n", stderr)
-    failures += 1
+for asynchronous in [false, true] {
+    if let failure = runOrderedBatch(accelerator: accelerator, asynchronous: asynchronous) {
+        fputs(failure + "\n", stderr)
+        failures += 1
+    }
 }
 if let failure = runScaling(accelerator: accelerator) {
     fputs(failure + "\n", stderr)

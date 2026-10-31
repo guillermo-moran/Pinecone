@@ -1,0 +1,155 @@
+--- a/src/overview.c
++++ b/src/overview.c
+@@ -109,6 +109,21 @@
+     return NULL;
+ 
+   return find_activity_by_app_info (self, needle_info);
++}
++
++
++static void
++on_activity_destroyed (PhoshOverview *self, PhoshActivity *activity)
++{
++  PhoshOverviewPrivate *priv = phosh_overview_get_instance_private (self);
++  PhoshToplevel *toplevel = g_object_get_data (G_OBJECT (activity), "toplevel");
++
++  if (priv->activity == activity)
++    priv->activity = NULL;
++  if (toplevel) {
++    g_signal_handlers_disconnect_by_data (toplevel, self);
++    g_object_set_data (G_OBJECT (activity), "toplevel", NULL);
++  }
+ }
+ 
+ 
+@@ -145,6 +160,8 @@
+   g_object_connect (activity,
+                     "swapped-signal::clicked", on_activity_clicked, self,
+                     NULL);
++  g_signal_connect_object (activity, "destroy", G_CALLBACK (on_activity_destroyed),
++                           self, G_CONNECT_SWAPPED);
+ 
+   if (!toplevel) {
+     gboolean light_mode = !phosh_splash_manager_get_prefer_dark (priv->splash_manager);
+@@ -224,6 +241,10 @@
+   if (phosh_overview_get_toplevel_from_activity (self, activity))
+     return;
+ 
++  /* A delayed failure from an earlier launch must not remove a newer splash. */
++  if (g_strcmp0 (g_object_get_data (G_OBJECT (activity), "startup-id"), startup_id) != 0)
++    return;
++
+   g_debug ("Activity '%s' failed to start, closing", g_app_info_get_id (info));
+   phosh_shell_show_notification_for_app (shell, info, _("Application is slow or failed to start"));
+ 
+@@ -374,10 +395,10 @@
+ 
+   activity = find_activity_by_toplevel (overview, toplevel);
+   g_return_if_fail (PHOSH_IS_ACTIVITY (activity));
+-  gtk_widget_destroy (GTK_WIDGET (activity));
+ 
+   if (priv->activity == activity)
+     priv->activity = NULL;
++  gtk_widget_destroy (GTK_WIDGET (activity));
+ }
+ 
+ 
+@@ -625,8 +646,9 @@
+   if (!activity)
+     return;
+ 
+-  /* Activity is not a splash screen, so keep it */
+-  if (phosh_activity_get_has_thumbnail (activity))
++  /* Thumbnail delivery is asynchronous and hidden Home activities may never
++   * request one. The window association, not its pixels, defines a live app. */
++  if (phosh_overview_get_toplevel_from_activity (self, activity))
+     return;
+ 
+   g_warning ("App %s didn't present a toplevel, hiding splash", g_app_info_get_id (info));
+--- a/src/toplevel-manager.c
++++ b/src/toplevel-manager.c
+@@ -65,12 +65,16 @@
+ on_initial_toplevel_timeout (gpointer data)
+ {
+   LaunchingAppInfo *info = data;
++  g_autoptr (PhoshToplevelManager) self = g_object_ref (info->manager);
++  g_autoptr (GAppInfo) app_info = g_object_ref (info->app_info);
+ 
+-  g_signal_emit (info->manager, signals[TOPLEVEL_MISSING], 0, info->app_info);
+   info->timeout_id = 0;
+-
+-  if (!g_ptr_array_remove_fast (info->manager->launching_apps, info))
+-    g_critical ("Failed to find launching info for %s", g_app_info_get_id (info->app_info));
++  /* Retire the timeout before callbacks can reenter launch/window tracking. */
++  if (!g_ptr_array_remove_fast (self->launching_apps, info)) {
++    g_critical ("Failed to find launching info for %s", g_app_info_get_id (app_info));
++    return;
++  }
++  g_signal_emit (self, signals[TOPLEVEL_MISSING], 0, app_info);
+ }
+ 
+ 
+@@ -101,12 +105,15 @@
+ static gboolean
+ app_info_has_toplevel (PhoshToplevelManager *self, GAppInfo *app_info)
+ {
+-  const char *app_id = g_app_info_get_id (app_info);
+-
+   for (int i = 0; i < self->toplevels->len; i++) {
+     PhoshToplevel *toplevel = g_ptr_array_index (self->toplevels, i);
++    const char *app_id = phosh_toplevel_get_app_id (toplevel);
++    g_autoptr (GDesktopAppInfo) info = NULL;
+ 
+-    if (g_strcmp0 (phosh_toplevel_get_app_id (toplevel), app_id) == 0)
++    if (!app_id)
++      continue;
++    info = phosh_get_desktop_app_info_for_app_id (app_id);
++    if (info && g_app_info_equal (G_APP_INFO (info), app_info))
+       return TRUE;
+   }
+ 
+@@ -120,27 +127,28 @@
+   g_autoptr (GAppInfo) needle = NULL;
+   const char *app_id;
+ 
++  if (self->launching_apps->len == 0)
++    return;
++
+   app_id = phosh_toplevel_get_app_id (toplevel);
+-  if (app_id)
++  if (!app_id)
+     return;
+ 
+   needle = G_APP_INFO (phosh_get_desktop_app_info_for_app_id (app_id));
+   if (!needle)
+     return;
+ 
+-  for (int i = 0; i < self->launching_apps->len; i++) {
+-    LaunchingAppInfo *info = g_ptr_array_index (self->launching_apps, i);
++  for (guint i = self->launching_apps->len; i > 0; i--) {
++    LaunchingAppInfo *info = g_ptr_array_index (self->launching_apps, i - 1);
+ 
+     /* TODO: we don't know the toplevels activation token (startup-id) so we can just go
+      * by app-id and thus can't distinguish multi window apps */
+     if (g_app_info_equal (G_APP_INFO (needle), info->app_info)) {
+-      g_ptr_array_remove_index_fast (self->launching_apps, i);
++      g_ptr_array_remove_index_fast (self->launching_apps, i - 1);
+       g_debug ("Found toplevel for launching app %s", g_app_info_get_id (needle));
+-      return;
+     }
+   }
+ 
+-  g_debug ("Couldn't find app info toplevel %s", app_id);
+ }
+ 
+ 
+@@ -219,9 +227,9 @@
+     g_ptr_array_add (self->toplevels, toplevel);
+     g_signal_emit (self, signals[TOPLEVEL_ADDED], 0, toplevel);
+     g_object_notify_by_pspec (G_OBJECT (self), props[PROP_NUM_TOPLEVELS]);
+-
+-    remove_from_launching (self, toplevel);
+   }
++  /* app-id may arrive in a later configure, after the initial window event. */
++  remove_from_launching (self, toplevel);
+ }

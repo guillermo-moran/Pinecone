@@ -1,0 +1,86 @@
+--- a/render/pixman/renderer.c
++++ b/render/pixman/renderer.c
+@@ -4,3 +4,4 @@
+ #include <pixman.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+@@ -17,5 +18,9 @@
+ static const struct wlr_renderer_impl renderer_impl;
+ 
++extern pixman_image_t *pinecone_pixman_snapshot_bits(pixman_format_code_t,
++	int, int, const void *, size_t) __attribute__((weak));
++extern int pinecone_pixman_update_snapshot(pixman_image_t *, const void *,
++	size_t, const void *, int) __attribute__((weak));
+ extern struct pinecone_pixman_buffer *pinecone_pixman_buffer_register(
+ 	void *, size_t, void *, void (*)(void *)) __attribute__((weak));
+ extern void pinecone_pixman_buffer_unregister(
+@@ -217,3 +222,27 @@
+ 
++static bool texture_update_from_buffer(struct wlr_texture *wlr_texture,
++		struct wlr_buffer *buffer, const pixman_region32_t *damage) {
++	struct wlr_pixman_texture *texture = get_texture(wlr_texture);
++	struct wlr_shm_attributes shm;
++	if (texture->buffer || !pinecone_pixman_update_snapshot ||
++			!wlr_buffer_get_shm(buffer, &shm)) {
++		return false;
++	}
++	void *data;
++	uint32_t format;
++	size_t stride;
++	if (!wlr_buffer_begin_data_ptr_access(buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ,
++			&data, &format, &stride)) {
++		return false;
++	}
++	int count;
++	pixman_box32_t *boxes = pixman_region32_rectangles((pixman_region32_t *)damage, &count);
++	bool ok = get_pixman_format_from_drm(format) == texture->format &&
++		pinecone_pixman_update_snapshot(texture->image, data, stride, boxes, count);
++	wlr_buffer_end_data_ptr_access(buffer);
++	return ok;
++}
++
+ static const struct wlr_texture_impl texture_impl = {
++	.update_from_buffer = texture_update_from_buffer,
+ 	.read_pixels = texture_read_pixels,
+@@ -350,6 +379,7 @@
+ 	void *data = NULL;
+ 	uint32_t drm_format;
+ 	size_t stride;
++	pixman_image_t *snapshot = NULL;
+ 	if (imported != NULL) {
+ 		// Creating a Pixman image does not read pixels. Do not acquire a CPU
+ 		// scope here: surface commits wait asynchronously for producer fences,
+@@ -361,6 +391,17 @@
+ 				&data, &drm_format, &stride)) {
+ 			goto error;
+ 		}
++		const char *enabled = getenv("PINECONE_WLROOTS_SHM_SNAPSHOT");
++		struct wlr_shm_attributes shm;
++		if (enabled && strcmp(enabled, "1") == 0 &&
++				pinecone_pixman_snapshot_bits && wlr_buffer_get_shm(buffer, &shm)) {
++			// Capture while READ access protects against pool resize/SIGBUS.
++			// The private image cannot be changed by a client. A new surface
++			// commit updates damage, or creates a new texture when shared.
++			snapshot = pinecone_pixman_snapshot_bits(
++				get_pixman_format_from_drm(drm_format), buffer->width,
++				buffer->height, data, stride);
++		}
+ 		wlr_buffer_end_data_ptr_access(buffer);
+ 	}
+ 
+@@ -369,7 +410,14 @@
+ 		drm_format, buffer->width, buffer->height);
+ 	if (texture == NULL) {
++		if (snapshot) pixman_image_unref(snapshot);
+ 		goto error;
+ 	}
+ 
++	if (snapshot) {
++		texture->image = snapshot;
++		// No client mapping is retained or exposed to asynchronous draws.
++		return &texture->wlr_texture;
++	}
++
+ 	texture->image = pixman_image_create_bits_no_clear(texture->format,
+ 		buffer->width, buffer->height, data, stride);

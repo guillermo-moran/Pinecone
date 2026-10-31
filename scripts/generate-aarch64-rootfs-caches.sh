@@ -38,13 +38,52 @@ validate_graphical_linker() {
   fi
 }
 
+generate_gio_module_caches() {
+  local rootfs="$1" directory
+  # Match glib.trigger: unpacking APKs does not run these registrations.
+  # Query the shipped modules with the shipped tool, never the host's GIO.
+  for directory in /usr/lib/gio/modules /usr/lib/gtk-4.0; do
+    [[ -d "${rootfs}${directory}" ]] || continue
+    [[ -x "${rootfs}/usr/bin/gio-querymodules" ]] || {
+      echo "missing aarch64 gio-querymodules in ${rootfs}" >&2
+      return 1
+    }
+    chroot "${rootfs}" /usr/bin/gio-querymodules "${directory}"
+  done
+}
+
+generate_icon_caches() {
+  local rootfs="$1" theme tool
+  for theme in "${rootfs}"/usr/share/icons/*; do
+    [[ -f "${theme}/index.theme" ]] || continue
+    tool=/usr/bin/gtk-update-icon-cache
+    if [[ ! -x "${rootfs}${tool}" ]]; then
+      tool=/usr/bin/gtk4-update-icon-cache
+    fi
+    [[ -x "${rootfs}${tool}" ]] || {
+      echo "missing aarch64 gtk-update-icon-cache (or gtk4-update-icon-cache) in ${rootfs}" >&2
+      return 1
+    }
+    # Both GTK versions consume this index. Keep image bytes in their original
+    # files, and regenerate after all theme/application icons have been staged.
+    chroot "${rootfs}" "${tool}" --force --index-only "${theme#"${rootfs}"}"
+    [[ -s "${theme}/icon-theme.cache" ]] || {
+      echo "missing generated icon-theme.cache in ${theme}" >&2
+      return 1
+    }
+    chroot "${rootfs}" "${tool}" --validate "${theme#"${rootfs}"}"
+  done
+}
+
 generate_in_chroot() {
   local rootfs="$1"
   validate_graphical_linker "${rootfs}"
+  generate_gio_module_caches "${rootfs}"
   chroot "${rootfs}" /usr/bin/fc-cache --system-only --really-force
   mkdir -p "${rootfs}/usr/lib/gdk-pixbuf-2.0/2.10.0"
   chroot "${rootfs}" /usr/bin/gdk-pixbuf-query-loaders > \
     "${rootfs}/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+  generate_icon_caches "${rootfs}"
   # APK extraction does not run GTK's trigger. Without this registry GTK
   # cannot discover the Wayland text-input module used by Squeekboard.
   if uses_gtk3 "${rootfs}"; then
@@ -69,7 +108,7 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   if [[ "$(id -u)" == "0" ]]; then
     generate_in_chroot "${ROOTFS}"
   else
-    sudo bash -e -c "$(declare -f uses_gtk3 generate_in_chroot validate_input_modules validate_graphical_linker); generate_in_chroot '$ROOTFS'"
+    sudo bash -e -c "$(declare -f uses_gtk3 generate_in_chroot generate_gio_module_caches generate_icon_caches validate_input_modules validate_graphical_linker); generate_in_chroot \"\$1\"" -- "${ROOTFS}"
   fi
   exit 0
 fi
@@ -106,6 +145,8 @@ lima_shell sudo mkdir -p "${GUEST_ROOT}"
 lima_shell sudo tar -xf "${GUEST_ROOTFS_ARCHIVE}" -C "${GUEST_ROOT}"
 lima_shell sudo bash -e -c \
   "$(declare -f validate_graphical_linker); validate_graphical_linker \"\$1\"" -- "${GUEST_ROOT}"
+lima_shell sudo bash -e -c \
+  "$(declare -f generate_gio_module_caches); generate_gio_module_caches \"\$1\"" -- "${GUEST_ROOT}"
 lima_shell sudo chroot "${GUEST_ROOT}" \
   /usr/bin/fc-cache --system-only --really-force
 lima_shell sudo mkdir -p \
@@ -113,6 +154,21 @@ lima_shell sudo mkdir -p \
 lima_shell sudo sh -c \
   "chroot '$GUEST_ROOT' /usr/bin/gdk-pixbuf-query-loaders > '$GUEST_ROOT/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache'"
 CACHE_PATHS=(var/cache/fontconfig usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache)
+lima_shell sudo bash -e -c \
+  "$(declare -f generate_icon_caches); generate_icon_caches \"\$1\"" -- "${GUEST_ROOT}"
+for theme in "${ROOTFS}"/usr/share/icons/*; do
+  [[ -f "${theme}/index.theme" ]] || continue
+  CACHE_PATHS+=("${theme#"${ROOTFS}/"}/icon-theme.cache")
+done
+for directory in usr/lib/gio/modules usr/lib/gtk-4.0; do
+  [[ -d "${ROOTFS}/${directory}" ]] || continue
+  if lima_shell sudo test -f "${GUEST_ROOT}/${directory}/giomodule.cache"; then
+    CACHE_PATHS+=("${directory}/giomodule.cache")
+  else
+    # No queryable modules is valid; gio-querymodules removes a stale cache.
+    rm -f "${ROOTFS}/${directory}/giomodule.cache"
+  fi
+done
 if uses_gtk3 "${ROOTFS}"; then
   lima_shell sudo mkdir -p "${GUEST_ROOT}/usr/lib/gtk-3.0/3.0.0"
   lima_shell sudo sh -c \
@@ -123,6 +179,12 @@ lima_shell sudo tar -cf "${GUEST_CACHE_ARCHIVE}" \
   -C "${GUEST_ROOT}" "${CACHE_PATHS[@]}"
 limactl copy "${INSTANCE}:${GUEST_CACHE_ARCHIVE}" "${HOST_CACHE_ARCHIVE}"
 bsdtar -xf "${HOST_CACHE_ARCHIVE}" -C "${ROOTFS}"
+for theme in "${ROOTFS}"/usr/share/icons/*; do
+  [[ -f "${theme}/index.theme" ]] || continue
+  # Extraction can advance the parent mtime past the archived cache. GTK
+  # rejects that cache even though its contents match this unchanged theme.
+  touch -r "${theme}" "${theme}/icon-theme.cache"
+done
 
 find "${ROOTFS}/var/cache/fontconfig" -type f -name '*cache-*' -print -quit | grep -q .
 test -s "${ROOTFS}/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"

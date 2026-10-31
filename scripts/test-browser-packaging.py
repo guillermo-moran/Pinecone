@@ -81,7 +81,7 @@ class StagingTests(unittest.TestCase):
         apk(self.cache, "extra-app", "1-r0")
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("ARM64VIZ_", "PINECONE_"))}
-        for name in ("WLROOTS", "PHOC", "PHOSH", "SETTINGS", "GLIB", "MUSL"):
+        for name in ("WLROOTS", "PHOC", "PHOSH", "SETTINGS", "TEXT_EDITOR", "GLIB", "MUSL"):
             self.env[f"PINECONE_USE_PATCHED_{name}"] = "0"
         self.env.update(ARM64VIZ_GRAPHICAL_PROFILE="phosh",
                         ARM64VIZ_GRAPHICAL_PACKAGE_CACHE=str(self.cache))

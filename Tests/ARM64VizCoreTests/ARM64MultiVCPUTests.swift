@@ -116,6 +116,35 @@ final class ARM64MultiVCPUTests: XCTestCase {
         XCTAssertTrue(decoder.appendRecords([]).isEmpty)
     }
 
+    func testFramedSettingsLaunchSurvivesPromptAndEveryUARTSplit() {
+        let prompt = Array("arm64viz-root:~# \u{1b}[6n".utf8)
+        let marker = Array("\u{1e}Pinecone app launch requested: settings\r\n".utf8)
+        let input = prompt + marker
+        for split in 0...input.count {
+            var decoder = GuestGraphicsTraceDecoder()
+            var filter = GuestControlConsoleFilter()
+            let first = Array(input.prefix(split))
+            let last = Array(input.dropFirst(split))
+            let records = decoder.appendRecords(first) + decoder.appendRecords(last)
+            XCTAssertEqual(records, [.applicationLaunch("settings")], "split \(split)")
+            XCTAssertEqual(filter.append(first) + filter.append(last), prompt)
+            var policy = ApplicationExecutionPolicy()
+            XCTAssertEqual(policy.handle(records[0], at: 1), .requested)
+            XCTAssertTrue(policy.isLatencySensitive(at: 2))
+            XCTAssertFalse(policy.isLatencySensitive(at: 12_000_000_001))
+        }
+    }
+
+    func testFramedSettingsLaunchRecoversAfterOversizedConsoleLine() {
+        var decoder = GuestGraphicsTraceDecoder()
+        XCTAssertTrue(decoder.appendRecords([UInt8](repeating: 65, count: 4096)).isEmpty)
+        XCTAssertEqual(decoder.appendRecords(Array(
+            "\u{1e}Pinecone app launch requested: settings\n".utf8)),
+            [.applicationLaunch("settings")])
+        XCTAssertTrue(decoder.appendRecords(Array(
+            "\u{1e}Pinecone app launch requested: bad app\n".utf8)).isEmpty)
+    }
+
     func testHistoricalPerformanceReportDecodesWithoutNewTraceFields() throws {
         let snapshot = VMPerformanceTimeline(startNanoseconds: 0).snapshot()
         var json = try XCTUnwrap(JSONSerialization.jsonObject(

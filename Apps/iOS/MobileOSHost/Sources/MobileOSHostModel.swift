@@ -458,7 +458,7 @@ final class MobileOSHostModel: ObservableObject {
                     continue
                 } else if let generation = runtime.hostIdleWaitGeneration {
                     await runtime.waitForHostActivity(after: generation)
-                } else if runtime.shouldPaceContinuousExecution {
+                } else if let generation = runtime.continuousExecutionPacingGeneration {
                     let now = DispatchTime.now().uptimeNanoseconds
                     let delay = executionPacer.delayNanoseconds(
                         afterRunDuration: runDuration,
@@ -466,7 +466,9 @@ final class MobileOSHostModel: ObservableObject {
                         latestInteractionNanoseconds: runtime.latestHostActivityNanoseconds
                     )
                     if delay > 0 {
-                        try? await Task.sleep(nanoseconds: delay)
+                        await runtime.waitForContinuousExecutionPacing(
+                            after: generation, timeoutNanoseconds: delay
+                        )
                     } else {
                         await Task.yield()
                     }
@@ -1030,6 +1032,11 @@ private enum LinuxKeyboardMapper {
 }
 
 private final class LinuxConsoleRuntime: @unchecked Sendable {
+    // Diagnostic control only: also extend secondary pacing suppression.
+    // Normal launches extend primary suppression without extending worker boosts.
+    private let unpacedPendingLaunches = ProcessInfo.processInfo.environment[
+        "PINECONE_EXPERIMENTAL_UNPACED_LAUNCH"
+    ] == "1"
     private static let networkPumpRunSliceSteps = 2_000
     private static let bootChunkRunSliceSteps = 40_000
     private static let interactiveChunkRunSliceSteps = 1_000_000
@@ -1090,6 +1097,8 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private let displayCommitSignal: DisplayCommitSignal
     private let performanceTimeline = VMPerformanceTimeline(attributionEnabled:
         ProcessInfo.processInfo.environment["PINECONE_INTERACTION_TRACE"] == "1")
+    private let schedulingDiagnosticsEnabled =
+        ProcessInfo.processInfo.environment["PINECONE_INTERACTION_TRACE"] == "1"
     private let uartOutputBuffer: LockedByteBuffer
     private let onUART: @Sendable ([UInt8]) -> Void
     private let lock = NSLock()
@@ -1103,6 +1112,11 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private var queuedTouchEventCount = 0
     private var drainedTouchEventCount = 0
     private var droppedTouchEventCount = 0
+    private var primaryPacingWaitCount: UInt64 = 0
+    private var primaryPacingRequestedNanoseconds: UInt64 = 0
+    private var primaryPacingElapsedNanoseconds: UInt64 = 0
+    private var primaryPacingMaximumNanoseconds: UInt64 = 0
+    private var primaryPacingGenerationChanges: UInt64 = 0
     private var pendingKeyboardEvents: [GuestKeyboardEvent] = []
     private var diskPersistenceCompleted = false
     private var stopRequested = false
@@ -1398,19 +1412,54 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         return (machine.virtioDisplay.displayGeneration ?? 0) <= baseline
     }
 
-    var shouldPaceContinuousExecution: Bool {
+    var continuousExecutionPacingGeneration: UInt64? {
         lock.lock()
+        // Observe before checking policy: input/IRQ/frame activity after this
+        // point must invalidate even a not-yet-registered pacing wait.
+        let generation = hostWakeSignal.currentGeneration
         let now = DispatchTime.now().uptimeNanoseconds
+        let launchPacing = applicationExecutionPolicy.pacingSuppression(at: now)
         let shouldPace = shellPromptSeen && displayContentVisible &&
             !lastRunSliceObservedWFI &&
             pendingInputReadIndex >= pendingInput.count &&
             pendingTouches.isEmpty && pendingKeyboardEvents.isEmpty &&
-            !isTouchLatencySensitiveLocked(now: now) &&
-            !isApplicationLaunchLatencySensitiveLocked(now: now)
+            !isTouchLatencySensitiveLocked(now: now)
         lock.unlock()
-        let enabled = shouldPace && !networkBridge.hasPendingAsynchronousTraffic
-        machine.parallelVCPUCluster?.setContinuousExecutionPacing(enabled: enabled)
-        return enabled
+        let pacingEligible = shouldPace && !networkBridge.hasPendingAsynchronousTraffic
+        let suppressSecondary = unpacedPendingLaunches
+            ? launchPacing.primary : launchPacing.secondary
+        machine.parallelVCPUCluster?.setContinuousExecutionPacing(
+            enabled: pacingEligible && !suppressSecondary
+        )
+        return pacingEligible && !launchPacing.primary ? generation : nil
+    }
+
+    func waitForContinuousExecutionPacing(
+        after generation: UInt64, timeoutNanoseconds: UInt64
+    ) async {
+        guard schedulingDiagnosticsEnabled else {
+            await hostWakeSignal.wait(after: generation, timeoutNanoseconds: timeoutNanoseconds)
+            return
+        }
+        let started = DispatchTime.now().uptimeNanoseconds
+        await hostWakeSignal.wait(after: generation, timeoutNanoseconds: timeoutNanoseconds)
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- started
+        let generationChanged = hostWakeSignal.currentGeneration != generation
+        recordPrimaryPacingWait(
+            requested: timeoutNanoseconds, elapsed: elapsed, generationChanged: generationChanged
+        )
+    }
+
+    private func recordPrimaryPacingWait(
+        requested: UInt64, elapsed: UInt64, generationChanged: Bool
+    ) {
+        lock.lock()
+        primaryPacingWaitCount &+= 1
+        primaryPacingRequestedNanoseconds &+= requested
+        primaryPacingElapsedNanoseconds &+= elapsed
+        primaryPacingMaximumNanoseconds = max(primaryPacingMaximumNanoseconds, elapsed)
+        if generationChanged { primaryPacingGenerationChanges &+= 1 }
+        lock.unlock()
     }
 
     func preferredRunSliceSteps(
@@ -2198,12 +2247,21 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         let queued = queuedTouchEventCount
         let drained = drainedTouchEventCount
         let dropped = droppedTouchEventCount
+        // Cumulative host wall-clock waits, not CPU time or per-input attribution.
+        // A changed generation is an observation, not proof of the wake cause.
+        let pacing = schedulingDiagnosticsEnabled
+            ? " primaryPacingWaits=\(primaryPacingWaitCount)" +
+                " requestedNs=\(primaryPacingRequestedNanoseconds)" +
+                " elapsedNs=\(primaryPacingElapsedNanoseconds)" +
+                " maxNs=\(primaryPacingMaximumNanoseconds)" +
+                " generationChanged=\(primaryPacingGenerationChanges)"
+            : ""
         lock.unlock()
         guard queued > 0 else {
             return ""
         }
         return " hosttouch=\(queued)/\(drained)/\(dropped)" +
-            " inputFrameCorrelation=unavailable \(machine.virtioInput.inputDiagnostics)"
+            " inputFrameCorrelation=unavailable \(machine.virtioInput.inputDiagnostics)\(pacing)"
     }
 
     private func drainKeyboardEvents() -> [GuestKeyboardEvent] {
@@ -2417,60 +2475,6 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
 
     private var shouldUseFrequentNetworkPumps: Bool {
         networkBridge.hasPendingAsynchronousTraffic
-    }
-}
-
-private final class HostWakeSignal: @unchecked Sendable {
-    private let lock = NSLock()
-    private var generation: UInt64 = 0
-    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
-
-    var currentGeneration: UInt64 {
-        lock.lock()
-        let value = generation
-        lock.unlock()
-        return value
-    }
-
-    func signal() {
-        lock.lock()
-        generation &+= 1
-        let pending = Array(waiters.values)
-        waiters.removeAll(keepingCapacity: true)
-        lock.unlock()
-
-        for continuation in pending {
-            continuation.resume()
-        }
-    }
-
-    func wait(after observedGeneration: UInt64, timeoutNanoseconds: UInt64) async {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            guard generation == observedGeneration else {
-                lock.unlock()
-                continuation.resume()
-                return
-            }
-
-            let identifier = UUID()
-            waiters[identifier] = continuation
-            lock.unlock()
-
-            let boundedTimeout = min(timeoutNanoseconds, UInt64(Int.max))
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(
-                deadline: .now() + .nanoseconds(Int(boundedTimeout))
-            ) { [weak self] in
-                self?.resumeWaiter(identifier)
-            }
-        }
-    }
-
-    private func resumeWaiter(_ identifier: UUID) {
-        lock.lock()
-        let continuation = waiters.removeValue(forKey: identifier)
-        lock.unlock()
-        continuation?.resume()
     }
 }
 

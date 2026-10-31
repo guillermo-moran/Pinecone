@@ -2,7 +2,8 @@
 /// State survives UART chunks, including a split control prefix.
 public struct GuestControlConsoleFilter {
     private let prefixes = [Array("\u{1e}PINECONE_APP_PRESENTED ".utf8),
-                            Array("\u{1e}PINECONE_APP_LIFECYCLE ".utf8)]
+                            Array("\u{1e}PINECONE_APP_LIFECYCLE ".utf8),
+                            Array("\u{1e}Pinecone app launch requested: ".utf8)]
     private var candidate: [UInt8] = []
     private var discarding = false
     private var discardedBytes = 0

@@ -291,6 +291,7 @@ static void configure_environment(void)
     setenv("WLR_RENDERER", "pixman", 1);
     setenv("WLR_RENDERER_ALLOW_SOFTWARE", "1", 1);
     setenv("PINECONE_WLROOTS_DMABUF", "1", 0);
+    setenv("PINECONE_WLROOTS_SHM_SNAPSHOT", "1", 0);
     setenv("WLR_LIBINPUT_NO_DEVICES", "1", 1);
     setenv("WLR_LOG", getenv("PINECONE_WLR_LOG") != NULL ? getenv("PINECONE_WLR_LOG") : "0", 1);
     setenv("XKB_DEFAULT_LAYOUT", "us", 1);
@@ -567,8 +568,9 @@ static int run_client(void)
 static int run_settings(void)
 {
     configure_environment();
+    /* The interactive prompt need not end in a newline. */
     static const char launch_marker[] =
-        "Pinecone app launch requested: settings\n";
+        "\036Pinecone app launch requested: settings\n";
     int console = open(console_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
     if (console >= 0) {
         (void)write_fully(

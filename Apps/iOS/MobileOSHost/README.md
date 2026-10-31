@@ -63,6 +63,12 @@ launch environment is required. Set `PINECONE_ASSEMBLY_EXECUTOR=0` in the scheme
 only when comparing against the established C executor; remove stale prototype
 or chaining environment overrides when testing the current defaults.
 
+The standard guest image includes the current Pixman bridge and Phoc r8.
+SHM texture snapshots, direct foreign-buffer fills, and eligible small-composite
+CPU rendering are enabled by default during normal Phosh startup. No graphics
+opt-in launch arguments are required; rebuild the guest image before building
+the app when changing these guest components.
+
 An updated bundled rootfs seeds a new writable guest disk on first launch. The
 previous writable disk is retained as `rootfs.previous.ext4`; this is not an
 in-place package upgrade and only one previous disk is retained. Do not uninstall

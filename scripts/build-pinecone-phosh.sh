@@ -14,6 +14,8 @@ cp "${ROOT_DIR}/scripts/patches/phosh-pinecone-launch-lifecycle.patch" "${PACKAG
 cp "${ROOT_DIR}/scripts/patches/phosh-pinecone-launcher.patch" "${PACKAGE_DIR}/"
 cp "${ROOT_DIR}/scripts/patches/phosh-pinecone-launcher-polish.patch" "${PACKAGE_DIR}/"
 cp "${ROOT_DIR}/scripts/patches/phosh-pinecone-light-lockscreen.patch" "${PACKAGE_DIR}/"
+cp "${ROOT_DIR}/scripts/patches/phosh-pinecone-window-lifecycle.patch" "${PACKAGE_DIR}/"
+cp "${ROOT_DIR}/scripts/patches/phosh-pinecone-tracker-ownership.patch" "${PACKAGE_DIR}/"
 cp "${ROOT_DIR}/scripts/rootfs/pinecone-gtk.css" "${PACKAGE_DIR}/pinecone-launcher.css"
 
 command -v limactl >/dev/null 2>&1 || {
@@ -60,6 +62,8 @@ limactl copy \
   "${PACKAGE_DIR}/phosh-pinecone-launcher.patch" \
   "${PACKAGE_DIR}/phosh-pinecone-launcher-polish.patch" \
   "${PACKAGE_DIR}/phosh-pinecone-light-lockscreen.patch" \
+  "${PACKAGE_DIR}/phosh-pinecone-window-lifecycle.patch" \
+  "${PACKAGE_DIR}/phosh-pinecone-tracker-ownership.patch" \
   "${PACKAGE_DIR}/pinecone-launcher.css" \
   "${INSTANCE}:${GUEST_BUILD_DIR}/"
 # Build dependencies are distinct from the session's runtime dependency closure.
@@ -74,16 +78,16 @@ limactl shell "${INSTANCE}" sudo -u "${GUEST_USER}" -g abuild sh -lc \
    abuild -d"
 
 GUEST_PACKAGE="$(limactl shell "${INSTANCE}" sh -lc \
-  "find ~/packages -path '*/aarch64/phosh-0.57.0-r8.apk' -print -quit")"
+  "find ~/packages -path '*/aarch64/phosh-0.57.0-r9.apk' -print -quit")"
 [[ -n "${GUEST_PACKAGE}" ]] || {
   echo "Pinecone Phosh runtime package was not produced" >&2
   exit 1
 }
 limactl copy "${INSTANCE}:${GUEST_PACKAGE}" "${OUTPUT_DIR}/"
-PACKAGE="${OUTPUT_DIR}/phosh-0.57.0-r8.apk"
+PACKAGE="${OUTPUT_DIR}/phosh-0.57.0-r9.apk"
 INFO="$(bsdtar -xOf "${PACKAGE}" .PKGINFO)"
 grep -qx 'pkgname = phosh' <<<"${INFO}"
-grep -qx 'pkgver = 0.57.0-r8' <<<"${INFO}"
+grep -qx 'pkgver = 0.57.0-r9' <<<"${INFO}"
 grep -qx 'arch = aarch64' <<<"${INFO}"
 bsdtar -tf "${PACKAGE}" usr/libexec/phosh >/dev/null
 VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pinecone-phosh-verify.XXXXXX")"
