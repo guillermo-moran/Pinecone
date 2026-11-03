@@ -22,8 +22,12 @@ struct ARM64VizCommand {
             try benchmarkNative(arguments: arguments)
         case "prepare-linux":
             try prepareLinux(arguments: arguments)
+        case "prepare-lineageos":
+            try prepareLinux(arguments: arguments + ["--lineageos"])
         case "run-linux-trace":
             try runLinuxTrace(arguments: arguments)
+        case "run-lineageos-trace":
+            try runLinuxTrace(arguments: arguments + ["--lineageos"])
         case "diff-linux-blocks":
             try diffLinuxBlocks(arguments: arguments)
         case "audit-instructions":
@@ -125,6 +129,7 @@ struct ARM64VizCommand {
     private static func prepareLinux(arguments: [String]) throws {
         let prepared = try prepareLinuxMachine(arguments: arguments)
         let machine = prepared.machine
+        defer { machine.parallelVCPUCluster?.stop() }
         let result = prepared.loadResult
         try dumpGeneratedDTBIfRequested(result.deviceTreeBlob, arguments: arguments)
 
@@ -132,6 +137,8 @@ struct ARM64VizCommand {
             guest: result.configuration.machineName,
             profile: result.layout.profile.rawValue,
             backend: machine.vm.backend.name,
+            virtualCPUCount: machine.vm.virtualCPUCount,
+            parallelVCPUExecution: machine.parallelVCPUCluster != nil,
             entryPoint: hex(result.layout.kernelLoadAddress),
             fdtAddress: hex(result.layout.fdtLoadAddress),
             fdtByteCount: result.layout.fdtByteCount,
@@ -164,10 +171,17 @@ struct ARM64VizCommand {
     private static func runLinuxTrace(arguments: [String]) throws {
         let prepared = try prepareLinuxMachine(arguments: arguments)
         let machine = prepared.machine
+        defer { machine.parallelVCPUCluster?.stop() }
         let result = prepared.loadResult
+        let isLineageOS = result.layout.profile == .lineageOS
         try dumpGeneratedDTBIfRequested(result.deviceTreeBlob, arguments: arguments)
         let maxSteps = try optionalInt(after: "--max-steps", in: arguments) ?? 128
-        let traceDepth = try optionalNonNegativeInt(after: "--trace-depth", in: arguments) ?? 32
+        // Retaining per-instruction diagnostic rings disables the native basic-
+        // block engine. Keep LineageOS on the fast path unless tracing is
+        // explicitly requested; a full Android boot is otherwise orders of
+        // magnitude slower.
+        let traceDepth = try optionalNonNegativeInt(after: "--trace-depth", in: arguments)
+            ?? (isLineageOS ? 0 : 32)
         let exceptionStormThreshold = try optionalNonNegativeInt(after: "--exception-storm-threshold", in: arguments) ?? 16
         let symbolMapPath = try optionalValue(after: "--symbols", in: arguments)
         let symbols = try symbolMapPath.map { try KernelSymbolMap(path: $0) }
@@ -178,24 +192,88 @@ struct ARM64VizCommand {
         let el0FaultSkip = try optionalNonNegativeInt(after: "--el0-fault-skip", in: arguments) ?? 0
         let stopOnUART = hasFlag("--stop-on-uart", in: arguments)
         let stopOnUARTOutput = try optionalValue(after: "--stop-on-uart-output", in: arguments).map(decodeEscapedArgument)
+        let stopOnDisplay = hasFlag("--stop-on-display", in: arguments)
+        let displayFlushSkip = try optionalNonNegativeInt(after: "--display-flush-skip", in: arguments) ?? 0
+        let displaySnapshotPath = try optionalValue(after: "--display-snapshot", in: arguments)
+        let displayBackingSnapshotPath = try optionalValue(after: "--display-backing-snapshot", in: arguments)
+        let displayResourceDiagnosticsPath = try optionalValue(
+            after: "--display-resource-diagnostics",
+            in: arguments
+        )
+        let displaySnapshotIntervalMS = try optionalInt(
+            after: "--display-snapshot-interval-ms",
+            in: arguments
+        )
+        let displaySnapshotIntervalNanoseconds: UInt64? = try displaySnapshotIntervalMS.map { interval in
+            let (nanoseconds, overflow) = UInt64(interval).multipliedReportingOverflow(by: 1_000_000)
+            guard !overflow else {
+                throw VMError.deviceError("--display-snapshot-interval-ms is too large")
+            }
+            return nanoseconds
+        }
         let streamUART = hasFlag("--stream-uart", in: arguments)
-        let mmioTraceDepth = try optionalNonNegativeInt(after: "--mmio-trace-depth", in: arguments) ?? 64
+        let mmioTraceDepth = try optionalNonNegativeInt(after: "--mmio-trace-depth", in: arguments)
+            ?? (isLineageOS ? 0 : 64)
         let memoryTraceDepth = try optionalNonNegativeInt(after: "--memory-trace-depth", in: arguments) ?? 0
         let memoryTraceEL0Only = hasFlag("--memory-trace-el0-only", in: arguments)
         let stopOnMemoryWriteVirtual = try optionalValue(after: "--stop-on-memory-write-virtual", in: arguments).map(parseAddress)
         let stopOnMemoryWritePhysical = try optionalValue(after: "--stop-on-memory-write-physical", in: arguments).map(parseAddress)
         let memoryWriteSkip = try optionalNonNegativeInt(after: "--memory-write-skip", in: arguments) ?? 0
-        let sysregTraceDepth = try optionalNonNegativeInt(after: "--sysreg-trace-depth", in: arguments) ?? 128
+        let sysregTraceDepth = try optionalNonNegativeInt(after: "--sysreg-trace-depth", in: arguments)
+            ?? (isLineageOS ? 0 : 128)
         let timerScale = UInt64(try optionalNonNegativeInt(after: "--timer-scale", in: arguments) ?? 1)
         let uartInputBytes = try linuxTraceUARTInputBytes(arguments: arguments)
         let uartInputAfterOutput = try optionalValue(after: "--uart-input-after-output", in: arguments).map(decodeEscapedArgument)
         let writebackDiskPath = try optionalValue(after: "--writeback-disk", in: arguments)
         let profileBackendTiming = hasFlag("--profile-backend-timing", in: arguments)
         let wallClockBudgetMS = try optionalNonNegativeInt(after: "--wall-clock-budget-ms", in: arguments)
+        let totalWallClockBudgetMS = try optionalNonNegativeInt(
+            after: "--total-wall-clock-budget-ms",
+            in: arguments
+        )
+        let uartNoProgressTimeoutMS = try optionalInt(
+            after: "--uart-no-progress-timeout-ms",
+            in: arguments
+        )
+        let requestedUARTProgressMilestones = try values(
+            after: "--uart-progress-marker",
+            in: arguments
+        ).map(decodeEscapedArgument)
+        guard requestedUARTProgressMilestones.allSatisfy({ !$0.isEmpty }) else {
+            throw VMError.deviceError("--uart-progress-marker must not be empty")
+        }
+        let traceStartedNanoseconds = DispatchTime.now().uptimeNanoseconds
+        var nextDisplaySnapshotNanoseconds = displaySnapshotIntervalNanoseconds.map {
+            traceStartedNanoseconds &+ $0
+        }
+        let uartProgressMilestones = requestedUARTProgressMilestones.isEmpty
+            ? UARTProgressWatchdog.lineageOSMilestones
+            : requestedUARTProgressMilestones
+        let uartProgressWatchdog: UARTProgressWatchdog?
+        if let uartNoProgressTimeoutMS {
+            let (timeoutNanoseconds, overflow) = UInt64(uartNoProgressTimeoutMS)
+                .multipliedReportingOverflow(by: 1_000_000)
+            guard !overflow else {
+                throw VMError.deviceError("--uart-no-progress-timeout-ms is too large")
+            }
+            uartProgressWatchdog = UARTProgressWatchdog(
+                timeoutNanoseconds: timeoutNanoseconds,
+                milestones: uartProgressMilestones,
+                startedAtNanoseconds: traceStartedNanoseconds
+            )
+        } else {
+            uartProgressWatchdog = nil
+        }
+        let totalWallClockDeadlineNanoseconds = totalWallClockBudgetMS.map {
+            traceStartedNanoseconds &+ UInt64($0) * 1_000_000
+        }
         var uartInputInjected = false
+        let hotPCProfilingEnabled =
+            ProcessInfo.processInfo.environment["PINECONE_HOT_PC_PROFILE"] == "1"
 
         if let backend = machine.vm.backend as? SoftwareARM64Backend {
             backend.collectPerformanceTimings = profileBackendTiming
+            backend.setNativeHotPCProfilingEnabled(hotPCProfilingEnabled)
         }
 
         for breakpoint in breakpoints {
@@ -221,14 +299,46 @@ struct ARM64VizCommand {
         machine.vm.enableInstructionTrace(capacity: traceDepth)
         machine.vm.enableMMIOTrace(capacity: mmioTraceDepth)
         machine.vm.enableGuestMemoryTrace(capacity: memoryTraceDepth, el0Only: memoryTraceEL0Only)
+        machine.parallelVCPUCluster?.configureExecution(
+            timerCyclesPerInstruction: machine.vm.timerCyclesPerInstruction,
+            wallClockRunBudgetNanoseconds: machine.vm.wallClockRunBudgetNanoseconds,
+            nativeCheckpointBlockInterval: machine.vm.nativeCheckpointBlockInterval,
+            hostPreemptionGenerationProvider: machine.vm.hostPreemptionGenerationProvider,
+            fallbackInterpreterPolicy: .nativeOnly
+        )
+        machine.parallelVCPUCluster?.configureRunBudget(
+            wallClockRunBudgetNanoseconds: machine.vm.wallClockRunBudgetNanoseconds,
+            nativeCheckpointBlockInterval: machine.vm.nativeCheckpointBlockInterval,
+            secondaryRunStepBudget: 5_000_000
+        )
         let cursorPositionQuery: [UInt8] = [0x1b, 0x5b, 0x36, 0x6e]
         let cursorPositionReply: [UInt8] = Array("\u{001B}[1;1R".utf8)
+        let uartStreamChunker = streamUART ? UARTOutputChunker() : nil
+        let uartStreamWriteLock = NSLock()
+        let flushUARTStream = {
+            guard let uartStreamChunker else { return }
+            uartStreamWriteLock.lock()
+            defer { uartStreamWriteLock.unlock() }
+            let bytes = uartStreamChunker.drain()
+            if !bytes.isEmpty {
+                FileHandle.standardError.write(Data(bytes))
+            }
+        }
         var recentUARTOutput: [UInt8] = []
-        if streamUART || uartInputAfterOutput != nil || stopOnUARTOutput != nil || !uartInputBytes.isEmpty {
+        if streamUART || uartInputAfterOutput != nil || stopOnUARTOutput != nil ||
+            !uartInputBytes.isEmpty || uartProgressWatchdog != nil {
             machine.uart.onByte = { byte in
-                if streamUART {
-                    FileHandle.standardError.write(Data([byte]))
+                if let uartStreamChunker {
+                    uartStreamWriteLock.lock()
+                    if let bytes = uartStreamChunker.append(byte) {
+                        FileHandle.standardError.write(Data(bytes))
+                    }
+                    uartStreamWriteLock.unlock()
                 }
+                uartProgressWatchdog?.observe(
+                    byte: byte,
+                    atNanoseconds: DispatchTime.now().uptimeNanoseconds
+                )
                 recentUARTOutput.append(byte)
                 if recentUARTOutput.count > cursorPositionQuery.count {
                     recentUARTOutput.removeFirst(recentUARTOutput.count - cursorPositionQuery.count)
@@ -254,6 +364,9 @@ struct ARM64VizCommand {
         var runtimeError: String?
         var lastException: ARM64ExceptionTraceEntry?
         var executedSteps: Int?
+        var stoppedOnDisplay = false
+        var stoppedOnWallClockBudget = false
+        var stoppedOnUARTNoProgress = false
         let runSliceQuantum = uartInputAfterOutput == nil ? 5_000_000 : 250_000
         do {
             var totalSteps = 0
@@ -265,22 +378,117 @@ struct ARM64VizCommand {
             }
 
             while remainingSteps > 0 {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if let watchdogSnapshot = uartProgressWatchdog?.snapshot(atNanoseconds: now),
+                   watchdogSnapshot.timedOut {
+                    stoppedOnUARTNoProgress = true
+                    break
+                }
+                if let totalWallClockDeadlineNanoseconds,
+                   now >= totalWallClockDeadlineNanoseconds {
+                    stoppedOnWallClockBudget = true
+                    break
+                }
+                if let watchdogSnapshot = uartProgressWatchdog?.snapshot(atNanoseconds: now) {
+                    let configuredBudget = wallClockBudgetMS.map { UInt64($0) * 1_000_000 }
+                    if watchdogSnapshot.completed {
+                        machine.vm.wallClockRunBudgetNanoseconds = configuredBudget
+                    } else {
+                        machine.vm.wallClockRunBudgetNanoseconds = min(
+                            configuredBudget ?? watchdogSnapshot.remainingNanoseconds,
+                            watchdogSnapshot.remainingNanoseconds
+                        )
+                    }
+                }
+                try machine.parallelVCPUCluster?.checkForFailure()
                 machine.virtioNetwork.pumpNetworkReceiveQueue()
                 let sliceSteps = min(remainingSteps, runSliceQuantum)
                 let runResult = try machine.vm.run(maxSteps: sliceSteps)
                 machine.virtioNetwork.pumpNetworkReceiveQueue()
                 totalSteps += runResult.steps
                 finalResult = runResult
+                flushUARTStream()
 
-                if case .maxSteps = runResult.stopReason, runResult.steps == sliceSteps {
+                if let displaySnapshotIntervalNanoseconds,
+                   let snapshotDeadline = nextDisplaySnapshotNanoseconds {
+                    let snapshotNow = DispatchTime.now().uptimeNanoseconds
+                    if snapshotNow >= snapshotDeadline {
+                        if let displaySnapshotPath,
+                           let displaySnapshot = machine.virtioDisplay.displaySnapshot() {
+                            try writeDisplaySnapshot(displaySnapshot, to: displaySnapshotPath)
+                        }
+                        if let displayBackingSnapshotPath,
+                           let backingSnapshot = machine.virtioDisplay.displayBackingSnapshot(
+                               memory: machine.vm.memory
+                           ) {
+                            try writeDisplaySnapshot(backingSnapshot, to: displayBackingSnapshotPath)
+                        }
+                        if let displayResourceDiagnosticsPath,
+                           let diagnostics = machine.virtioDisplay.displayResourceDiagnostics(
+                               memory: machine.vm.memory
+                           ) {
+                            try writeDisplayResourceDiagnostics(
+                                diagnostics,
+                                to: displayResourceDiagnosticsPath,
+                                hostElapsedMilliseconds:
+                                    (snapshotNow &- traceStartedNanoseconds) / 1_000_000
+                            )
+                        }
+                        nextDisplaySnapshotNanoseconds = snapshotNow &+ displaySnapshotIntervalNanoseconds
+                    }
+                }
+
+                if let watchdogSnapshot = uartProgressWatchdog?.snapshot(
+                    atNanoseconds: DispatchTime.now().uptimeNanoseconds
+                ), watchdogSnapshot.timedOut {
+                    stoppedOnUARTNoProgress = true
+                    break
+                }
+
+                if stopOnDisplay,
+                   machine.virtioDisplay.displayFrameMetadata() != nil,
+                   (machine.virtioDisplay.displayPerformanceCounters["flushCommands"] ?? 0) > Double(displayFlushSkip) {
+                    stoppedOnDisplay = true
+                    remainingSteps = 0
+                    continue
+                }
+
+                switch runResult.stopReason {
+                // A wall-clock quantum can return maxSteps before consuming
+                // the instruction allowance. It ends this slice, not the boot.
+                case .maxSteps:
                     remainingSteps -= runResult.steps
-                } else {
+                case .yielded:
+                    remainingSteps -= min(remainingSteps, runResult.steps)
+                    if let cluster = machine.parallelVCPUCluster {
+                        if let timerWait = machine.vm.hostTimerWaitNanoseconds {
+                            let boundedWait = min(timerWait, UInt64(10_000_000))
+                            if boundedWait > 0 {
+                                usleep(useconds_t(max(1, boundedWait / 1_000)))
+                            }
+                            cluster.signal()
+                        } else if machine.vm.hasPendingInterruptForAnyVirtualCPU {
+                            cluster.signal()
+                        } else {
+                            remainingSteps = 0
+                        }
+                    } else if runResult.steps == 0 {
+                        remainingSteps = 0
+                    }
+                default:
                     remainingSteps = 0
                 }
             }
+            try machine.parallelVCPUCluster?.checkForFailure()
 
             if let finalResult {
-                if totalSteps >= maxSteps, case .maxSteps = finalResult.stopReason {
+                if stoppedOnDisplay {
+                    stopReason = "display-frame"
+                } else if stoppedOnUARTNoProgress {
+                    stopReason = "uart-no-progress-timeout"
+                } else if stoppedOnWallClockBudget {
+                    stopReason = "total-wall-clock-budget"
+                } else if totalSteps >= maxSteps, case .maxSteps = finalResult.stopReason {
                     stopReason = RunStopReason.maxSteps(maxSteps).description
                 } else {
                     stopReason = finalResult.stopReason.description
@@ -288,10 +496,16 @@ struct ARM64VizCommand {
                 lastException = finalResult.lastException
                 executedSteps = totalSteps
             }
+            if stoppedOnUARTNoProgress, stopReason == nil {
+                stopReason = "uart-no-progress-timeout"
+                executedSteps = totalSteps
+            }
         } catch {
             runtimeError = String(describing: error)
             lastException = machine.vm.lastException
         }
+        machine.parallelVCPUCluster?.stop()
+        flushUARTStream()
         if let writebackDiskPath {
             try Data(machine.virtioBlock.storageBytes).write(to: URL(fileURLWithPath: writebackDiskPath))
         }
@@ -300,6 +514,47 @@ struct ARM64VizCommand {
         let exception = lastException ?? machine.vm.lastException
         let physicalKernelLoadAddress = result.layout.kernelLoadAddress
         let backendPerformance = (machine.vm.backend as? SoftwareARM64Backend)?.performanceSnapshot()
+        let primaryAssemblyStatistics = (machine.vm.backend as? SoftwareARM64Backend)?
+            .nativeAssemblyStatistics ?? [:]
+        let secondaryAssemblyStatistics = machine.parallelVCPUCluster?
+            .secondaryAssemblyStatistics ?? [:]
+        let secondaryHotPCs = hotPCProfilingEnabled
+            ? machine.parallelVCPUCluster?.secondaryHotPCProfile ?? []
+            : []
+        let primaryHotPCs = (machine.vm.backend as? SoftwareARM64Backend)?
+            .nativeHotPCSnapshot(limit: 32)
+            .map {
+                NativeHotPCSummary(
+                    pc: hex($0.pc),
+                    samples: $0.samples,
+                    linkRegister: hex($0.linkRegister),
+                    instructions: $0.instructions.map { hex(UInt64($0)) }
+                )
+            } ?? []
+        let secondaryExecutionTotals = machine.parallelVCPUCluster?.secondaryExecutionTotals
+        let wallClockElapsedMilliseconds =
+            (DispatchTime.now().uptimeNanoseconds &- traceStartedNanoseconds) / 1_000_000
+        let uartProgressSnapshot = uartProgressWatchdog?.snapshot(
+            atNanoseconds: DispatchTime.now().uptimeNanoseconds
+        )
+        let displayFrame = machine.virtioDisplay.displayFrameMetadata()
+        let displayPerformanceCounters = machine.virtioDisplay.displayPerformanceCounters
+        if let displaySnapshotPath,
+           let displaySnapshot = machine.virtioDisplay.displaySnapshot() {
+            try writeDisplaySnapshot(displaySnapshot, to: displaySnapshotPath)
+        }
+        if let displayBackingSnapshotPath,
+           let backingSnapshot = machine.virtioDisplay.displayBackingSnapshot(memory: machine.vm.memory) {
+            try writeDisplaySnapshot(backingSnapshot, to: displayBackingSnapshotPath)
+        }
+        if let displayResourceDiagnosticsPath,
+           let diagnostics = machine.virtioDisplay.displayResourceDiagnostics(memory: machine.vm.memory) {
+            try writeDisplayResourceDiagnostics(
+                diagnostics,
+                to: displayResourceDiagnosticsPath,
+                hostElapsedMilliseconds: wallClockElapsedMilliseconds
+            )
+        }
         let recentMemoryAccesses = machine.vm.guestMemoryTrace.map {
             guestMemoryTraceSummary($0, symbols: symbols, physicalKernelLoadAddress: physicalKernelLoadAddress)
         }
@@ -307,6 +562,26 @@ struct ARM64VizCommand {
             guest: result.configuration.machineName,
             profile: result.layout.profile.rawValue,
             backend: machine.vm.backend.name,
+            virtualCPUCount: machine.vm.virtualCPUCount,
+            parallelVCPUExecution: machine.parallelVCPUCluster != nil,
+            timerMode: machine.parallelVCPUCluster == nil
+                ? "instruction-scaled"
+                : "host-monotonic",
+            initialCounterTicksPerHostSecond: prepared.initialCounterTicksPerHostSecond,
+            smpActiveCounterTicksPerHostSecond: prepared.smpActiveCounterTicksPerHostSecond,
+            advertisedCNTFRQ: prepared.advertisedCNTFRQ,
+            totalWallClockBudgetMilliseconds: totalWallClockBudgetMS,
+            uartNoProgressTimeoutMilliseconds: uartNoProgressTimeoutMS,
+            uartProgressMilestones: uartProgressWatchdog == nil ? [] : uartProgressMilestones,
+            uartProgressMilestonesReached: uartProgressSnapshot?.reachedMilestones ?? [],
+            nextUARTProgressMilestone: uartProgressSnapshot?.nextMilestone,
+            uartProgressCompleted: uartProgressSnapshot?.completed ?? false,
+            wallClockElapsedMilliseconds: wallClockElapsedMilliseconds,
+            secondaryExecutedSteps: machine.parallelVCPUCluster?.secondaryExecutedSteps ?? 0,
+            secondaryNativeSteps: secondaryExecutionTotals?.nativeSteps ?? 0,
+            secondaryFallbackSteps: secondaryExecutionTotals?.fallbackSteps ?? 0,
+            primaryAssemblyStatistics: primaryAssemblyStatistics,
+            secondaryAssemblyStatistics: secondaryAssemblyStatistics,
             entryPoint: hex(result.layout.kernelLoadAddress),
             fdtAddress: hex(result.layout.fdtLoadAddress),
             fdtByteCount: result.layout.fdtByteCount,
@@ -324,6 +599,10 @@ struct ARM64VizCommand {
             el0FaultSkip: el0FaultSkip,
             stopOnUART: stopOnUART,
             stopOnUARTOutput: stopOnUARTOutput,
+            stopOnDisplay: stopOnDisplay,
+            displayFlushSkip: displayFlushSkip,
+            displaySnapshotPath: displaySnapshotPath,
+            displayBackingSnapshotPath: displayBackingSnapshotPath,
             streamUART: streamUART,
             uartInputByteCount: uartInputBytes.count,
             uartInputInjected: uartInputInjected,
@@ -355,10 +634,29 @@ struct ARM64VizCommand {
             linkLocalTransmittedFrames: prepared.networkBackend.transmittedFrameCount,
             linkLocalGeneratedFrames: prepared.networkBackend.generatedFrameCount,
             linkLocalRecentFrames: prepared.networkBackend.recentFrameSummaries,
+            displayFrame: displayFrame.map {
+                DisplayFrameSummary(
+                    width: $0.width,
+                    height: $0.height,
+                    stride: $0.stride,
+                    bytesPerPixel: $0.bytesPerPixel,
+                    generation: $0.generation,
+                    commitTimestampNanoseconds: $0.commitTimestampNanoseconds,
+                    damageRectangleCount: $0.damage.count,
+                    damagedByteCount: $0.damagedByteCount,
+                    hasStableStorage: $0.hasStableStorage
+                )
+            },
+            displayGeneration: machine.virtioDisplay.displayGeneration,
+            displayPresented: (displayPerformanceCounters["flushCommands"] ?? 0) > Double(displayFlushSkip),
+            displayDiagnostics: machine.virtioDisplay.displayDiagnostics,
+            displayPerformanceCounters: displayPerformanceCounters,
             el0FaultCount: machine.vm.observedEL0FaultCount,
             translationCacheHits: machine.vm.translationCacheHits,
             translationCacheMisses: machine.vm.translationCacheMisses,
             backendPerformance: backendPerformance,
+            primaryHotPCs: primaryHotPCs,
+            secondaryHotPCs: secondaryHotPCs,
             symbolMap: symbols.map { SymbolMapSummary(path: symbolMapPath ?? "", symbolCount: $0.symbolCount) },
             stopReason: stopReason,
             error: runtimeError,
@@ -443,45 +741,149 @@ struct ARM64VizCommand {
         print("")
     }
 
-    private static func prepareLinuxMachine(arguments: [String]) throws -> PreparedLinuxMachine {
+    private static func prepareLinuxMachine(
+        arguments: [String],
+        forceSingleVCPU: Bool = false
+    ) throws -> PreparedLinuxMachine {
         let positional = positionalArguments(in: arguments)
         guard let kernelPath = positional.first else {
             throw VMError.deviceError("missing Linux ARM64 Image path")
         }
 
-        let kernel = try Data(contentsOf: URL(fileURLWithPath: kernelPath))
-        let initrd = try optionalData(path: optionalValue(after: "--initrd", in: arguments))
+        let profile = try linuxGuestProfile(arguments: arguments)
+        let kernelOrBootImage = try Data(contentsOf: URL(fileURLWithPath: kernelPath))
+        let parsedBootImage: AndroidBootImage?
+        if profile == .lineageOS, AndroidBootImage.isAndroidBootImage([UInt8](kernelOrBootImage)) {
+            parsedBootImage = try AndroidBootImage(bytes: [UInt8](kernelOrBootImage))
+        } else {
+            parsedBootImage = nil
+        }
+
+        let explicitInitrd = try optionalData(path: optionalValue(after: "--initrd", in: arguments))
+        let initBoot = try optionalData(path: optionalValue(after: "--init-boot", in: arguments)).map {
+            try AndroidBootImage(bytes: [UInt8]($0))
+        }
+        let vendorBoot = try optionalData(path: optionalValue(after: "--vendor-boot", in: arguments)).map {
+            try AndroidVendorBootImage(bytes: [UInt8]($0))
+        }
+        guard initBoot == nil || initBoot?.kernel.isEmpty == true else {
+            throw VMError.unsupportedGuest("--init-boot must reference an Android init_boot image without a kernel payload")
+        }
+
+        let kernel = parsedBootImage.map { Data($0.kernel) } ?? kernelOrBootImage
+        let initBootRamdisk: Data? = initBoot?.ramdisk.map { Data($0) }
+        let packedBootRamdisk: Data? = parsedBootImage?.ramdisk.map { Data($0) }
+        let genericInitrd: Data? = explicitInitrd ?? initBootRamdisk ?? packedBootRamdisk
+        let initrd: Data? = genericInitrd.map { generic in
+            guard let vendorBoot else { return generic }
+            return Data(vendorBoot.assembledRamdisk(genericRamdisk: [UInt8](generic)))
+        }
         let dtb = try optionalData(path: optionalValue(after: "--dtb", in: arguments))
-        let disk = try optionalData(path: optionalValue(after: "--disk", in: arguments))
+        let diskPath = try optionalValue(after: "--disk", in: arguments)
+        let secondaryDiskPath = try optionalValue(after: "--secondary-disk", in: arguments)
+        let diskStorage = try diskPath.map {
+            try FileBackedVirtIOBlockStorage(url: URL(fileURLWithPath: $0))
+        }
+        let secondaryDiskStorage = try secondaryDiskPath.map {
+            try FileBackedVirtIOBlockStorage(url: URL(fileURLWithPath: $0))
+        }
         let memoryMiB = try optionalInt(after: "--memory-mib", in: arguments) ?? 512
         let memorySize = memoryMiB * 1024 * 1024
-        let blockStorageSize = max(1024 * 1024, disk?.count ?? 0)
-        let profile: LinuxGuestProfile = hasFlag("--postmarketos", in: arguments) ? .postmarketOS : .generic
+        let requestedVirtualCPUCount = forceSingleVCPU
+            ? 1
+            : (try optionalInt(after: "--vcpus", in: arguments) ??
+                profile.recommendedVirtualCPUCount)
+        guard (1...8).contains(requestedVirtualCPUCount) else {
+            throw VMError.deviceError("--vcpus must be between 1 and 8")
+        }
+        let parallelVCPUExecution = requestedVirtualCPUCount > 1 &&
+            !hasFlag("--cooperative-vcpus", in: arguments)
+        let blockStorageSize = max(1024 * 1024, diskStorage?.count ?? 0)
+        let activeCounterRate = try optionalInt(after: "--smp-counter-hz", in: arguments)
+            ?? Int(profile.recommendedSMPActiveCounterTicksPerHostSecond)
+        guard activeCounterRate > 0, activeCounterRate <= Int(UInt32.max) else {
+            throw VMError.deviceError("--smp-counter-hz must be between 1 and 4294967295")
+        }
+        let initialCounterRate = profile.recommendedCounterTicksPerHostSecond
         let publishedDevices: ResearchMachineDevicePublication = hasFlag("--minimal-devices", in: arguments) ? .linuxConsole : .full
+
+        let explicitBootArguments = try optionalValue(after: "--bootargs", in: arguments)
+        let embeddedBootArguments = [
+            vendorBoot?.commandLine ?? "",
+            parsedBootImage?.commandLine ?? ""
+        ].filter { !$0.isEmpty }.joined(separator: " ")
+        let bootArguments: String?
+        if let explicitBootArguments {
+            bootArguments = explicitBootArguments
+        } else if profile == .lineageOS, !embeddedBootArguments.isEmpty {
+            bootArguments = profile.mergedBootArguments([profile.defaultBootArguments, embeddedBootArguments])
+        } else {
+            bootArguments = nil
+        }
 
         let machine = try MachineFactory.makeResearchMachine(
             memorySize: memorySize,
             blockStorageSize: blockStorageSize,
+            blockStorage: diskStorage,
+            secondaryBlockStorage: secondaryDiskStorage,
+            virtualCPUCount: requestedVirtualCPUCount,
+            parallelVCPUExecution: parallelVCPUExecution,
+            parallelCounterTicksPerHostSecond:
+                initialCounterRate,
+            parallelActiveCounterTicksPerHostSecond:
+                UInt32(activeCounterRate),
+            virtioTransport: profile == .lineageOS ? .pci : .mmio,
+            enableVirGL: profile == .lineageOS,
             publishedDevices: publishedDevices
         )
         let networkBackend = LinkLocalVirtIONetworkBackend()
         machine.virtioNetwork.attachNetworkBackend(networkBackend)
-        let adapter = LinuxDirectBootAdapter(
-            artifacts: LinuxBootArtifacts(
-                kernelImage: [UInt8](kernel),
-                initrd: initrd.map { [UInt8]($0) },
-                deviceTreeBlob: dtb.map { [UInt8]($0) },
-                diskImage: disk.map { [UInt8]($0) }
-            ),
-            profile: profile,
-            bootArguments: try optionalValue(after: "--bootargs", in: arguments)
+        let artifacts = LinuxBootArtifacts(
+            kernelImage: [UInt8](kernel),
+            initrd: initrd.map { [UInt8]($0) },
+            deviceTreeBlob: dtb.map { [UInt8]($0) },
+            diskByteCountHint: diskStorage?.count
         )
+        let loadResult: LinuxBootLoadResult
+        if profile == .lineageOS {
+            loadResult = try LineageOSBootAdapter(
+                artifacts: artifacts,
+                bootArguments: bootArguments
+            ).loadWithResult(into: machine.vm)
+        } else {
+            loadResult = try LinuxDirectBootAdapter(
+                artifacts: artifacts,
+                profile: profile,
+                bootArguments: bootArguments
+            ).loadWithResult(into: machine.vm)
+        }
+        if machine.parallelVCPUCluster != nil {
+            machine.vm.memory.beginConcurrentExecution()
+        }
 
         return PreparedLinuxMachine(
             machine: machine,
-            loadResult: try adapter.loadWithResult(into: machine.vm),
-            networkBackend: networkBackend
+            loadResult: loadResult,
+            networkBackend: networkBackend,
+            initialCounterTicksPerHostSecond: initialCounterRate,
+            smpActiveCounterTicksPerHostSecond: UInt32(activeCounterRate),
+            advertisedCNTFRQ: machine.vm.systemRegisters.read(
+                ARM64SystemRegister.cntfrqEL0,
+                cpu: machine.vm.cpu
+            )
         )
+    }
+
+    private static func linuxGuestProfile(arguments: [String]) throws -> LinuxGuestProfile {
+        let profileFlags: [(String, LinuxGuestProfile)] = [
+            ("--postmarketos", .postmarketOS),
+            ("--lineageos", .lineageOS)
+        ]
+        let selected = profileFlags.filter { hasFlag($0.0, in: arguments) }
+        guard selected.count <= 1 else {
+            throw VMError.deviceError("select only one Linux guest profile: --postmarketos or --lineageos")
+        }
+        return selected.first?.1 ?? .generic
     }
 
     private static func diffLinuxBlocks(arguments: [String]) throws {
@@ -490,8 +892,8 @@ struct ARM64VizCommand {
         let progressSteps = try optionalNonNegativeInt(after: "--progress-steps", in: arguments) ?? 100_000
         let debugChunks = hasFlag("--debug-chunks", in: arguments)
         let timerScale = UInt64(try optionalNonNegativeInt(after: "--timer-scale", in: arguments) ?? 1)
-        let reference = try prepareLinuxMachine(arguments: arguments)
-        let candidate = try prepareLinuxMachine(arguments: arguments)
+        let reference = try prepareLinuxMachine(arguments: arguments, forceSingleVCPU: true)
+        let candidate = try prepareLinuxMachine(arguments: arguments, forceSingleVCPU: true)
 
         guard
             let referenceBackend = reference.machine.vm.backend as? SoftwareARM64Backend,
@@ -767,14 +1169,22 @@ struct ARM64VizCommand {
               benchmark-native [--steps n]
                          Measure the trained native C execution loop without
                          tracing, timers, MMIO, or interpreter fallback.
-              prepare-linux <Image> [--postmarketos] [--initrd path]
+              prepare-linux <Image|boot.img> [--postmarketos|--lineageos]
+                         [--initrd path] [--init-boot init_boot.img]
                          [--dtb path] [--disk path] [--memory-mib n]
+                         [--vcpus 1...8] [--cooperative-vcpus]
                          [--bootargs "..."] [--minimal-devices]
                          [--dump-generated-dtb path]
-                         Prepare native ARM64 Linux/postmarketOS boot state
+                         Prepare native ARM64 Linux/postmarketOS/LineageOS boot state
                          without invoking QEMU. This loads artifacts, stages
                          FDT/initrd/disk state, and reports the handoff.
-              run-linux-trace <Image> [--postmarketos] [--initrd path]
+                         With --lineageos, Android boot header v3/v4 boot.img
+                         is unpacked automatically. Android 13+ builds can pass
+                         their separate ramdisk with --init-boot.
+              prepare-lineageos <Image|boot.img> [same options]
+                         Alias for prepare-linux --lineageos.
+              run-linux-trace <Image|boot.img> [--postmarketos|--lineageos]
+                         [--initrd path] [--init-boot init_boot.img]
                          [--dtb path] [--disk path] [--memory-mib n]
                          [--bootargs "..."] [--minimal-devices] [--max-steps n]
                          [--dump-generated-dtb path]
@@ -784,6 +1194,11 @@ struct ARM64VizCommand {
                          [--stop-on-el0] [--stop-on-el0-fault]
                          [--el0-fault-skip n] [--stop-on-uart]
                          [--stop-on-uart-output text]
+                         [--stop-on-display] [--display-flush-skip n]
+                         [--display-snapshot frame.ppm]
+                         [--display-backing-snapshot guest-frame.ppm]
+                         [--display-resource-diagnostics resources.json]
+                         [--display-snapshot-interval-ms n]
                          [--stream-uart] [--mmio-trace-depth n]
                          [--memory-trace-depth n] [--memory-trace-el0-only]
                          [--stop-on-memory-write-virtual address]
@@ -794,6 +1209,9 @@ struct ARM64VizCommand {
                          [--uart-input-after-output text]
                          [--writeback-disk path] [--profile-backend-timing]
                          [--wall-clock-budget-ms n]
+                         [--total-wall-clock-budget-ms n]
+                         [--uart-no-progress-timeout-ms n]
+                         [--uart-progress-marker text]...
                          Attempt native execution with the owned software
                          backend and emit a bounded instruction trace. This is
                          diagnostic only; full Linux execution is still pending.
@@ -806,6 +1224,18 @@ struct ARM64VizCommand {
                          Use --stop-on-uart to stop at the first PL011 byte.
                          Use --stop-on-uart-output to stop after escaped text
                          has appeared on PL011.
+                         Use --stop-on-display to stop after the first guest-
+                         presented virtio-gpu scanout frame.
+                         Use --display-flush-skip to ignore earlier frames and
+                         --display-snapshot to save the final frame as PPM.
+                         Use --display-backing-snapshot to independently read
+                         the active scanout's guest RAM for comparison.
+                         Use --display-snapshot-interval-ms to atomically update
+                         supplied snapshot and resource-diagnostic paths while
+                         execution continues; final files are still written
+                         when execution ends.
+                         Use --display-resource-diagnostics to compare each GPU
+                         resource's committed host pixels with raw guest backing.
                          Use --memory-trace-depth to retain recent normal RAM
                          reads/writes, and --memory-trace-el0-only to limit it
                          to userspace accesses.
@@ -821,12 +1251,27 @@ struct ARM64VizCommand {
                          Use --sysreg-trace-depth to retain recent MRS/MSR state.
                          Use --profile-backend-timing when nanosecond backend
                          timing counters are worth the extra timestamp overhead.
+                         Use --total-wall-clock-budget-ms to end the complete
+                         trace cleanly with diagnostics after a fixed duration.
+                         Use --uart-no-progress-timeout-ms 300000 for a
+                         five-minute LineageOS progress watchdog. Only ordered
+                         boot milestones renew it, so repeated UART log spam
+                         cannot keep a stuck boot alive. Repeat
+                         --uart-progress-marker to replace the built-in Linux,
+                         init, SurfaceFlinger, and SystemUI milestones.
+                         Interactive runs default to two parallel vCPUs, or four
+                         for LineageOS. --cooperative-vcpus keeps the selected
+                         topology on the single-threaded scheduler for diagnosis.
                          Use --timer-scale to set counter ticks per instruction;
                          0 means event-driven timer advancement at WFI only.
                          Use --minimal-devices for initramfs shell traces that
                          only publish GIC, timer, and UART in the guest FDT.
                          Use --writeback-disk to persist virtio-block storage
                          after the trace run completes.
+              run-lineageos-trace <Image|boot.img> [same options]
+                         [--smp-counter-hz n] diagnostic counter ticks per host
+                         second after secondary CPU startup (default 6000000).
+                         Alias for run-linux-trace --lineageos.
               diff-linux-blocks <Image> [--initrd path] [--dtb path]
                          [--disk path] [--memory-mib n] [--bootargs "..."]
                          [--minimal-devices] [--max-steps n]
@@ -1374,6 +1819,51 @@ struct ARM64VizCommand {
         return String(decoding: tail, as: UTF8.self)
     }
 
+    private static func writeDisplaySnapshot(
+        _ snapshot: VirtualFramebufferSnapshot,
+        to path: String
+    ) throws {
+        guard snapshot.bytesPerPixel == 4,
+              snapshot.width > 0,
+              snapshot.height > 0,
+              snapshot.stride >= snapshot.width * snapshot.bytesPerPixel else {
+            throw VMError.deviceError("unsupported display snapshot layout")
+        }
+
+        var output = Data("P6\n\(snapshot.width) \(snapshot.height)\n255\n".utf8)
+        var rgb = [UInt8](repeating: 0, count: snapshot.width * snapshot.height * 3)
+        for y in 0..<snapshot.height {
+            let sourceRow = y * snapshot.stride
+            let destinationRow = y * snapshot.width * 3
+            for x in 0..<snapshot.width {
+                let source = sourceRow + x * 4
+                let destination = destinationRow + x * 3
+                rgb[destination] = snapshot.pixels[source + 2]
+                rgb[destination + 1] = snapshot.pixels[source + 1]
+                rgb[destination + 2] = snapshot.pixels[source]
+            }
+        }
+        output.append(contentsOf: rgb)
+        try output.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    private static func writeDisplayResourceDiagnostics(
+        _ snapshot: VirtualGPUResourceDiagnosticsSnapshot,
+        to path: String,
+        hostElapsedMilliseconds: UInt64
+    ) throws {
+        let output = DisplayResourceDiagnosticsOutput(
+            hostElapsedMilliseconds: hostElapsedMilliseconds,
+            device: snapshot
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(output).write(
+            to: URL(fileURLWithPath: path),
+            options: .atomic
+        )
+    }
+
     private static func traceSystemRegisters(_ registers: ARM64SystemRegisterBank, cpu: CPUState) -> [RegisterSummary] {
         let selected: [ARM64SystemRegisterKey] = [
             ARM64SystemRegister.currentEL,
@@ -1431,8 +1921,11 @@ struct ARM64VizCommand {
             return nil
         }
         let virtualAddress = exception.faultAddress ?? exception.returnAddress
-        let usesTTBR1 = (virtualAddress >> 63) == 1
         let tcr = vm.systemRegisters.rawValue(for: ARM64SystemRegister.tcrEL1)
+        let usesTTBR1 = ARM64Stage1Translator.usesTTBR1(
+            virtualAddress: virtualAddress,
+            tcr: tcr
+        )
         let sizeOffset = usesTTBR1 ? 16 : 0
         let tsz = Int((tcr >> UInt64(sizeOffset)) & 0x3f)
         let inputAddressSize = 64 - tsz
@@ -1462,7 +1955,10 @@ struct ARM64VizCommand {
             )
         }
 
-        for level in 0...3 {
+        let indexedBits = max(0, inputAddressSize - 12)
+        let lookupLevels = max(1, (indexedBits + 8) / 9)
+        let startLevel = max(0, 4 - lookupLevels)
+        for level in startLevel...3 {
             let shift = 39 - (level * 9)
             let index = (effectiveAddress >> UInt64(shift)) & 0x1ff
             let descriptorAddress = currentTable + index * 8
@@ -1546,9 +2042,14 @@ struct ARM64VizCommand {
         let optionsWithValues: Set<String> = [
             "--bootargs",
             "--disk",
+            "--display-snapshot",
+            "--display-backing-snapshot",
+            "--display-resource-diagnostics",
+            "--display-snapshot-interval-ms",
             "--dump-generated-dtb",
             "--dtb",
             "--initrd",
+            "--init-boot",
             "--exception-storm-threshold",
             "--breakpoint",
             "--breakpoint-skip",
@@ -1564,8 +2065,13 @@ struct ARM64VizCommand {
             "--stop-on-memory-write-physical",
             "--stop-on-memory-write-virtual",
             "--sysreg-trace-depth",
+            "--smp-counter-hz",
             "--timer-scale",
             "--trace-depth",
+            "--total-wall-clock-budget-ms",
+            "--uart-no-progress-timeout-ms",
+            "--uart-progress-marker",
+            "--vcpus",
             "--writeback-disk"
         ]
         while index < arguments.endIndex {
@@ -1722,6 +2228,8 @@ private struct LinuxPrepareSummary: Encodable {
     let guest: String
     let profile: String
     let backend: String
+    let virtualCPUCount: Int
+    let parallelVCPUExecution: Bool
     let entryPoint: String
     let fdtAddress: String
     let fdtByteCount: Int
@@ -1767,6 +2275,24 @@ private struct LinuxTraceSummary: Encodable {
     let guest: String
     let profile: String
     let backend: String
+    let virtualCPUCount: Int
+    let parallelVCPUExecution: Bool
+    let timerMode: String
+    let initialCounterTicksPerHostSecond: UInt32
+    let smpActiveCounterTicksPerHostSecond: UInt32
+    let advertisedCNTFRQ: UInt64
+    let totalWallClockBudgetMilliseconds: Int?
+    let uartNoProgressTimeoutMilliseconds: Int?
+    let uartProgressMilestones: [String]
+    let uartProgressMilestonesReached: [String]
+    let nextUARTProgressMilestone: String?
+    let uartProgressCompleted: Bool
+    let wallClockElapsedMilliseconds: UInt64
+    let secondaryExecutedSteps: UInt64
+    let secondaryNativeSteps: UInt64
+    let secondaryFallbackSteps: UInt64
+    let primaryAssemblyStatistics: [String: UInt64]
+    let secondaryAssemblyStatistics: [String: [String: UInt64]]
     let entryPoint: String
     let fdtAddress: String
     let fdtByteCount: Int
@@ -1784,6 +2310,10 @@ private struct LinuxTraceSummary: Encodable {
     let el0FaultSkip: Int
     let stopOnUART: Bool
     let stopOnUARTOutput: String?
+    let stopOnDisplay: Bool
+    let displayFlushSkip: Int
+    let displaySnapshotPath: String?
+    let displayBackingSnapshotPath: String?
     let streamUART: Bool
     let uartInputByteCount: Int
     let uartInputInjected: Bool
@@ -1809,10 +2339,17 @@ private struct LinuxTraceSummary: Encodable {
     let linkLocalTransmittedFrames: Int
     let linkLocalGeneratedFrames: Int
     let linkLocalRecentFrames: [String]
+    let displayFrame: DisplayFrameSummary?
+    let displayGeneration: UInt64?
+    let displayPresented: Bool
+    let displayDiagnostics: String
+    let displayPerformanceCounters: [String: Double]
     let el0FaultCount: Int
     let translationCacheHits: Int
     let translationCacheMisses: Int
     let backendPerformance: ARM64BackendPerformanceSnapshot?
+    let primaryHotPCs: [NativeHotPCSummary]
+    let secondaryHotPCs: [[String: String]]
     let symbolMap: SymbolMapSummary?
     let stopReason: String?
     let error: String?
@@ -1848,10 +2385,34 @@ private struct LinuxTraceSummary: Encodable {
     let nextBackendWork: [String]
 }
 
+private struct NativeHotPCSummary: Encodable {
+    let pc: String
+    let samples: UInt64
+    let linkRegister: String
+    let instructions: [String]
+}
+
+private struct DisplayResourceDiagnosticsOutput: Encodable {
+    let hostElapsedMilliseconds: UInt64
+    let device: VirtualGPUResourceDiagnosticsSnapshot
+}
+
 private struct VirtIOBlockRequestTypeSummary: Encodable {
     let requestType: UInt32
     let name: String
     let count: Int
+}
+
+private struct DisplayFrameSummary: Encodable {
+    let width: Int
+    let height: Int
+    let stride: Int
+    let bytesPerPixel: Int
+    let generation: UInt64
+    let commitTimestampNanoseconds: UInt64
+    let damageRectangleCount: Int
+    let damagedByteCount: Int
+    let hasStableStorage: Bool
 }
 
 private struct RegisterSummary: Encodable {
@@ -2044,4 +2605,7 @@ private struct PreparedLinuxMachine {
     let machine: ResearchMachine
     let loadResult: LinuxBootLoadResult
     let networkBackend: LinkLocalVirtIONetworkBackend
+    let initialCounterTicksPerHostSecond: UInt32
+    let smpActiveCounterTicksPerHostSecond: UInt32
+    let advertisedCNTFRQ: UInt64
 }

@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "name": "LineageOS virtio_arm64only minimal safe post-build patch",
+  "release": "v2026.10.18",
+  "source": {
+    "sizeBytes": 5368709120,
+    "sha256": "3b832a5e48eb904fe6c130a68251cae29f4ff4b82364b38bd9c591ccfe722f3c"
+  },
+  "preserve": [
+    "product/priv-app/SettingsIntelligence",
+    "product/app/LatinIME",
+    "system/bin/surfaceflinger",
+    "system_ext/priv-app/Launcher3QuickStep",
+    "system_ext/priv-app/LineageSettingsProvider",
+    "system_ext/priv-app/Settings",
+    "system_ext/priv-app/SystemUI",
+    "vendor/bin/hw/android.hardware.security.keymint-service",
+    "vendor/lib64/hw/gralloc.default.so",
+    "vendor/lib64/hw/mapper.minigbm_upstream.so",
+    "vendor/lib64/hw/vulkan.virtio.so"
+  ],
+  "actions": [
+    {
+      "type": "replaceFile",
+      "partition": "vendor_dlkm",
+      "path": "/lib/modules/modules.load",
+      "replacement": "lineageos-modules.load",
+      "existingSha256": "83cad775f2741447a7d9adf34cd33e95682cbbc0dbb7228e5adccd6a00bc5634",
+      "replacementSha256": "210a45341733b9f5b5ea7337f3e5164a34e147920ceba024c39a87ae9e791db8",
+      "selinuxContext": "u:object_r:vendor_file:s0",
+      "reason": "Replace the pinned release's crashing virt_wifi module with its Bluetooth dependency while preserving the rest of the module list."
+    },
+    {
+      "type": "replaceFile",
+      "partition": "vendor",
+      "path": "/etc/fstab.virtio",
+      "replacement": "lineageos-fstab.virtio-unencrypted",
+      "existingSha256": "98b0c4d968d8b24abf51a415b321a05dad2329ea30624d2957dbe17055838a52",
+      "replacementSha256": "cd0a6d09850a10bbb19de70be322ad38eb37fcb9b1cd5cdf37a02907ae5b9265",
+      "selinuxContext": "u:object_r:vendor_configs_file:s0",
+      "reason": "Use stable unencrypted userdata for the emulator because its stub KeyMint cannot persist Android file-encryption keys across boots."
+    }
+  ]
+}

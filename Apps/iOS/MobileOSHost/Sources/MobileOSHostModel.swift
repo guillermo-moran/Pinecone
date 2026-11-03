@@ -25,6 +25,31 @@ private func linuxConsoleBootArguments() -> String {
     return arguments.joined(separator: " ")
 }
 
+enum GuestBootTarget: String, CaseIterable, Identifiable, Sendable {
+    case alpine
+    case android
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .alpine:
+            return "Alpine Linux"
+        case .android:
+            return "Android (LineageOS)"
+        }
+    }
+
+    var profile: LinuxGuestProfile {
+        switch self {
+        case .alpine:
+            return .generic
+        case .android:
+            return .lineageOS
+        }
+    }
+}
+
 @MainActor
 final class HostPerformanceFeed: ObservableObject {
     struct Snapshot: Equatable, Sendable {
@@ -67,6 +92,7 @@ final class HostPerformanceFeed: ObservableObject {
 
 @MainActor
 final class MobileOSHostModel: ObservableObject {
+    @Published private(set) var selectedBootTarget: GuestBootTarget?
     @Published private(set) var vmBootLog: String = ""
     @Published private(set) var terminalText: String = ""
     @Published private(set) var linuxReport: LinuxHostReport?
@@ -91,7 +117,11 @@ final class MobileOSHostModel: ObservableObject {
     private var pendingTerminalControlBytes: [UInt8] = []
 
     private static let terminalLimit = 64_000
-    private static let terminalFlushIntervalNanoseconds: UInt64 = 50_000_000
+    // Publishing the verbose Android UART at 20 Hz forces SwiftUI to repeatedly
+    // lay out tens of thousands of monospaced characters and can starve the VM.
+    // Four updates per second remains live enough for a console while leaving
+    // the emulator threads the overwhelming majority of the host CPU budget.
+    private static let terminalFlushIntervalNanoseconds: UInt64 = 250_000_000
     private static let bootRunSliceSteps = 40_000
     private static let interactiveRunSliceSteps = 1_000_000
     private static let idleRunSliceSteps = 4_000
@@ -120,17 +150,21 @@ final class MobileOSHostModel: ObservableObject {
     }
 
     var terminalPromptLabel: String {
-        hasShellPrompt ? "arm64viz-root #" : "ttyAMA0"
+        if selectedBootTarget == .android {
+            return "ttyAMA0 • LineageOS"
+        }
+        return hasShellPrompt ? "arm64viz-root #" : "ttyAMA0"
     }
 
     var canSendTerminalInput: Bool {
         status == .running && hasShellPrompt
     }
 
-    func boot() async {
+    func boot(_ target: GuestBootTarget) async {
         stop()
         await waitForCleanupToFinish()
 
+        selectedBootTarget = target
         runIdentifier &+= 1
         let activeRunIdentifier = runIdentifier
         status = .booting
@@ -170,12 +204,15 @@ final class MobileOSHostModel: ObservableObject {
         bootTask = Task.detached(priority: .userInitiated) { [weak self, uartCoalescer] in
             do {
                 try Task.checkCancellation()
-                let bundle = try MobileOSHostModel.loadBundledShellArtifacts()
+                let bundle = try MobileOSHostModel.loadBootArtifacts(for: target)
 
                 try Task.checkCancellation()
                 let runtime = try LinuxConsoleRuntime(
                     artifacts: bundle.artifacts,
-                    diskPersistenceURL: bundle.diskPersistenceURL
+                    diskPersistenceURL: bundle.diskPersistenceURL,
+                    secondaryDiskPersistenceURL: bundle.secondaryDiskPersistenceURL,
+                    profile: target.profile,
+                    bootArguments: bundle.bootArguments
                 ) { bytes in
                     uartCoalescer.append(bytes)
                 }
@@ -200,6 +237,22 @@ final class MobileOSHostModel: ObservableObject {
                 )
             }
         }
+    }
+
+    func restartSelectedGuest() async {
+        guard let selectedBootTarget else { return }
+        await boot(selectedBootTarget)
+    }
+
+    func prepareLineageOSImportFolder() {
+        _ = try? Self.ensureLineageOSImportFolder()
+    }
+
+    func returnToBootOptions() {
+        stop()
+        selectedBootTarget = nil
+        lastError = nil
+        linuxReport = nil
     }
 
     func stop() {
@@ -523,6 +576,9 @@ final class MobileOSHostModel: ObservableObject {
     ) {
         guard runIdentifier == self.runIdentifier else { return }
         displayFeed.publish(metadata)
+        if selectedBootTarget == .android {
+            isPhoshReady = runtime?.hasVisibleDisplayContent == true
+        }
     }
 
     private func recordRunnerProgress(
@@ -670,7 +726,10 @@ final class MobileOSHostModel: ObservableObject {
 
 #if targetEnvironment(simulator)
     private static var simulatorUARTLogURL: URL? {
-        guard ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_DUMP_UART"] == "1",
+        // Keep the complete boot evidence even when launched from Simulator's
+        // home screen. The on-screen transcript is intentionally only a tail.
+        // Explicitly setting this to 0 disables disk logging for benchmarks.
+        guard ProcessInfo.processInfo.environment["PINECONE_SIMULATOR_DUMP_UART"] != "0",
               let cachesURL = FileManager.default.urls(
                 for: .cachesDirectory,
                 in: .userDomainMask
@@ -751,7 +810,9 @@ final class MobileOSHostModel: ObservableObject {
     }
 
     private func launchPhoshIfNeeded() {
-        guard !phoshLaunchCommandSent, hasShellPrompt else {
+        guard selectedBootTarget == .alpine,
+              !phoshLaunchCommandSent,
+              hasShellPrompt else {
             return
         }
         phoshLaunchCommandSent = true
@@ -767,7 +828,8 @@ final class MobileOSHostModel: ObservableObject {
     }
 
     private func appendFilesystemLoadingMessageIfNeeded() {
-        guard !filesystemLoadingMessagePrinted,
+        guard selectedBootTarget == .alpine,
+              !filesystemLoadingMessagePrinted,
               status == .running,
               !hasShellPrompt,
               terminalText.contains("legacy bootconsole [pl11] disabled") else {
@@ -789,7 +851,18 @@ final class MobileOSHostModel: ObservableObject {
         filesystemLoadingMessagePrinted = true
     }
 
-    nonisolated private static func loadBundledShellArtifacts() throws -> BundledShellArtifacts {
+    nonisolated private static func loadBootArtifacts(
+        for target: GuestBootTarget
+    ) throws -> BootArtifactBundle {
+        switch target {
+        case .alpine:
+            return try loadBundledAlpineArtifacts()
+        case .android:
+            return try loadLineageOSArtifacts()
+        }
+    }
+
+    nonisolated private static func loadBundledAlpineArtifacts() throws -> BootArtifactBundle {
         guard let kernelURL = Bundle.main.url(forResource: "Image", withExtension: nil) else {
             throw VMError.deviceError("bundled Linux Image resource is missing")
         }
@@ -810,7 +883,7 @@ final class MobileOSHostModel: ObservableObject {
         let kernel = try Data(contentsOf: kernelURL, options: .mappedIfSafe)
         let initrd = try Data(contentsOf: initrdURL, options: .mappedIfSafe)
         let disk = try loadWritableDiskImage()
-        return BundledShellArtifacts(
+        return BootArtifactBundle(
             artifacts: LinuxBootArtifacts(
                 kernelImage: [UInt8](kernel),
                 initrd: [UInt8](initrd),
@@ -820,8 +893,169 @@ final class MobileOSHostModel: ObservableObject {
             initrdResourceName: initrdName,
             diskResourceName: disk == nil ? nil : "rootfs.ext4",
             diskPersistenceURL: disk?.url,
-            diskByteCount: disk?.byteCount ?? 0
+            secondaryDiskResourceName: nil,
+            secondaryDiskPersistenceURL: nil,
+            secondaryDiskByteCount: 0,
+            diskByteCount: disk?.byteCount ?? 0,
+            bootArguments: linuxConsoleBootArguments(),
+            sourceDescription: "Bundle resource"
         )
+    }
+
+    nonisolated private static func loadLineageOSArtifacts() throws -> BootArtifactBundle {
+        let lineageDirectory = try ensureLineageOSImportFolder()
+        let fileManager = FileManager.default
+
+        let bootURL = lineageDirectory.appendingPathComponent("boot.img")
+        guard fileManager.fileExists(atPath: bootURL.path) else {
+            throw VMError.deviceError(
+                "LineageOS boot.img is missing. In Files, open On My iPhone/iPad > Pinecone > LineageOS and add a LineageOS virtio_arm64only boot.img."
+            )
+        }
+
+        let bootData = try Data(contentsOf: bootURL, options: .mappedIfSafe)
+        let bootImage = try AndroidBootImage(bytes: [UInt8](bootData))
+
+        let initBootURL = lineageDirectory.appendingPathComponent("init_boot.img")
+        let initBootImage: AndroidBootImage?
+        if fileManager.fileExists(atPath: initBootURL.path) {
+            let initBootData = try Data(contentsOf: initBootURL, options: .mappedIfSafe)
+            let parsed = try AndroidBootImage(bytes: [UInt8](initBootData))
+            guard parsed.kernel.isEmpty else {
+                throw VMError.unsupportedGuest(
+                    "LineageOS/init_boot.img must be an Android init_boot image without a kernel payload"
+                )
+            }
+            initBootImage = parsed
+        } else {
+            initBootImage = nil
+        }
+
+        let genericRamdisk = initBootImage?.ramdisk ?? bootImage.ramdisk
+        guard let genericRamdisk, !genericRamdisk.isEmpty else {
+            throw VMError.unsupportedGuest(
+                "LineageOS boot.img has no ramdisk; add the matching init_boot.img to the LineageOS folder"
+            )
+        }
+
+        let vendorBootURL = lineageDirectory.appendingPathComponent("vendor_boot.img")
+        guard fileManager.fileExists(atPath: vendorBootURL.path) else {
+            throw VMError.deviceError(
+                "LineageOS vendor_boot.img is missing. Add the vendor_boot image extracted from the matching system disk."
+            )
+        }
+        let vendorBootData = try Data(contentsOf: vendorBootURL, options: .mappedIfSafe)
+        let vendorBootImage = try AndroidVendorBootImage(bytes: [UInt8](vendorBootData))
+        let ramdisk = vendorBootImage.assembledRamdisk(genericRamdisk: genericRamdisk)
+
+        func findDisk(named candidates: [String]) throws -> (String, URL, Int)? {
+            try candidates.lazy.compactMap { name -> (String, URL, Int)? in
+                let url = lineageDirectory.appendingPathComponent(name)
+                guard fileManager.fileExists(atPath: url.path) else { return nil }
+                let attributes = try fileManager.attributesOfItem(atPath: url.path)
+                let byteCount = (attributes[.size] as? NSNumber)?.intValue ?? 0
+                guard byteCount > 0 else { return nil }
+                return (name, url, byteCount)
+            }.first
+        }
+        guard let disk = try findDisk(named: [
+            "vda-unencrypted-preexpanded-complete-all-fontfix2-nobootanim.raw",
+            "vda-unencrypted-preexpanded-complete-all-fontfix2.raw",
+            "vda-unencrypted-preexpanded-complete-all.raw",
+            "vda-unencrypted-preexpanded-complete.raw",
+            "vda-arm64viz.raw",
+            "vda.raw",
+            "lineageos.raw",
+            "disk.img",
+        ]) else {
+            throw VMError.deviceError(
+                "LineageOS system disk is missing. Add vda-unencrypted-preexpanded-complete-all-fontfix2-nobootanim.raw, vda-arm64viz.raw, or vda.raw to the LineageOS folder."
+            )
+        }
+        guard let secondaryDisk = try findDisk(named: [
+            "vdb-arm64viz.raw",
+            "vdb.raw",
+            "userdata.img",
+        ]) else {
+            throw VMError.deviceError(
+                "LineageOS userdata disk is missing. Add vdb-arm64viz.raw or vdb.raw to the LineageOS folder."
+            )
+        }
+
+        let bootArguments: String
+        let imageCommandLine = [
+            vendorBootImage.commandLine,
+            bootImage.commandLine
+        ].filter { !$0.isEmpty }.joined(separator: " ")
+        let verboseSerialArguments = "ignore_loglevel loglevel=7 printk.time=1 print-fatal-signals=1"
+        if imageCommandLine.isEmpty {
+            bootArguments = LinuxGuestProfile.lineageOS.mergedBootArguments([
+                LinuxGuestProfile.lineageOS.defaultBootArguments,
+                verboseSerialArguments
+            ])
+        } else {
+            bootArguments = LinuxGuestProfile.lineageOS.mergedBootArguments([
+                LinuxGuestProfile.lineageOS.defaultBootArguments,
+                verboseSerialArguments,
+                imageCommandLine
+            ])
+        }
+
+        return BootArtifactBundle(
+            artifacts: LinuxBootArtifacts(
+                kernelImage: bootImage.kernel,
+                initrd: ramdisk,
+                diskByteCountHint: disk.2
+            ),
+            kernelResourceName: "boot.img",
+            initrdResourceName: "vendor_boot.img + generic ramdisk + bootconfig",
+            diskResourceName: disk.0,
+            diskPersistenceURL: disk.1,
+            secondaryDiskResourceName: secondaryDisk.0,
+            secondaryDiskPersistenceURL: secondaryDisk.1,
+            secondaryDiskByteCount: secondaryDisk.2,
+            diskByteCount: disk.2,
+            bootArguments: bootArguments,
+            sourceDescription: "Files/Pinecone/LineageOS"
+        )
+    }
+
+    nonisolated private static func ensureLineageOSImportFolder() throws -> URL {
+        let fileManager = FileManager.default
+        guard let documentsURL = fileManager.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw VMError.deviceError("the Pinecone Documents directory is unavailable")
+        }
+
+        let lineageDirectory = documentsURL.appendingPathComponent("LineageOS", isDirectory: true)
+        try fileManager.createDirectory(at: lineageDirectory, withIntermediateDirectories: true)
+        try writeLineageOSInstructionsIfNeeded(to: lineageDirectory, fileManager: fileManager)
+        return lineageDirectory
+    }
+
+    nonisolated private static func writeLineageOSInstructionsIfNeeded(
+        to directory: URL,
+        fileManager: FileManager
+    ) throws {
+        let instructionsURL = directory.appendingPathComponent("README.txt")
+        guard !fileManager.fileExists(atPath: instructionsURL.path) else { return }
+        let instructions = """
+        Pinecone LineageOS boot assets
+
+        Required:
+        - boot.img from a LineageOS virtio_arm64only build (Android boot header v3/v4)
+        - vendor_boot.img from the matching build for first-stage modules and bootconfig
+        - vda-unencrypted-preexpanded-complete-all-fontfix2-nobootanim.raw (preferred), vda-arm64viz.raw, vda.raw, lineageos.raw, or disk.img as the LineageOS system disk
+        - vdb-arm64viz.raw (preferred), vdb.raw, or userdata.img as the writable userdata disk
+
+        Optional:
+        - init_boot.img when the generic ramdisk is not stored in boot.img
+
+        Phone-specific OTA packages and recovery images are not compatible.
+        """
+        try instructions.write(to: instructionsURL, atomically: true, encoding: .utf8)
     }
 
     nonisolated private static func loadWritableDiskImage() throws -> (url: URL, byteCount: Int)? {
@@ -925,23 +1159,31 @@ final class MobileOSHostModel: ObservableObject {
 
     nonisolated private static func makeLinuxReport(
         from result: LinuxBootLoadResult,
-        bundle: BundledShellArtifacts,
+        bundle: BootArtifactBundle,
         backendName: String
     ) -> LinuxHostReport {
         let artifacts = bundle.artifacts
         let diskDescription: String
         if let diskResourceName = bundle.diskResourceName {
-            diskDescription = "\(diskResourceName) attached for persistent-root bring-up (\(byteCount(artifacts.diskByteCountHint ?? 0)))"
+            let secondaryDescription = bundle.secondaryDiskResourceName.map {
+                "; \($0) attached as userdata (\(byteCount(bundle.secondaryDiskByteCount)))"
+            } ?? ""
+            diskDescription = "\(diskResourceName) attached as the system disk (\(byteCount(artifacts.diskByteCountHint ?? 0)))\(secondaryDescription)"
         } else {
-            diskDescription = "rootfs.ext4 not bundled"
+            diskDescription = result.layout.profile == .lineageOS
+                ? "no LineageOS raw disk attached"
+                : "rootfs.ext4 not bundled"
         }
+        let shellTarget = result.layout.profile == .lineageOS
+            ? "LineageOS virtio_arm64 direct boot"
+            : "persistent rootfs /sbin/init with ttyAMA0 shell"
         return LinuxHostReport(
             guest: result.configuration.machineName,
             profile: result.layout.profile.rawValue,
             backend: backendName,
-            shellTarget: "persistent rootfs /sbin/init with ttyAMA0 shell",
-            kernelArtifact: "Bundle resource: \(bundle.kernelResourceName) (\(byteCount(artifacts.kernelImage.count)))",
-            initrdArtifact: "Bundle resource: \(bundle.initrdResourceName) (\(byteCount(artifacts.initrd?.count ?? 0))); \(diskDescription)",
+            shellTarget: shellTarget,
+            kernelArtifact: "\(bundle.sourceDescription): \(bundle.kernelResourceName) (\(byteCount(artifacts.kernelImage.count)))",
+            initrdArtifact: "\(bundle.sourceDescription): \(bundle.initrdResourceName) (\(byteCount(artifacts.initrd?.count ?? 0))); \(diskDescription)",
             entryPoint: hex(result.layout.kernelLoadAddress),
             fdtAddress: hex(result.layout.fdtLoadAddress),
             fdtByteCount: result.layout.fdtByteCount,
@@ -968,13 +1210,18 @@ final class MobileOSHostModel: ObservableObject {
     }
 }
 
-private struct BundledShellArtifacts {
+private struct BootArtifactBundle {
     let artifacts: LinuxBootArtifacts
     let kernelResourceName: String
     let initrdResourceName: String
     let diskResourceName: String?
     let diskPersistenceURL: URL?
+    let secondaryDiskResourceName: String?
+    let secondaryDiskPersistenceURL: URL?
+    let secondaryDiskByteCount: Int
     let diskByteCount: Int
+    let bootArguments: String
+    let sourceDescription: String
 }
 
 private struct GuestKeyboardEvent {
@@ -1059,10 +1306,10 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private static let maximumPendingInputBytes = 64 * 1024
     private static let maximumPendingTouchEvents = 256
     private static let maximumPendingKeyboardEvents = 4_096
-    private static var virtualCPUCount: Int {
+    private static func virtualCPUCount(for profile: LinuxGuestProfile) -> Int {
         let requested = ProcessInfo.processInfo.environment["PINECONE_VCPU_COUNT"]
             .flatMap(Int.init)
-        return min(max(requested ?? 2, 1), 8)
+        return min(max(requested ?? profile.recommendedVirtualCPUCount, 1), 8)
     }
     private static var parallelVCPUExecutionEnabled: Bool {
         guard let configured = ProcessInfo.processInfo.environment[
@@ -1074,22 +1321,36 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     }
 #if targetEnvironment(simulator)
     private static let defaultGuestMemoryMiB = 1024
+    private static let lineageGuestMemoryMiB = 2048
+    private static let maximumGuestMemoryMiB = 2048
 #else
     private static let defaultGuestMemoryMiB = 384
+    private static let lineageGuestMemoryMiB = 1024
+    private static let maximumGuestMemoryMiB = 1024
 #endif
 
-    private static var guestMemorySize: Int {
+    private static func guestMemorySize(for profile: LinuxGuestProfile) -> Int {
         let requestedMiB = ProcessInfo.processInfo.environment["PINECONE_GUEST_MEMORY_MB"]
             .flatMap(Int.init)
-        let memoryMiB = min(max(requestedMiB ?? defaultGuestMemoryMiB, 128), 1_024)
+        // Alpine remains comfortable at the established device footprint.
+        // Android's framework and graphics services need substantially more
+        // headroom. The full image at 1 GiB triggers reclaim, process kills,
+        // and long GC pauses during UI startup. Give simulator Android 2 GiB
+        // without increasing Alpine's default or physical-device allocations.
+        let profileDefaultMiB = profile == .lineageOS
+            ? lineageGuestMemoryMiB
+            : defaultGuestMemoryMiB
+        let memoryMiB = min(max(requestedMiB ?? profileDefaultMiB, 128), maximumGuestMemoryMiB)
         return memoryMiB * 1024 * 1024
     }
 
     let loadResult: LinuxBootLoadResult
     let backendName: String
     let diskPersistenceURL: URL?
+    let secondaryDiskPersistenceURL: URL?
 
     private let machine: ResearchMachine
+    private let profile: LinuxGuestProfile
     private let graphicsAccelerator: PineconeMetalGraphicsAccelerator?
     private let networkBridge: LinkLocalVirtIONetworkBackend
     private let hostWakeSignal: HostWakeSignal
@@ -1143,6 +1404,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     private var lastRunSliceObservedWFI = false
     private var displayContentVisible = false
     private var displayBlankedAfterShell = false
+    private var androidGraphicsReady = false
     private var interactiveWorkloadReady = false
     private var applicationExecutionPolicy = ApplicationExecutionPolicy()
     private var guestTraceDecoder = GuestGraphicsTraceDecoder()
@@ -1158,18 +1420,33 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     init(
         artifacts: LinuxBootArtifacts,
         diskPersistenceURL: URL?,
+        secondaryDiskPersistenceURL: URL?,
+        profile: LinuxGuestProfile,
+        bootArguments: String,
         onUART: @escaping @Sendable ([UInt8]) -> Void
     ) throws {
+        self.profile = profile
         let uartOutputBuffer = LockedByteBuffer()
         let fileBackedStorage = try diskPersistenceURL.map(FileBackedVirtIOBlockStorage.init(url:))
+        let secondaryFileBackedStorage = try secondaryDiskPersistenceURL.map(
+            FileBackedVirtIOBlockStorage.init(url:)
+        )
+        let virtualCPUCount = Self.virtualCPUCount(for: profile)
         let diskByteCount = fileBackedStorage?.count ?? artifacts.diskImage?.count ?? 0
         let machine = try MachineFactory.makeResearchMachine(
-            memorySize: Self.guestMemorySize,
+            memorySize: Self.guestMemorySize(for: profile),
             blockStorageSize: max(1024 * 1024, diskByteCount),
             blockStorage: fileBackedStorage,
-            virtualCPUCount: Self.virtualCPUCount,
+            secondaryBlockStorage: secondaryFileBackedStorage,
+            virtualCPUCount: virtualCPUCount,
             parallelVCPUExecution:
-                Self.virtualCPUCount > 1 && Self.parallelVCPUExecutionEnabled,
+                virtualCPUCount > 1 && Self.parallelVCPUExecutionEnabled,
+            parallelCounterTicksPerHostSecond:
+                profile.recommendedCounterTicksPerHostSecond,
+            parallelActiveCounterTicksPerHostSecond:
+                profile.recommendedSMPActiveCounterTicksPerHostSecond,
+            virtioTransport: profile == .lineageOS ? .pci : .mmio,
+            enableVirGL: profile == .lineageOS,
             publishedDevices: diskByteCount == 0 ? .linuxConsole : .full
         )
         let environment = ProcessInfo.processInfo.environment
@@ -1211,12 +1488,19 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             displayCommitSignal?.note(generation: generation)
             hostWakeSignal?.signal()
         }
-        let adapter = LinuxDirectBootAdapter(
-            artifacts: artifacts,
-            profile: .generic,
-            bootArguments: linuxConsoleBootArguments()
-        )
-        let result = try adapter.loadWithResult(into: machine.vm)
+        let result: LinuxBootLoadResult
+        if profile == .lineageOS {
+            result = try LineageOSBootAdapter(
+                artifacts: artifacts,
+                bootArguments: bootArguments
+            ).loadWithResult(into: machine.vm)
+        } else {
+            result = try LinuxDirectBootAdapter(
+                artifacts: artifacts,
+                profile: profile,
+                bootArguments: bootArguments
+            ).loadWithResult(into: machine.vm)
+        }
         machine.vm.memory.beginConcurrentExecution()
         if environment["PINECONE_DIAGNOSTIC_SYNCHRONIZE_ALL_RAM"] == "1" {
             machine.vm.memory.requireFullySynchronizedConcurrentAccess()
@@ -1258,6 +1542,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         self.loadResult = result
         self.backendName = machine.vm.backend.name
         self.diskPersistenceURL = diskPersistenceURL
+        self.secondaryDiskPersistenceURL = secondaryDiskPersistenceURL
     }
 
     deinit {
@@ -1478,13 +1763,16 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             result = pendingInputSteps
         } else if isApplicationLaunchLatencySensitiveLocked(now: now) {
             result = pendingInputSteps
-        } else if shellPromptSeen && lastRunSliceObservedWFI &&
+        } else if (shellPromptSeen || interactiveWorkloadReady) && lastRunSliceObservedWFI &&
                     !networkBridge.hasPendingAsynchronousTraffic {
             result = idleSteps
-        } else if shellPromptSeen {
+        } else if shellPromptSeen || interactiveWorkloadReady {
             result = interactiveSteps
         } else {
-            result = bootSteps
+            // Android has no shell prompt and otherwise stays on tiny boot
+            // slices forever. Native checkpoints and the wall-clock budget
+            // still bound service/input latency with this larger outer slice.
+            result = profile == .lineageOS ? max(bootSteps, Self.normalSecondaryRunSliceSteps) : bootSteps
         }
         lock.unlock()
         return result
@@ -1507,6 +1795,14 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
         let touches = drainTouches()
         if !touches.isEmpty {
+            // Android may finish its slow startup after the display idle
+            // timeout. A touchscreen contact alone is not a wake key. Send
+            // KEY_WAKEUP on a new contact so tapping the emulator can wake
+            // the guest without a reboot; it is idempotent while awake.
+            if profile == .lineageOS && touches.contains(where: { $0.phase == .down }) {
+                machine.virtioKeyboard.enqueueKey(code: 143, value: 1)
+                machine.virtioKeyboard.enqueueKey(code: 143, value: 0)
+            }
 #if targetEnvironment(simulator)
             if touches.contains(where: \.isDown),
                ProcessInfo.processInfo.environment[
@@ -1568,7 +1864,8 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             } else if hasSeenShellPrompt {
                 responsivenessBudget = Self.interactiveChunkRunSliceSteps
             } else {
-                responsivenessBudget = Self.bootChunkRunSliceSteps
+                responsivenessBudget = profile == .lineageOS
+                    ? Self.normalSecondaryRunSliceSteps : Self.bootChunkRunSliceSteps
             }
             var stepBudget = min(stepsRemaining, responsivenessBudget)
             let latencySensitive = hasLatencySensitiveTouch
@@ -1629,7 +1926,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         lock.lock()
         let generation = hostWakeSignal.currentGeneration
         let now = DispatchTime.now().uptimeNanoseconds
-        let shouldIdle = shellPromptSeen &&
+        let shouldIdle = (shellPromptSeen || interactiveWorkloadReady) &&
             lastRunSliceObservedWFI &&
             pendingInputReadIndex >= pendingInput.count &&
             pendingTouches.isEmpty &&
@@ -1665,7 +1962,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
     }
 
     func persistDiskImageIfNeeded() throws {
-        guard let diskPersistenceURL else {
+        guard diskPersistenceURL != nil || secondaryDiskPersistenceURL != nil else {
             return
         }
 
@@ -1678,7 +1975,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         persistenceLock.unlock()
 
         do {
-            try writeDiskImage(to: diskPersistenceURL)
+            try writeDiskImages()
         } catch {
             persistenceLock.lock()
             diskPersistenceCompleted = false
@@ -1687,11 +1984,13 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         }
     }
 
-    private func writeDiskImage(to destinationURL: URL) throws {
-        guard destinationURL == diskPersistenceURL else {
-            throw VMError.deviceError("persistent rootfs destination changed while the VM was running")
+    private func writeDiskImages() throws {
+        if diskPersistenceURL != nil {
+            try machine.virtioBlock.flushStorage()
         }
-        try machine.virtioBlock.flushStorage()
+        if secondaryDiskPersistenceURL != nil {
+            try machine.virtioSecondaryBlock?.flushStorage()
+        }
     }
 
     func executionCounters() -> (native: Int, fallback: Int) {
@@ -2005,8 +2304,10 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         let shellIsReady = shellPromptSeen
         let alreadyVisible = displayContentVisible
         let blankedAfterShell = displayBlankedAfterShell
+        let androidIsReady = androidGraphicsReady
         lock.unlock()
-        guard shellIsReady, !alreadyVisible else {
+        guard ((profile == .lineageOS && androidIsReady) || shellIsReady),
+              !alreadyVisible else {
             return
         }
 
@@ -2055,9 +2356,22 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             }
         }
         guard foundVisiblePixel else {
+            guard profile != .lineageOS else { return }
             lock.lock()
             displayBlankedAfterShell = true
             lock.unlock()
+            return
+        }
+        if profile == .lineageOS {
+            lock.lock()
+            displayContentVisible = true
+            lock.unlock()
+            if performanceTimeline.mark(
+                .firstVisibleFrame,
+                execution: executionMilestoneSnapshot()
+            ) {
+                writePerformanceMetricsIfRequested()
+            }
             return
         }
         guard blankedAfterShell else {
@@ -2072,6 +2386,12 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
         ) {
             writePerformanceMetricsIfRequested()
         }
+    }
+
+    var hasVisibleDisplayContent: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return displayContentVisible
     }
 
 #if targetEnvironment(simulator)
@@ -2312,7 +2632,15 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             uartPromptTail.contains("arm64viz-root:~#") ||
                 uartPromptTail.contains("arm64viz-root #")
         )
-        let foundWorkloadReady = uartPromptTail.contains("Phosh ready after")
+        let foundAndroidLauncherReady = profile == .lineageOS && !interactiveWorkloadReady &&
+            uartPromptTail.contains("Displayed com.android.launcher3/")
+        let foundWorkloadReady = uartPromptTail.contains("Phosh ready after") || foundAndroidLauncherReady
+        let foundAndroidGraphicsReady = profile == .lineageOS && (
+            uartPromptTail.contains("SurfaceFlinger: Connecting display") ||
+                uartPromptTail.contains("SystemServerTiming: StartSystemUI") ||
+                uartPromptTail.contains("VRI[FallbackHome]") ||
+                uartPromptTail.contains("VRI[Launcher")
+        )
         if foundPrompt {
             shellPromptSeen = true
             displayContentVisible = false
@@ -2322,7 +2650,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             interactiveWorkloadReady = true
 #if targetEnvironment(simulator)
             let environment = ProcessInfo.processInfo.environment
-            if !postReadyActionsScheduled && (
+            if profile != .lineageOS && !postReadyActionsScheduled && (
                 environment["PINECONE_SIMULATOR_AUTO_UNLOCK"] == "1" ||
                 !(environment["PINECONE_SIMULATOR_POST_READY_COMMAND"] ?? "")
                     .isEmpty
@@ -2332,7 +2660,17 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             }
 #endif
         }
+        if foundAndroidGraphicsReady {
+            androidGraphicsReady = true
+        }
         lock.unlock()
+        let uiClockOverride = ProcessInfo.processInfo.environment["PINECONE_ANDROID_REALTIME_UI"]
+        if foundAndroidLauncherReady, uiClockOverride != "0" {
+            let rate: UInt32 = uiClockOverride == "1"
+                ? 24_000_000 : profile.recommendedInteractiveCounterTicksPerHostSecond
+            machine.parallelVCPUCluster?.setCounterTicksPerHostSecond(rate)
+            fputs("Pinecone Android: launcher displayed; guest UI clock set to \(rate) ticks per host second\n", stderr)
+        }
         for record in guestRecords {
             if case .graphics(let event) = record {
                 performanceTimeline.recordGuestGraphics(event)
@@ -2449,6 +2787,7 @@ private final class LinuxConsoleRuntime: @unchecked Sendable {
             "virtioGPU": machine.virtioDisplay.displayPerformanceCounters,
             "metal": graphicsAccelerator?.performanceCounters ?? [:],
         ]
+        report["counterTicksPerHostSecond"] = machine.parallelVCPUCluster?.counterTicksPerHostSecond
         report["threadedPrototypePrimary"] =
             (machine.vm.backend as? SoftwareARM64Backend)?.nativeThreadedPrototypeStatistics
         report["assemblyExecutorPrimary"] =

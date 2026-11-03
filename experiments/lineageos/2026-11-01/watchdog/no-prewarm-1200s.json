@@ -1,0 +1,3674 @@
+{
+  "backend" : "software-aarch64-subset",
+  "backendPerformance" : {
+    "decodedBasicBlockExecutions" : 0,
+    "decodedBasicBlockNanoseconds" : 0,
+    "decodedBasicBlockSteps" : 0,
+    "decodedFallbackGadgets" : [
+
+    ],
+    "nativeBasicBlockExecutions" : 831947697,
+    "nativeBasicBlockNanoseconds" : 0,
+    "nativeBasicBlockSteps" : 3735214442,
+    "nativeBasicBlockUnsupportedExits" : 0,
+    "nativeBatchPrefetchHits" : 1302298,
+    "nativeBatchPrefetchLimit" : 0,
+    "nativeBatchPrefetchLimitChanges" : 185,
+    "nativeBatchPrefetchUnused" : 660603,
+    "nativeBatchPrefetchedBlocks" : 1962901,
+    "nativeBlockCacheDecodes" : 16708307,
+    "nativeBlockCacheFrontHits" : 55788967,
+    "nativeBlockCacheHits" : 65677326,
+    "nativeBlockCacheMisses" : 16717894,
+    "nativeDecodeWindowHits" : 11995053,
+    "nativeDecodeWindowMisses" : 4722841,
+    "nativeDirectCodeFetches" : 68590418,
+    "nativeDirectLinkHits" : 66475082,
+    "nativeDirectLinkMisses" : 18989630,
+    "nativeFastRAMReadHits" : 5981,
+    "nativeFastRAMReadMisses" : 332337,
+    "nativeFastRAMWriteHits" : 5858,
+    "nativeFastRAMWriteMisses" : 245881,
+    "nativeFillHits" : 0,
+    "nativeFillMisses" : 0,
+    "nativeGenericDispatches" : 134573176,
+    "nativeIneligibleGadgets" : [
+
+    ],
+    "nativeInstructionFetchHits" : 0,
+    "nativeInstructionTLBColdMisses" : 0,
+    "nativeInstructionTLBConflictMisses" : 0,
+    "nativeInstructionTLBHits" : 0,
+    "nativeInstructionTLBHotHits" : 0,
+    "nativeInstructionTLBInvalidationMisses" : 0,
+    "nativeInstructionTLBMisses" : 0,
+    "nativePageTableFaults" : 0,
+    "nativePageTableWalks" : 0,
+    "nativePhysicalDeviceReads" : 332316,
+    "nativePhysicalDeviceWrites" : 245253,
+    "nativeReadTLBHits" : 0,
+    "nativeReadTLBMisses" : 0,
+    "nativeSingleInstructionSteps" : 6906,
+    "nativeSuperblockBlocks" : 720590581,
+    "nativeSuperblockDispatches" : 182084537,
+    "nativeSuperblockFrontHits" : 138064529,
+    "nativeSuperblockHits" : 163312024,
+    "nativeTranslationCallbackWalks" : 0,
+    "nativeWriteTLBHits" : 0,
+    "nativeWriteTLBMisses" : 0,
+    "singleInstructionNanoseconds" : 0,
+    "singleInstructionSteps" : 6906,
+    "swiftFallbackSingleInstructionSteps" : 0,
+    "unsupportedInstructions" : [
+
+    ]
+  },
+  "bootArguments" : "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 loglevel=6 vt.global_cursor_default=0 androidboot.console=ttyAMA0 androidboot.seriallogging=ttyAMA0 androidboot.seriallogging.logcat_buffer=all androidboot.hardware=virtio androidboot.partition_map=vdb,userdata androidboot.graphics=mesa_swrast androidboot.hwui_renderer=skiagl binder.impl=rust firmware_class.path=\/vendor\/firmware\/ log_buf_len=4M loop.max_part=7 printk.devkmsg=on rw vt.global_cursor_default=0 acpi=nospcr androidboot.verifiedbootstate=orange bootconfig",
+  "breakpoints" : [
+
+  ],
+  "currentEL" : "EL1",
+  "diskByteCount" : 5368709120,
+  "displayDiagnostics" : "gpu=t90\/f90 bytes=176947200\/11796480 direct=0\/0 snap=1 cow=2\/3932160 glock=0.00\/0.01ms dirty=122\/88:0 pages=43\/39:96415744\/80531456 exact=0\/0 pv2d=0\/0:0\/b0\/m0\/n0:0 err=0\/0\/0\/0:none tr=r7:0,0,480x1024@0:c0b150r0:1966080 fl=r7:0,0,480x1024:p1c0s1d0:0",
+  "displayFlushSkip" : 0,
+  "displayFrame" : {
+    "bytesPerPixel" : 4,
+    "commitTimestampNanoseconds" : 7275196450727750,
+    "damageRectangleCount" : 1,
+    "damagedByteCount" : 1966080,
+    "generation" : 8,
+    "hasStableStorage" : true,
+    "height" : 1024,
+    "stride" : 1920,
+    "width" : 480
+  },
+  "displayGeneration" : 8,
+  "displayPerformanceCounters" : {
+    "backingCopiedBytes" : 96415744,
+    "cleanBackingSkippedBytes" : 80531456,
+    "commandLockHoldP95Milliseconds" : 0.006958,
+    "commandLockWaitP95Milliseconds" : 0.000291,
+    "committedBytes" : 11796480,
+    "dirtyTileChangedBytes" : 0,
+    "dirtyTileScans" : 122,
+    "exactGuestWriteBytes" : 0,
+    "exactGuestWrites" : 0,
+    "flushCommands" : 90,
+    "frameCopyOnWriteBytes" : 3932160,
+    "frameCopyOnWriteCount" : 2,
+    "hostNative.operator.0.commands" : 0,
+    "hostNative.operator.0.destinationBytes" : 0,
+    "hostNative.operator.0.milliseconds" : 0,
+    "hostNative.operator.0.pixels" : 0,
+    "hostNative.operator.1.commands" : 0,
+    "hostNative.operator.1.destinationBytes" : 0,
+    "hostNative.operator.1.milliseconds" : 0,
+    "hostNative.operator.1.pixels" : 0,
+    "hostNative.operator.10.commands" : 0,
+    "hostNative.operator.10.destinationBytes" : 0,
+    "hostNative.operator.10.milliseconds" : 0,
+    "hostNative.operator.10.pixels" : 0,
+    "hostNative.operator.11.commands" : 0,
+    "hostNative.operator.11.destinationBytes" : 0,
+    "hostNative.operator.11.milliseconds" : 0,
+    "hostNative.operator.11.pixels" : 0,
+    "hostNative.operator.12.commands" : 0,
+    "hostNative.operator.12.destinationBytes" : 0,
+    "hostNative.operator.12.milliseconds" : 0,
+    "hostNative.operator.12.pixels" : 0,
+    "hostNative.operator.13.commands" : 0,
+    "hostNative.operator.13.destinationBytes" : 0,
+    "hostNative.operator.13.milliseconds" : 0,
+    "hostNative.operator.13.pixels" : 0,
+    "hostNative.operator.2.commands" : 0,
+    "hostNative.operator.2.destinationBytes" : 0,
+    "hostNative.operator.2.milliseconds" : 0,
+    "hostNative.operator.2.pixels" : 0,
+    "hostNative.operator.3.commands" : 0,
+    "hostNative.operator.3.destinationBytes" : 0,
+    "hostNative.operator.3.milliseconds" : 0,
+    "hostNative.operator.3.pixels" : 0,
+    "hostNative.operator.4.commands" : 0,
+    "hostNative.operator.4.destinationBytes" : 0,
+    "hostNative.operator.4.milliseconds" : 0,
+    "hostNative.operator.4.pixels" : 0,
+    "hostNative.operator.5.commands" : 0,
+    "hostNative.operator.5.destinationBytes" : 0,
+    "hostNative.operator.5.milliseconds" : 0,
+    "hostNative.operator.5.pixels" : 0,
+    "hostNative.operator.6.commands" : 0,
+    "hostNative.operator.6.destinationBytes" : 0,
+    "hostNative.operator.6.milliseconds" : 0,
+    "hostNative.operator.6.pixels" : 0,
+    "hostNative.operator.7.commands" : 0,
+    "hostNative.operator.7.destinationBytes" : 0,
+    "hostNative.operator.7.milliseconds" : 0,
+    "hostNative.operator.7.pixels" : 0,
+    "hostNative.operator.8.commands" : 0,
+    "hostNative.operator.8.destinationBytes" : 0,
+    "hostNative.operator.8.milliseconds" : 0,
+    "hostNative.operator.8.pixels" : 0,
+    "hostNative.operator.9.commands" : 0,
+    "hostNative.operator.9.destinationBytes" : 0,
+    "hostNative.operator.9.milliseconds" : 0,
+    "hostNative.operator.9.pixels" : 0,
+    "hostNative.reason.ineligible.commands" : 0,
+    "hostNative.reason.ineligible.destinationBytes" : 0,
+    "hostNative.reason.ineligible.milliseconds" : 0,
+    "hostNative.reason.ineligible.pixels" : 0,
+    "hostNative.reason.submissionDeclined.commands" : 0,
+    "hostNative.reason.submissionDeclined.destinationBytes" : 0,
+    "hostNative.reason.submissionDeclined.milliseconds" : 0,
+    "hostNative.reason.submissionDeclined.pixels" : 0,
+    "hostNative.reason.unavailable.commands" : 0,
+    "hostNative.reason.unavailable.destinationBytes" : 0,
+    "hostNative.reason.unavailable.milliseconds" : 0,
+    "hostNative.reason.unavailable.pixels" : 0,
+    "hostNative.solidA8Over.commands" : 0,
+    "hostNative.solidA8Over.destinationBytes" : 0,
+    "hostNative.solidA8Over.milliseconds" : 0,
+    "hostNative.solidA8Over.pixels" : 0,
+    "hostPhase.accelerator.calls" : 0,
+    "hostPhase.accelerator.milliseconds" : 0,
+    "hostPhase.finish.calls" : 5,
+    "hostPhase.finish.milliseconds" : 0.000291,
+    "hostPhase.flush.calls" : 90,
+    "hostPhase.flush.milliseconds" : 11.97475,
+    "hostPhase.frameCopy.calls" : 92,
+    "hostPhase.frameCopy.milliseconds" : 0.952302,
+    "hostPhase.native.calls" : 0,
+    "hostPhase.native.milliseconds" : 0,
+    "hostPhase.prepare.calls" : 12,
+    "hostPhase.prepare.milliseconds" : 2.355293,
+    "hostPhase.reset.calls" : 0,
+    "hostPhase.reset.milliseconds" : 0,
+    "hostPhase.synchronize.calls" : 0,
+    "hostPhase.synchronize.milliseconds" : 0,
+    "hostPhase.transfer.calls" : 90,
+    "hostPhase.transfer.milliseconds" : 18.001173,
+    "nativeDirectGuestWriteBytes" : 0,
+    "nativeDirectGuestWrites" : 0,
+    "paravirtualAcceleratedCommands" : 0,
+    "paravirtualBatches" : 0,
+    "paravirtualCommands" : 0,
+    "paravirtualFinishFailures" : 0,
+    "paravirtualNativeFailures" : 0,
+    "paravirtualPixels" : 0,
+    "paravirtualPrepareFailures" : 0,
+    "paravirtualSynchronizationFailures" : 0,
+    "snapshotCopies" : 0,
+    "transferCommands" : 90,
+    "transferredBytes" : 176947200,
+    "unchangedFlushes" : 88
+  },
+  "displayPresented" : true,
+  "displaySnapshotPath" : "\/private\/tmp\/pinecone-ui-probe.ppm",
+  "el0FaultCount" : 55362,
+  "el0FaultSkip" : 0,
+  "entryPoint" : "0x40200000",
+  "exceptionCounts" : [
+    {
+      "count" : 10,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 7,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 4,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbbb52c",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 3,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbaea84",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 3,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x7",
+      "returnAddress" : "0x7bcbbba90c",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 2,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x7bcbbae810",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x7",
+      "returnAddress" : "0x7bcbaca600",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbb1f7ac",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbb3ca9c",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x7bcbb55ebc",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x7bcbb58c4c",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x7bcbbaf790",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbaff04",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x7bcbbb02ac",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x7bcbbb02dc",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x7bcbbb0d7c",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbb1e0c",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbba650",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x6",
+      "returnAddress" : "0x7bcbbba90c",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x7",
+      "returnAddress" : "0x7bcbbbbcc0",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x7",
+      "returnAddress" : "0x7bcbbbbf08",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbbe674",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "instructionAbortLowerEL",
+      "iss" : "0x7",
+      "returnAddress" : "0x7bcbbe2768",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x47",
+      "returnAddress" : "0x7bcbbe2e94",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "dataAbortLowerEL",
+      "iss" : "0x6",
+      "returnAddress" : "0x7bcbc68dbc",
+      "source" : "translationFault",
+      "vectorAddress" : "0xffffffc080010c00"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc080189d3c",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0801cc468",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc08036b524",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0803d0ef8",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0803dc66c",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0803f2018",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0803ff714",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0804483ac",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc08045099c",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc081328bbc",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0813382b4",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc08133badc",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc08133bf14",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc08133c6a0",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc08134029c",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc081367abc",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    }
+  ],
+  "exceptionStormThreshold" : 0,
+  "executedSteps" : 3735221348,
+  "executionStateTransitions" : [
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7f7a1c8ef0",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 146913
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7f6f2ffc3c",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 66430
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7f7a1c8ad8",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 8698
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6d82735f40",
+      "previousPState" : "0x20001000",
+      "reason" : "instruction",
+      "step" : 12307
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70c19dbea4",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 131342
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x716def50",
+      "previousPState" : "0x40001000",
+      "reason" : "instruction",
+      "step" : 8221
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x717a49f0",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 151711
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b9587808",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 7990
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6e01350ed8",
+      "previousPState" : "0x1000",
+      "reason" : "irq",
+      "step" : 1700
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x5983767408",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 92821
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7f6f2b8cf4",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 33086
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7127af2430",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 126100
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x598376791c",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 158905
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7127aeff68",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 180248
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7127b1ad7c",
+      "previousPState" : "0x40001000",
+      "reason" : "irq",
+      "step" : 130205
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x71775370",
+      "previousPState" : "0x20001000",
+      "reason" : "instruction",
+      "step" : 21810
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6e0163418c",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 32902
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6e0140110c",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 14221
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x71bb7800",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 32619
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7ed40f62d0",
+      "previousPState" : "0x1000",
+      "reason" : "instruction",
+      "step" : 4190
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5b0280c",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 43654
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6e0165fcf4",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 42163
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x720b4198",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 35956
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x71e62348",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 40675
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6ded16d5c0",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 48263
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6ded162890",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 15551
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6de818be50",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 32319
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x71657e90",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 25596
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x790214be68",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 26039
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5afd0c0",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 20484
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70af472148",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 162391
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5b07f2c",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 104778
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70af44a59c",
+      "previousPState" : "0xa0001000",
+      "reason" : "irq",
+      "step" : 62157
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70af44ea3c",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 83633
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6bd922b40c",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 41256
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7d223322f0",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 23006
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6261e6f8d0",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 4619
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6261c1e83c",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 16296
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7d3318a484",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 5782
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6dd66c421c",
+      "previousPState" : "0x20001000",
+      "reason" : "instruction",
+      "step" : 32053
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7216bf90",
+      "previousPState" : "0x1000",
+      "reason" : "instruction",
+      "step" : 16190
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6dd66094f0",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 39525
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6dd7847e14",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 77228
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6dd692f440",
+      "previousPState" : "0xa0001000",
+      "reason" : "irq",
+      "step" : 102561
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5afd118",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 25494
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5b197d4",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 19493
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5b1a2a8",
+      "previousPState" : "0x1000",
+      "reason" : "instruction",
+      "step" : 95737
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7177fce0",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 136
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x71d18290",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 24428
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5afd170",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 27002
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6e01305e70",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 14872
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6e01453edc",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 15717
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5b30358",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 12193
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x193d5964",
+      "previousPState" : "0x60001000",
+      "reason" : "irq",
+      "step" : 38761
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70a7b0ee74",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 6126
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70d5dd6d6c",
+      "previousPState" : "0x20001000",
+      "reason" : "instruction",
+      "step" : 1503
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70d5ddc59c",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 3006
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70d5df9920",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 4413
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70c19db52c",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 98565
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70c19db28c",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 82745
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x70b5b07f2c",
+      "previousPState" : "0x20001000",
+      "reason" : "irq",
+      "step" : 88593
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7cbaaa9b40",
+      "previousPState" : "0x60001000",
+      "reason" : "instruction",
+      "step" : 138041
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c80",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x6e017a1f28",
+      "previousPState" : "0x80001000",
+      "reason" : "irq",
+      "step" : 285391
+    },
+    {
+      "newEL" : "EL1",
+      "newPC" : "0xffffffc080010c00",
+      "newPState" : "0x3c5",
+      "previousEL" : "EL0",
+      "previousPC" : "0x7bcbc3aefc",
+      "previousPState" : "0x80001000",
+      "reason" : "instruction",
+      "step" : 32424
+    }
+  ],
+  "fdtAddress" : "0x7ff00000",
+  "fdtByteCount" : 5832,
+  "globalMMIOAccessCounts" : [
+    {
+      "access" : "read",
+      "count" : 189159,
+      "device" : "intc",
+      "offset" : "0x1000c"
+    },
+    {
+      "access" : "read",
+      "count" : 118599,
+      "device" : "uart0",
+      "offset" : "0x18"
+    },
+    {
+      "access" : "write",
+      "count" : 117047,
+      "device" : "uart0",
+      "offset" : "0x0"
+    },
+    {
+      "access" : "write",
+      "count" : 98915,
+      "device" : "intc",
+      "offset" : "0x10010"
+    },
+    {
+      "access" : "write",
+      "count" : 23024,
+      "device" : "intc",
+      "offset" : "0xf00"
+    },
+    {
+      "access" : "read",
+      "count" : 20667,
+      "device" : "virtio_pci1",
+      "offset" : "0x2000"
+    },
+    {
+      "access" : "read",
+      "count" : 3778,
+      "device" : "virtio_pci2",
+      "offset" : "0x2000"
+    },
+    {
+      "access" : "write",
+      "count" : 2729,
+      "device" : "uart0",
+      "offset" : "0x38"
+    },
+    {
+      "access" : "write",
+      "count" : 2567,
+      "device" : "virtio_pci1",
+      "offset" : "0x1000"
+    },
+    {
+      "access" : "write",
+      "count" : 897,
+      "device" : "virtio_pci2",
+      "offset" : "0x1000"
+    },
+    {
+      "access" : "read",
+      "count" : 77,
+      "device" : "virtio_pci5",
+      "offset" : "0x2000"
+    },
+    {
+      "access" : "read",
+      "count" : 26,
+      "device" : "virtio_pci3",
+      "offset" : "0x2000"
+    },
+    {
+      "access" : "write",
+      "count" : 9,
+      "device" : "intc",
+      "offset" : "0x100"
+    },
+    {
+      "access" : "write",
+      "count" : 4,
+      "device" : "uart0",
+      "offset" : "0x30"
+    },
+    {
+      "access" : "write",
+      "count" : 3,
+      "device" : "virtio_pci3",
+      "offset" : "0x1004"
+    },
+    {
+      "access" : "write",
+      "count" : 3,
+      "device" : "virtio_pci5",
+      "offset" : "0x1000"
+    },
+    {
+      "access" : "read",
+      "count" : 2,
+      "device" : "intc",
+      "offset" : "0x800"
+    },
+    {
+      "access" : "read",
+      "count" : 2,
+      "device" : "intc",
+      "offset" : "0xc04"
+    },
+    {
+      "access" : "write",
+      "count" : 2,
+      "device" : "intc",
+      "offset" : "0x0"
+    },
+    {
+      "access" : "read",
+      "count" : 2,
+      "device" : "uart0",
+      "offset" : "0x30"
+    },
+    {
+      "access" : "read",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x4"
+    },
+    {
+      "access" : "read",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x10000"
+    },
+    {
+      "access" : "read",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x100fc"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x180"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x184"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x188"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x380"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x384"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x388"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x400"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x404"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x408"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x40c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x410"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x414"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x418"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x41c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x420"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x424"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x428"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x42c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x430"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x434"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x438"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x43c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x440"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x444"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x448"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x44c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x450"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x454"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x458"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x45c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x820"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x824"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x828"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x82c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x830"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x834"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x838"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x83c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x840"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x844"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x848"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x84c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x850"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x854"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x858"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x85c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc08"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc0c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc10"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc14"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x10000"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x10004"
+    },
+    {
+      "access" : "read",
+      "count" : 1,
+      "device" : "virtio_pci3",
+      "offset" : "0x3006"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "virtio_pci3",
+      "offset" : "0x1000"
+    }
+  ],
+  "guest" : "arm64viz-lineageos",
+  "initrdAddress" : "0x7f95d000",
+  "initrdByteCount" : 5908014,
+  "interruptDiagnostics" : {
+    "acknowledgedCounts" : [
+      {
+        "count" : 35061,
+        "line" : 0
+      },
+      {
+        "count" : 43202,
+        "line" : 1
+      },
+      {
+        "count" : 74,
+        "line" : 5
+      },
+      {
+        "count" : 263289,
+        "line" : 27
+      },
+      {
+        "count" : 20667,
+        "line" : 68
+      },
+      {
+        "count" : 26,
+        "line" : 69
+      },
+      {
+        "count" : 77,
+        "line" : 71
+      },
+      {
+        "count" : 3778,
+        "line" : 73
+      }
+    ],
+    "activeLines" : [
+
+    ],
+    "activeRaiseDropCounts" : [
+      {
+        "count" : 1,
+        "line" : 0
+      },
+      {
+        "count" : 322,
+        "line" : 1
+      },
+      {
+        "count" : 9419,
+        "line" : 27
+      },
+      {
+        "count" : 294,
+        "line" : 68
+      },
+      {
+        "count" : 20,
+        "line" : 73
+      }
+    ],
+    "clearedCounts" : [
+      {
+        "count" : 46976126,
+        "line" : 27
+      },
+      {
+        "count" : 47806554,
+        "line" : 30
+      },
+      {
+        "count" : 1695515,
+        "line" : 33
+      },
+      {
+        "count" : 20668,
+        "line" : 68
+      },
+      {
+        "count" : 269594,
+        "line" : 69
+      },
+      {
+        "count" : 1,
+        "line" : 70
+      },
+      {
+        "count" : 78,
+        "line" : 71
+      },
+      {
+        "count" : 1,
+        "line" : 72
+      },
+      {
+        "count" : 3779,
+        "line" : 73
+      }
+    ],
+    "completedCounts" : [
+      {
+        "count" : 35061,
+        "line" : 0
+      },
+      {
+        "count" : 43202,
+        "line" : 1
+      },
+      {
+        "count" : 74,
+        "line" : 5
+      },
+      {
+        "count" : 263289,
+        "line" : 27
+      },
+      {
+        "count" : 20667,
+        "line" : 68
+      },
+      {
+        "count" : 26,
+        "line" : 69
+      },
+      {
+        "count" : 77,
+        "line" : 71
+      },
+      {
+        "count" : 3778,
+        "line" : 73
+      }
+    ],
+    "enabledLines" : [
+      27,
+      33,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73
+    ],
+    "pendingLines" : [
+      0,
+      27
+    ],
+    "raisedCounts" : [
+      {
+        "count" : 35063,
+        "line" : 0
+      },
+      {
+        "count" : 43202,
+        "line" : 1
+      },
+      {
+        "count" : 74,
+        "line" : 5
+      },
+      {
+        "count" : 830428,
+        "line" : 27
+      },
+      {
+        "count" : 25998,
+        "line" : 68
+      },
+      {
+        "count" : 44,
+        "line" : 69
+      },
+      {
+        "count" : 330,
+        "line" : 71
+      },
+      {
+        "count" : 5467,
+        "line" : 73
+      }
+    ]
+  },
+  "interruptState" : {
+    "pendingLine" : 27,
+    "physicalTimerAsserted" : false,
+    "physicalTimerEnabled" : false,
+    "physicalTimerIRQ" : 30,
+    "virtualTimerAsserted" : true,
+    "virtualTimerEnabled" : false,
+    "virtualTimerIRQ" : 27
+  },
+  "lastException" : {
+    "currentEL" : "EL1",
+    "exceptionClass" : "unknown",
+    "irqLine" : 27,
+    "iss" : "0x0",
+    "newPState" : "0x3c5",
+    "previousPState" : "0x80000005",
+    "returnAddress" : "0xffffffc0813382b4",
+    "source" : "irq",
+    "syndrome" : "0x0",
+    "vectorAddress" : "0xffffffc080010a80",
+    "vectorBase" : "0xffffffc080010800",
+    "vectorOffset" : "0x280"
+  },
+  "linkLocalGeneratedFrames" : 0,
+  "linkLocalRecentFrames" : [
+    "len=92 ether=0x3634 shifted=0x86dd generated=false prefix=00003333000000160261726d363486dd6000000000240001fe80000000000000",
+    "len=72 ether=0x3634 shifted=0x86dd generated=false prefix=00003333000000020261726d363486dd6000000000103afffe80000000000000",
+    "len=352 ether=0x0800 shifted=0x4510 generated=false prefix=ffffffffffff0261726d3634080045100152000040004011398c00000000ffff",
+    "len=352 ether=0x0800 shifted=0x4510 generated=false prefix=ffffffffffff0261726d3634080045100152000040004011398c00000000ffff",
+    "len=352 ether=0x0800 shifted=0x4510 generated=false prefix=ffffffffffff0261726d3634080045100152000040004011398c00000000ffff",
+    "len=350 ether=0x0800 shifted=0x4510 generated=false prefix=ffffffffffff0261726d3634080045100150000040004011398e00000000ffff",
+    "len=72 ether=0x3634 shifted=0x86dd generated=false prefix=00003333000000020261726d363486dd6000000000103afffe80000000000000",
+    "len=350 ether=0x0800 shifted=0x4510 generated=false prefix=ffffffffffff0261726d3634080045100150000040004011398e00000000ffff",
+    "len=72 ether=0x3634 shifted=0x86dd generated=false prefix=00003333000000020261726d363486dd6000000000103afffe80000000000000",
+    "len=350 ether=0x0800 shifted=0x4510 generated=false prefix=ffffffffffff0261726d3634080045100150000040004011398e00000000ffff",
+    "len=350 ether=0x0800 shifted=0x4510 generated=false prefix=ffffffffffff0261726d3634080045100150000040004011398e00000000ffff",
+    "len=72 ether=0x3634 shifted=0x86dd generated=false prefix=00003333000000020261726d363486dd6000000000103afffe80000000000000"
+  ],
+  "linkLocalTransmittedFrames" : 26,
+  "maxSteps" : 80000000000,
+  "memoryTraceDepth" : 0,
+  "memoryTraceEL0Only" : false,
+  "memoryWriteSkip" : 0,
+  "mmioAccessCounts" : [
+
+  ],
+  "mmioTraceDepth" : 0,
+  "nextBackendWork" : [
+    "Linux-grade IRQ\/FIQ priority, masking, EOI, and nesting behavior",
+    "Broader MMU attributes, shareability, cacheability, and TLB maintenance",
+    "GIC\/timer driver compatibility beyond the current minimal model",
+    "PL011 FIFO depth, baud\/control registers, and interrupt edge cases",
+    "virtio descriptor-ring execution for net\/input\/display"
+  ],
+  "observedMemoryWriteWatchCount" : 0,
+  "parallelVCPUExecution" : true,
+  "pc" : "0xffffffc080010a80",
+  "pcPhysical" : "0x40210a80",
+  "primaryAssemblyStatistics" : {
+    "blocks" : 45160585,
+    "boundaries" : 24886012,
+    "boundedEnabled" : 0,
+    "boundedRuns" : 0,
+    "boundedSteps" : 0,
+    "boundedVisits" : 0,
+    "chainEnabled" : 0,
+    "chainRuns" : 0,
+    "chainSteps" : 0,
+    "chainVisits" : 0,
+    "enabled" : 1,
+    "faults" : 21380,
+    "steps" : 88027733
+  },
+  "primaryHotPCs" : [
+    {
+      "instructions" : [
+        "0xeb08015f",
+        "0xaa0a03e9",
+        "0x54fffd81"
+      ],
+      "linkRegister" : "0x6e013d1074",
+      "pc" : "0x6e017a1f38",
+      "samples" : 1381
+    },
+    {
+      "instructions" : [
+        "0xf9401d4a",
+        "0xeb13015f",
+        "0x54000608"
+      ],
+      "linkRegister" : "0x6e013d1074",
+      "pc" : "0x6e017a1f00",
+      "samples" : 1279
+    },
+    {
+      "instructions" : [
+        "0xf940052b",
+        "0xb40000ab"
+      ],
+      "linkRegister" : "0x6e013d1074",
+      "pc" : "0x6e017a1f0c",
+      "samples" : 1215
+    },
+    {
+      "instructions" : [
+        "0xf940112a",
+        "0xf940154b",
+        "0xeb13017f",
+        "0x54000088"
+      ],
+      "linkRegister" : "0x6e013d1074",
+      "pc" : "0x6e017a1ef0",
+      "samples" : 1195
+    },
+    {
+      "instructions" : [
+        "0x8b010000",
+        "0xf2402c1f",
+        "0x54ffffa1"
+      ],
+      "linkRegister" : "0xffffffc0803f5dfc",
+      "pc" : "0xffffffc0813262a0",
+      "samples" : 1105
+    },
+    {
+      "instructions" : [
+        "0x3869690a",
+        "0x91000520",
+        "0xaa0003e9",
+        "0x35ffffaa"
+      ],
+      "linkRegister" : "0x7f7a1c8ab8",
+      "pc" : "0x7f7a1d960c",
+      "samples" : 1096
+    },
+    {
+      "instructions" : [
+        "0xd50b7420"
+      ],
+      "linkRegister" : "0xffffffc0803f5dfc",
+      "pc" : "0xffffffc08132629c",
+      "samples" : 1096
+    },
+    {
+      "instructions" : [
+        "0xd5384108",
+        "0xb9458509",
+        "0x11000529",
+        "0xb9058509"
+      ],
+      "linkRegister" : "0xffffffc081355be8",
+      "pc" : "0xffffffc0801cc468",
+      "samples" : 1092
+    },
+    {
+      "instructions" : [
+        "0x297fbdae",
+        "0xf100058c",
+        "0x910021ad",
+        "0x4a0001ce"
+      ],
+      "linkRegister" : "0xffffffc08076f7c8",
+      "pc" : "0xffffffc08084fde8",
+      "samples" : 1092
+    },
+    {
+      "instructions" : [
+        "0xd1000448",
+        "0x5280080a",
+        "0xdac01109",
+        "0x4b090149"
+      ],
+      "linkRegister" : "0x7bcbc73df8",
+      "pc" : "0x7bcbbb09d8",
+      "samples" : 1091
+    },
+    {
+      "instructions" : [
+        "0xb40000b9"
+      ],
+      "linkRegister" : "0xffffffc0803c6b84",
+      "pc" : "0xffffffc0803c6c60",
+      "samples" : 1089
+    },
+    {
+      "instructions" : [
+        "0xd0000070",
+        "0xf9401e11",
+        "0x9100e210",
+        "0xd61f0220"
+      ],
+      "linkRegister" : "0x7bcbb58e1c",
+      "pc" : "0x7bcbc748f0",
+      "samples" : 1085
+    },
+    {
+      "instructions" : [
+        "0x8b050108",
+        "0xeb050042",
+        "0x54ffffaa"
+      ],
+      "linkRegister" : "0xffffffc08040e3e0",
+      "pc" : "0xffffffc081328f70",
+      "samples" : 1085
+    },
+    {
+      "instructions" : [
+        "0xf86f5929",
+        "0xeb00013f",
+        "0x540000a1"
+      ],
+      "linkRegister" : "0xffffffc08133a138",
+      "pc" : "0xffffffc08133f3fc",
+      "samples" : 1084
+    },
+    {
+      "instructions" : [
+        "0xd503245f",
+        "0xb4000682"
+      ],
+      "linkRegister" : "0x7bcbb55c5c",
+      "pc" : "0x7bcbbae640",
+      "samples" : 1084
+    },
+    {
+      "instructions" : [
+        "0xd5033abf",
+        "0xaa1303e0",
+        "0xf94002c8",
+        "0xb27d0108"
+      ],
+      "linkRegister" : "0xffffffc0803cc9dc",
+      "pc" : "0xffffffc0803d0c94",
+      "samples" : 1083
+    },
+    {
+      "instructions" : [
+        "0xf9402269",
+        "0x5280082a",
+        "0x6a28015f",
+        "0xcb020129"
+      ],
+      "linkRegister" : "0xffffffc08014fb54",
+      "pc" : "0xffffffc08015c198",
+      "samples" : 1083
+    },
+    {
+      "instructions" : [
+        "0x1400000a"
+      ],
+      "linkRegister" : "0xffffffc08020c434",
+      "pc" : "0xffffffc0801f8944",
+      "samples" : 1081
+    },
+    {
+      "instructions" : [
+        "0x2a1f03e0",
+        "0xa9454ff4",
+        "0xa94457f6",
+        "0xa9435ff8"
+      ],
+      "linkRegister" : "0xffffffc0813582a4",
+      "pc" : "0xffffffc08136a354",
+      "samples" : 1081
+    },
+    {
+      "instructions" : [
+        "0xf94006e8",
+        "0xeb18011f",
+        "0x54000161"
+      ],
+      "linkRegister" : "0x7bcbb56b80",
+      "pc" : "0x7bcbb40a6c",
+      "samples" : 1081
+    },
+    {
+      "instructions" : [
+        "0xaa0b03ea",
+        "0xf940016b",
+        "0xb5ffffcb"
+      ],
+      "linkRegister" : "0x6e013d1074",
+      "pc" : "0x6e017a1f14",
+      "samples" : 1052
+    },
+    {
+      "instructions" : [
+        "0x8b35cdf9",
+        "0xf9400338",
+        "0xea38039f",
+        "0xf81f83b8"
+      ],
+      "linkRegister" : "0xffffffc0803857d4",
+      "pc" : "0xffffffc0803858f4",
+      "samples" : 1008
+    },
+    {
+      "instructions" : [
+        "0x52800508",
+        "0xf9400429",
+        "0xd503201f",
+        "0x9ba85268"
+      ],
+      "linkRegister" : "0x7bcbbb0e08",
+      "pc" : "0x7bcbbb0f2c",
+      "samples" : 1000
+    },
+    {
+      "instructions" : [
+        "0x39400268",
+        "0xeb08029f",
+        "0x91000694",
+        "0x54ffff03"
+      ],
+      "linkRegister" : "0xffffffc08044694c",
+      "pc" : "0xffffffc080453ab4",
+      "samples" : 1000
+    },
+    {
+      "instructions" : [
+        "0x14000006"
+      ],
+      "linkRegister" : "0x6e013d1074",
+      "pc" : "0x6e017a1f20",
+      "samples" : 991
+    },
+    {
+      "instructions" : [
+        "0x11000524",
+        "0x2a1f03ef",
+        "0x7829d803",
+        "0x2a0203f6"
+      ],
+      "linkRegister" : "0x6e016072b0",
+      "pc" : "0x6e01607308",
+      "samples" : 978
+    },
+    {
+      "instructions" : [
+        "0x14000017"
+      ],
+      "linkRegister" : "0xffffffc08070d364",
+      "pc" : "0xffffffc08070d314",
+      "samples" : 968
+    },
+    {
+      "instructions" : [
+        "0xd503245f",
+        "0x140187ab"
+      ],
+      "linkRegister" : "0x7bcbb5830c",
+      "pc" : "0x7bcbb1c584",
+      "samples" : 968
+    },
+    {
+      "instructions" : [
+        "0xb8776a98",
+        "0x340001d8"
+      ],
+      "linkRegister" : "0x6e012893b0",
+      "pc" : "0x6e01289244",
+      "samples" : 968
+    },
+    {
+      "instructions" : [
+        "0xf94008aa",
+        "0x7869794a",
+        "0x3829690a",
+        "0x91000529"
+      ],
+      "linkRegister" : "0x6e01607454",
+      "pc" : "0x6e0125e2d8",
+      "samples" : 954
+    },
+    {
+      "instructions" : [
+        "0xd503233f",
+        "0xa9be7bfd",
+        "0xf9000bf3",
+        "0x910003fd"
+      ],
+      "linkRegister" : "0x7bcbc73df8",
+      "pc" : "0x7bcbc73dd8",
+      "samples" : 948
+    },
+    {
+      "instructions" : [
+        "0x17ffffc0"
+      ],
+      "linkRegister" : "0xffffffc0803faa68",
+      "pc" : "0xffffffc0803fab48",
+      "samples" : 947
+    }
+  ],
+  "profile" : "lineageOS",
+  "pstate" : "0x3c5",
+  "recentExceptions" : [
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcbb1a000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcbc8c050",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbb1e0c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc0804483ac",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080189d3c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcbabb000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbaff04",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc0803dc66c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0xa0000005",
+      "returnAddress" : "0xffffffc0803f2018",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc08133bf14",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba5b010",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbb1f7ac",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcbac8000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x7",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbaca600",
+      "source" : "translationFault",
+      "syndrome" : "0x92000007",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7fefcf2ff0",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbba650",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba40004",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x7",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbbbf08",
+      "source" : "translationFault",
+      "syndrome" : "0x92000007",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba3c020",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbbb52c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba3d010",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20001000",
+      "returnAddress" : "0x7bcbbbb52c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba3e000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20001000",
+      "returnAddress" : "0x7bcbbbb52c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba3f018",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20001000",
+      "returnAddress" : "0x7bcbbbb52c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x5",
+      "returnAddress" : "0xffffffc0801cc468",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba1c008",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x7",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbba90c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000007",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bca9e0008",
+      "faultLevel" : 2,
+      "faultStatusCode" : "translationLevel2",
+      "iss" : "0x6",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbba90c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000006",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba11000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbaf790",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7fefcf1ff0",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60001000",
+      "returnAddress" : "0x7bcbbbe674",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bca980010",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbb3ca9c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x64191a0040",
+      "faultLevel" : 2,
+      "faultStatusCode" : "translationLevel2",
+      "iss" : "0x6",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbc68dbc",
+      "source" : "translationFault",
+      "syndrome" : "0x92000006",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc0803d0ef8",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bca960008",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x7",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbba90c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000007",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba5799c",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x7",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20001000",
+      "returnAddress" : "0x7bcbbbbcc0",
+      "source" : "translationFault",
+      "syndrome" : "0x92000007",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataRead",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bca940008",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x7",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbba90c",
+      "source" : "translationFault",
+      "syndrome" : "0x92000007",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba10000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba0f000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "instruction",
+      "currentEL" : "EL0",
+      "exceptionClass" : "instructionAbortLowerEL",
+      "faultAddress" : "0x7bcbbe2768",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x7",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbe2768",
+      "source" : "translationFault",
+      "syndrome" : "0x82000007",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc08036b524",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7fefcf0ce0",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbe2e94",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba0b000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba0c000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbaea84",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba0d000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbaea84",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba0e000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbaea84",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20001000",
+      "returnAddress" : "0x7bcbbb02dc",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbb58c4c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbae810",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbb55ebc",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba0a000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba09000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbae810",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20001000",
+      "returnAddress" : "0x7bcbbb02ac",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba08000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0478",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc08133badc",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba07000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba06000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc081367abc",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80000005",
+      "returnAddress" : "0xffffffc081328bbc",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba07000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc0803ff714",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc08133c6a0",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba06000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba07000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc08134029c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba06000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba07000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc08045099c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba06000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80001000",
+      "returnAddress" : "0x7bcbbb0d7c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "access" : "dataWrite",
+      "currentEL" : "EL0",
+      "exceptionClass" : "dataAbortLowerEL",
+      "faultAddress" : "0x7bcba07000",
+      "faultLevel" : 3,
+      "faultStatusCode" : "translationLevel3",
+      "iss" : "0x47",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x1000",
+      "returnAddress" : "0x7bcbbb0864",
+      "source" : "translationFault",
+      "syndrome" : "0x92000047",
+      "vectorAddress" : "0xffffffc080010c00",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x400"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x80000005",
+      "returnAddress" : "0xffffffc0813382b4",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    }
+  ],
+  "recentInstructions" : [
+
+  ],
+  "recentMMIOAccesses" : [
+
+  ],
+  "recentMemoryAccesses" : [
+
+  ],
+  "recentSystemRegisterReads" : [
+
+  ],
+  "recentSystemRegisterWrites" : [
+
+  ],
+  "registers" : [
+    {
+      "name" : "x0",
+      "value" : "0xffffffc087debc60"
+    },
+    {
+      "name" : "x1",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x2",
+      "value" : "0xffffff80043acb00"
+    },
+    {
+      "name" : "x3",
+      "value" : "0x3"
+    },
+    {
+      "name" : "x4",
+      "value" : "0xffffff801d449118"
+    },
+    {
+      "name" : "x5",
+      "value" : "0x100073"
+    },
+    {
+      "name" : "x6",
+      "value" : "0xffffff8003f32b80"
+    },
+    {
+      "name" : "x7",
+      "value" : "0x626f6c5f636f6c6c"
+    },
+    {
+      "name" : "x8",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x9",
+      "value" : "0xffffff801519470c"
+    },
+    {
+      "name" : "x10",
+      "value" : "0xffffffc081abb000"
+    },
+    {
+      "name" : "x11",
+      "value" : "0x7bcba12fff"
+    },
+    {
+      "name" : "x12",
+      "value" : "0x7bca9e0000"
+    },
+    {
+      "name" : "x13",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x14",
+      "value" : "0xffffff8015194700"
+    },
+    {
+      "name" : "x15",
+      "value" : "0xe"
+    },
+    {
+      "name" : "x16",
+      "value" : "0xffffff8015194708"
+    },
+    {
+      "name" : "x17",
+      "value" : "0xf"
+    },
+    {
+      "name" : "x18",
+      "value" : "0xffffffc087de1000"
+    },
+    {
+      "name" : "x19",
+      "value" : "0xffffffc087debc60"
+    },
+    {
+      "name" : "x20",
+      "value" : "0xffffffc087debb10"
+    },
+    {
+      "name" : "x21",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x22",
+      "value" : "0x7bcba05000"
+    },
+    {
+      "name" : "x23",
+      "value" : "0xffffff801450e100"
+    },
+    {
+      "name" : "x24",
+      "value" : "0xffffff8031cc2500"
+    },
+    {
+      "name" : "x25",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x26",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x27",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x28",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x29",
+      "value" : "0xffffffc087debae0"
+    },
+    {
+      "name" : "x30",
+      "value" : "0xffffffc08133b904"
+    },
+    {
+      "name" : "sp",
+      "value" : "0xffffffc087debae0"
+    },
+    {
+      "name" : "pc",
+      "value" : "0xffffffc080010a80"
+    }
+  ],
+  "secondaryAssemblyStatistics" : {
+    "1" : {
+      "blocks" : 177808625,
+      "boundaries" : 102293055,
+      "boundedEnabled" : 0,
+      "boundedRuns" : 0,
+      "boundedSteps" : 0,
+      "boundedVisits" : 0,
+      "chainEnabled" : 0,
+      "chainRuns" : 0,
+      "chainSteps" : 0,
+      "chainVisits" : 0,
+      "enabled" : 1,
+      "faults" : 73989,
+      "steps" : 370794260
+    },
+    "2" : {
+      "blocks" : 170367640,
+      "boundaries" : 97554611,
+      "boundedEnabled" : 0,
+      "boundedRuns" : 0,
+      "boundedSteps" : 0,
+      "boundedVisits" : 0,
+      "chainEnabled" : 0,
+      "chainRuns" : 0,
+      "chainSteps" : 0,
+      "chainVisits" : 0,
+      "enabled" : 1,
+      "faults" : 72523,
+      "steps" : 358588098
+    },
+    "3" : {
+      "blocks" : 155048154,
+      "boundaries" : 85515237,
+      "boundedEnabled" : 0,
+      "boundedRuns" : 0,
+      "boundedSteps" : 0,
+      "boundedVisits" : 0,
+      "chainEnabled" : 0,
+      "chainRuns" : 0,
+      "chainSteps" : 0,
+      "chainVisits" : 0,
+      "enabled" : 1,
+      "faults" : 79509,
+      "steps" : 324863703
+    }
+  },
+  "secondaryExecutedSteps" : 45997199897,
+  "secondaryFallbackSteps" : 0,
+  "secondaryNativeSteps" : 45997176403,
+  "sp" : "0xffffffc087debae0",
+  "stackFrames" : [
+    {
+      "framePointer" : "0xffffffc087debae0",
+      "returnAddress" : "0xffffffc08133bd94"
+    },
+    {
+      "framePointer" : "0xffffffc087debb20",
+      "returnAddress" : "0xffffffc0803f2138"
+    },
+    {
+      "framePointer" : "0xffffffc087debb50",
+      "returnAddress" : "0xffffffc0803f25f0"
+    },
+    {
+      "framePointer" : "0xffffffc087debc40",
+      "returnAddress" : "0xffffffc08041a65c"
+    },
+    {
+      "framePointer" : "0xffffffc087debcb0",
+      "returnAddress" : "0xffffffc080418aac"
+    },
+    {
+      "framePointer" : "0xffffffc087debd00",
+      "returnAddress" : "0xffffffc080115fb4"
+    },
+    {
+      "framePointer" : "0xffffffc087debd60",
+      "returnAddress" : "0xffffffc080114814"
+    },
+    {
+      "framePointer" : "0xffffffc087debdc0",
+      "returnAddress" : "0xffffffc08004dc40"
+    },
+    {
+      "framePointer" : "0xffffffc087debe00",
+      "returnAddress" : "0xffffffc08004db8c"
+    },
+    {
+      "framePointer" : "0xffffffc087debe20",
+      "returnAddress" : "0xffffffc08004dad8"
+    },
+    {
+      "framePointer" : "0xffffffc087debe50",
+      "returnAddress" : "0xffffffc0813580cc"
+    },
+    {
+      "framePointer" : "0xffffffc087debe80",
+      "returnAddress" : "0xffffffc081358034"
+    },
+    {
+      "framePointer" : "0xffffffc087debea0",
+      "returnAddress" : "0xffffffc080011650"
+    },
+    {
+      "framePointer" : "0xffffffc087debfe0",
+      "returnAddress" : "0x0"
+    }
+  ],
+  "stopOnDisplay" : false,
+  "stopOnEL0" : false,
+  "stopOnEL0Fault" : false,
+  "stopOnUART" : false,
+  "stopOnUARTOutput" : "processing action (sys.boot_completed=1)",
+  "stopReason" : "total-wall-clock-budget",
+  "streamUART" : true,
+  "suppliedDeviceTree" : false,
+  "sysregTraceDepth" : 0,
+  "systemRegisters" : [
+    {
+      "name" : "CurrentEL",
+      "value" : "0x4"
+    },
+    {
+      "name" : "DAIF",
+      "value" : "0x3c0"
+    },
+    {
+      "name" : "SCTLR_EL1",
+      "value" : "0x200002034f4591d"
+    },
+    {
+      "name" : "TCR_EL1",
+      "value" : "0x4500070b5593519"
+    },
+    {
+      "name" : "TTBR0_EL1",
+      "value" : "0x42550000"
+    },
+    {
+      "name" : "TTBR1_EL1",
+      "value" : "0x42551000"
+    },
+    {
+      "name" : "VBAR_EL1",
+      "value" : "0xffffffc080010800"
+    },
+    {
+      "name" : "MAIR_EL1",
+      "value" : "0x40044ffff"
+    },
+    {
+      "name" : "SP_EL0",
+      "value" : "0xffffff8004372880"
+    },
+    {
+      "name" : "ESR_EL1",
+      "value" : "0x0"
+    },
+    {
+      "name" : "FAR_EL1",
+      "value" : "0x7bcba07000"
+    },
+    {
+      "name" : "ELR_EL1",
+      "value" : "0xffffffc0813382b4"
+    },
+    {
+      "name" : "SPSR_EL1",
+      "value" : "0x80000005"
+    },
+    {
+      "name" : "CONTEXTIDR_EL1",
+      "value" : "0x5d8"
+    },
+    {
+      "name" : "TPIDR_EL1",
+      "value" : "0xffffffbfbce6a000"
+    },
+    {
+      "name" : "TPIDR_EL0",
+      "value" : "0x7fefcf4808"
+    },
+    {
+      "name" : "TPIDRRO_EL0",
+      "value" : "0x0"
+    },
+    {
+      "name" : "DCZID_EL0",
+      "value" : "0x4"
+    },
+    {
+      "name" : "CNTFRQ_EL0",
+      "value" : "0x16e3600"
+    },
+    {
+      "name" : "CNTP_CTL_EL0",
+      "value" : "0x4"
+    },
+    {
+      "name" : "CNTP_TVAL_EL0",
+      "value" : "0x538f4f23"
+    },
+    {
+      "name" : "CNTP_CVAL_EL0",
+      "value" : "0x0"
+    },
+    {
+      "name" : "CNTV_CTL_EL0",
+      "value" : "0x5"
+    },
+    {
+      "name" : "CNTV_TVAL_EL0",
+      "value" : "0xfffffd8e"
+    },
+    {
+      "name" : "CNTV_CVAL_EL0",
+      "value" : "0x1ac70ae6b"
+    },
+    {
+      "name" : "CNTPCT_EL0",
+      "value" : "0x1ac70b0dd"
+    },
+    {
+      "name" : "CNTVCT_EL0",
+      "value" : "0x1ac70b0dd"
+    }
+  ],
+  "timerFastForwardCount" : 0,
+  "timerFastForwardCycles" : 0,
+  "timerMode" : "host-monotonic",
+  "timerScale" : 1,
+  "totalWallClockBudgetMilliseconds" : 1200000,
+  "translationCacheHits" : 74487,
+  "translationCacheMisses" : 81203,
+  "uartInputByteCount" : 0,
+  "uartInputInjected" : false,
+  "uartOutputByteCount" : 1657432,
+  "uartOutputTail" : "erfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.212   662   662 W watchdog: type=1400 audit(0.0:33): avc:  denied  { read } for  name=\"transactions\" dev=\"binder\" ino=1048589 scontext=u:r:system_server:s0 tcontext=u:object_r:binderfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.455   662   692 E android.os.Debug: Failed to get binder state info for pid: 1334 status: -2: Success\r\n10-19 12:44:15.464   662   692 E system_server: libdebuggerd_client: failed to get process tids\r\n10-19 12:44:15.488   662   692 E system_server: libdebuggerd_client: failed to get process info: failed to open \/proc\/1334: No such file or directory\r\n10-19 12:44:15.559   662   692 W ActivityManager: Dumping Java threads failed, initiating native stack dump.\r\n[  298.601356][  T241] type=1400 audit(1792413855.560:34): avc:  denied  { read } for  comm=\"watchdog\" name=\"transactions\" dev=\"binder\" ino=1048589 scontext=u:r:system_server:s0 tcontext=u:object_r:binderfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.560   662   662 I auditd  : type=1400 audit(0.0:34): avc:  denied  { read } for  comm=\"watchdog\" name=\"transactions\" dev=\"binder\" ino=1048589 scontext=u:r:system_server:s0 tcontext=u:object_r:binderfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.560   662   662 W watchdog: type=1400 audit(0.0:34): avc:  denied  { read } for  name=\"transactions\" dev=\"binder\" ino=1048589 scontext=u:r:system_server:s0 tcontext=u:object_r:binderfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.599   662   692 E android.os.Debug: Failed to get binder state info for pid: 1334 status: -2: Success\r\n10-19 12:44:15.601   662   692 E system_server: libdebuggerd_client: failed to get process tids\r\n10-19 12:44:15.602   662   692 I system_server: libdebuggerd_client: started dumping process 1334\r\n10-19 12:44:15.621   912   912 D PerDisplayStore: <StatusBarModePerDisplayRepository> new instance created for displayId=0\r\n10-19 12:44:15.628   277   277 I tombstoned: registered intercept for pid 1334 and type kDebuggerdNativeBacktrace\r\n10-19 12:44:15.635   662   692 E system_server: libdebuggerd_client: failed to send signal to pid 1334: No such process\r\n10-19 12:44:15.636   277   277 I tombstoned: intercept for pid 1334 and type kDebuggerdNativeBacktrace terminated: due to input\r\n10-19 12:44:15.703   662   692 W ActivityManager: Native stack dump failed!\r\n10-19 12:44:15.709   662   692 I ActivityManager: dumpStackTraces nativepids=[256, 257, 518, 458, 523, 460, 466, 467, 534, 472, 536, 1432, 537, 476, 477, 478, 547, 484, 485, 230, 555, 242, 1397, 505, 446, 447]\r\n10-19 12:44:15.708  1494  1494 E DEBUG   : failed to readlink \/proc\/662\/fd\/453: No such file or directory\r\n10-19 12:44:15.780   662   692 I ActivityManager: Collecting stacks for native pid 256\r\n[  298.825526][  T241] type=1400 audit(1792413855.784:35): avc:  denied  { read } for  comm=\"watchdog\" name=\"transactions\" dev=\"binder\" ino=1048589 scontext=u:r:system_server:s0 tcontext=u:object_r:binderfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.784   662   662 I auditd  : type=1400 audit(0.0:35): avc:  denied  { read } for  comm=\"watchdog\" name=\"transactions\" dev=\"binder\" ino=1048589 scontext=u:r:system_server:s0 tcontext=u:object_r:binderfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.784   662   662 W watchdog: type=1400 audit(0.0:35): avc:  denied  { read } for  name=\"transactions\" dev=\"binder\" ino=1048589 scontext=u:r:system_server:s0 tcontext=u:object_r:binderfs_logs_transactions:s0 tclass=file permissive=0\r\n10-19 12:44:15.867  1376  1383 W droid.launcher3: Suspending all threads took: 24.022ms\r\n10-19 12:44:15.901   662   692 E android.os.Debug: Failed to get binder state info for pid: 256 status: -2: Success\r\n10-19 12:44:15.977   662   692 I system_server: libdebuggerd_client: started dumping process 256\r\n10-19 12:44:15.986   277   277 I tombstoned: registered intercept for pid 256 and type kDebuggerdNativeBacktrace\r\n10-19 12:44:15.990   256   256 I libc    : Requested dump for pid 256 (android.system.)\r\n",
+  "uartProgressCompleted" : false,
+  "uartProgressMilestones" : [
+
+  ],
+  "uartProgressMilestonesReached" : [
+
+  ],
+  "virtioBlockRecentRequests" : [
+
+  ],
+  "virtioBlockRequestTypes" : [
+    {
+      "count" : 171808,
+      "name" : "read",
+      "requestType" : 0
+    },
+    {
+      "count" : 103,
+      "name" : "write",
+      "requestType" : 1
+    },
+    {
+      "count" : 44,
+      "name" : "flush",
+      "requestType" : 4
+    },
+    {
+      "count" : 2,
+      "name" : "discard",
+      "requestType" : 11
+    }
+  ],
+  "virtioBlockRequests" : 171957,
+  "virtioNetworkReceives" : 0,
+  "virtioNetworkTransmits" : 26,
+  "virtualCPUCount" : 4,
+  "waitForEventCount" : 571290,
+  "waitForInterruptCount" : 11335,
+  "wallClockElapsedMilliseconds" : 1200029
+}

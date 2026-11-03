@@ -5,8 +5,114 @@ import SwiftUI
 import UIKit
 
 struct ContentView: View {
+    @EnvironmentObject private var model: MobileOSHostModel
+
     var body: some View {
-        LinuxConsoleView()
+        Group {
+            if model.selectedBootTarget == nil {
+                GuestBootPicker()
+            } else {
+                LinuxConsoleView()
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: model.selectedBootTarget)
+    }
+}
+
+private struct GuestBootPicker: View {
+    @EnvironmentObject private var model: MobileOSHostModel
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color(red: 0.02, green: 0.04, blue: 0.07), .black],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("Pinecone")
+                            .font(.system(size: 38, weight: .bold, design: .rounded))
+                        Text("Choose a guest to boot")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    VStack(spacing: 14) {
+                        bootCard(
+                            target: .alpine,
+                            icon: "terminal.fill",
+                            detail: "Bundled Alpine environment with the persistent Pinecone desktop and shell.",
+                            footnote: "Ready to boot"
+                        )
+                        bootCard(
+                            target: .android,
+                            icon: "apps.iphone",
+                            detail: "Direct-boot the LineageOS virtio_arm64only guest with Pinecone's virtual devices.",
+                            footnote: "Experimental · reads boot and disk images from Files › Pinecone › LineageOS"
+                        )
+                    }
+
+                    Text("Android support is an early bring-up path. Use a virtio_arm64only build; phone OTA and recovery images are not compatible.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: 680, alignment: .leading)
+                .padding(32)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .foregroundStyle(.white)
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
+        .task {
+            model.prepareLineageOSImportFolder()
+        }
+    }
+
+    private func bootCard(
+        target: GuestBootTarget,
+        icon: String,
+        detail: String,
+        footnote: String
+    ) -> some View {
+        Button {
+            Task { await model.boot(target) }
+        } label: {
+            HStack(spacing: 18) {
+                Image(systemName: icon)
+                    .font(.system(size: 28, weight: .semibold))
+                    .frame(width: 54, height: 54)
+                    .background(Color.white.opacity(0.09))
+                    .clipShape(RoundedRectangle(cornerRadius: 13))
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(target.displayName)
+                        .font(.title3.weight(.semibold))
+                    Text(detail)
+                        .font(.subheadline)
+                        .foregroundStyle(Color.white.opacity(0.72))
+                    Text(footnote)
+                        .font(.caption)
+                        .foregroundStyle(Color.white.opacity(0.48))
+                }
+                Spacer(minLength: 10)
+                Image(systemName: "chevron.right")
+                    .foregroundStyle(Color.white.opacity(0.5))
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.06))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -30,9 +136,10 @@ private struct LinuxConsoleView: View {
                 performanceFeed: model.performanceFeed,
                 selectView: selectView,
                 toggleKeyboard: toggleKeyboard,
+                wake: { model.sendGuestKey(code: 143) },
                 reset: {
                     dismissKeyboard()
-                    Task { await model.boot() }
+                    Task { await model.restartSelectedGuest() }
                 },
                 reboot: {
                     model.sendTerminalBytes(Array("reboot\n".utf8))
@@ -40,20 +147,36 @@ private struct LinuxConsoleView: View {
                 stop: {
                     dismissKeyboard()
                     model.stop()
+                },
+                bootOptions: {
+                    dismissKeyboard()
+                    model.returnToBootOptions()
                 }
             )
             .padding(.trailing, 8)
+
+            if model.status == .failed, let error = model.lastError {
+                BootFailurePanel(
+                    targetName: model.selectedBootTarget?.displayName ?? "Guest",
+                    error: error,
+                    retry: { Task { await model.restartSelectedGuest() } },
+                    bootOptions: model.returnToBootOptions
+                )
+                .padding(24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black.opacity(0.72))
+                .transition(.opacity)
+            }
         }
         .padding(.bottom, 8)
         .background(Color.black.ignoresSafeArea())
         .ignoresSafeArea(.keyboard, edges: .bottom)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-        .task {
-            guard model.status == .idle else {
-                return
+        .onAppear {
+            if model.selectedBootTarget == .android {
+                selectedView = .display
             }
-            await model.boot()
         }
         .onChange(of: selectedView) { _, _ in
             dismissKeyboard()
@@ -152,9 +275,11 @@ private struct GuestControlDrawer: View {
     @ObservedObject var performanceFeed: HostPerformanceFeed
     let selectView: (GuestViewMode) -> Void
     let toggleKeyboard: () -> Void
+    let wake: () -> Void
     let reset: () -> Void
     let reboot: () -> Void
     let stop: () -> Void
+    let bootOptions: () -> Void
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 6) {
@@ -203,6 +328,13 @@ private struct GuestControlDrawer: View {
                             toggleKeyboard()
                         }
                         drawerButton(
+                            image: "sun.max",
+                            label: "Wake guest",
+                            disabled: status != .running
+                        ) {
+                            wake()
+                        }
+                        drawerButton(
                             image: "arrow.counterclockwise",
                             label: "Reset VM",
                             disabled: status == .booting
@@ -223,6 +355,12 @@ private struct GuestControlDrawer: View {
                             role: .destructive
                         ) {
                             stop()
+                        }
+                        drawerButton(
+                            image: "square.grid.2x2",
+                            label: "Boot options"
+                        ) {
+                            bootOptions()
                         }
                     }
                     .frame(width: 46)
@@ -256,6 +394,36 @@ private struct GuestControlDrawer: View {
         .disabled(disabled)
         .opacity(disabled ? 0.34 : 1)
         .accessibilityLabel(label)
+    }
+}
+
+private struct BootFailurePanel: View {
+    let targetName: String
+    let error: String
+    let retry: () -> Void
+    let bootOptions: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("\(targetName) could not boot", systemImage: "exclamationmark.triangle.fill")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text(error)
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.8))
+                .textSelection(.enabled)
+
+            HStack {
+                Button("Boot Options", action: bootOptions)
+                    .buttonStyle(.bordered)
+                Button("Try Again", action: retry)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(22)
+        .frame(maxWidth: 620, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 18))
     }
 }
 
@@ -738,7 +906,15 @@ private final class DisplayKeyboardInputView: UIView, UIKeyInput {
 }
 
 private enum TerminalTextRenderer {
+    // Keep more UART history in the model for boot-state detection, but only
+    // shape the recent tail for the visible terminal. Rendering the full
+    // 64,000-character buffer on every verbose printk update throttles Android.
+    private static let visibleCharacterLimit = 16_000
+
     static func render(_ raw: String) -> String {
+        let raw = raw.count > visibleCharacterLimit
+            ? String(raw.suffix(visibleCharacterLimit))
+            : raw
         var lines: [[Character]] = [[]]
         var column = 0
         var index = raw.startIndex

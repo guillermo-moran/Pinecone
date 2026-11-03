@@ -208,6 +208,26 @@ int32_t avz_file_block_storage_zero(
     if (lock_result != 0)
         return -lock_result;
 
+#if defined(__APPLE__) && defined(F_PUNCHHOLE)
+    /*
+     * Android commonly issues a whole-device WRITE_ZEROES while formatting
+     * userdata on first boot.  Preserve the zero-read semantics without
+     * allocating and writing every byte of a sparse multi-gigabyte image.
+     * Filesystems that do not support hole punching fall through to pwrite.
+     */
+    fpunchhole_t punch = {
+        .fp_flags = 0,
+        .reserved = 0,
+        .fp_offset = (off_t)offset,
+        .fp_length = (off_t)byte_count,
+    };
+    if (fcntl(storage->file_descriptor, F_PUNCHHOLE, &punch) == 0) {
+        storage->is_dirty = 1;
+        pthread_mutex_unlock(&storage->lock);
+        return 0;
+    }
+#endif
+
     static const unsigned char zeroes[64u * 1024u] = {0};
     size_t completed = 0;
     const size_t total = (size_t)byte_count;

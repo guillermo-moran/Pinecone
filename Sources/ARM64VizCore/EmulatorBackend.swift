@@ -93,12 +93,14 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         nativeBlockCache = avz_native_block_cache_create()
         nativeExecutionContext = avz_native_execution_context_create()
         let assemblyOverride = ProcessInfo.processInfo.environment["PINECONE_ASSEMBLY_EXECUTOR"]
+        // Ship the assembly path enabled in the iOS app, including standalone
+        // device launches. Keep an explicit C opt-out and the CLI's baseline.
 #if os(iOS)
-        // The device-test configuration must also apply when launched outside Xcode.
-        let assemblyEnabled = assemblyOverride.map { $0 == "1" } ?? true
+        let assemblyDefault = true
 #else
-        let assemblyEnabled = assemblyOverride == "1"
+        let assemblyDefault = false
 #endif
+        let assemblyEnabled = assemblyOverride.map { $0 == "1" } ?? assemblyDefault
         setNativeAssemblyExecutorEnabled(assemblyEnabled)
         setNativeAssemblyChainingEnabled(
             assemblyEnabled && ProcessInfo.processInfo.environment["PINECONE_ASSEMBLY_CHAINING"] == "1"
@@ -722,6 +724,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         let key: BasicBlockCacheKey
         let instructions: [DecodedBlockInstruction]
         let nativeInstructions: [AVZNativeInstruction]
+        let nativeSemanticCandidates: [UInt8]
         let physicalRanges: [CodeCachePhysicalRange]
         let nativeEligible: Bool
         let usesVectorState: Bool
@@ -737,6 +740,20 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             self.key = key
             self.instructions = instructions
             self.nativeInstructions = nativeInstructions
+            self.nativeSemanticCandidates = nativeInstructions.withUnsafeBufferPointer { buffer in
+                guard let baseAddress = buffer.baseAddress else {
+                    return []
+                }
+                return buffer.indices.map { index in
+                    avz_native_classify_semantic_candidate(
+                        baseAddress,
+                        buffer.count,
+                        index,
+                        index == 0 ? 1 : 0,
+                        0
+                    )
+                }
+            }
             self.physicalRanges = physicalRanges
             self.nativeEligible = nativeEligible
             self.usesVectorState = usesVectorState
@@ -1938,8 +1955,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
             let pageOffset = virtualAddress & 0xfff
             let virtualPage = virtualAddress & ~UInt64(0xfff)
-            let usesTTBR1 = (virtualAddress >> 63) == 1
             let tcr = vm.translationTCR_EL1
+            let usesTTBR1 = ARM64Stage1Translator.usesTTBR1(
+                virtualAddress: virtualAddress,
+                tcr: tcr
+            )
             let ttbr = usesTTBR1 ? vm.translationTTBR1_EL1 : vm.translationTTBR0_EL1
             let key = NativePageCacheKey(
                 virtualPage: virtualPage,
@@ -1974,7 +1994,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             tcr: UInt64,
             ttbr: UInt64
         ) throws -> GuestAddress {
-            let usesTTBR1 = (virtualAddress >> 63) == 1
+            let usesTTBR1 = ARM64Stage1Translator.usesTTBR1(
+                virtualAddress: virtualAddress,
+                tcr: tcr
+            )
             let sizeOffset = usesTTBR1 ? 16 : 0
             let tsz = Int((tcr >> UInt64(sizeOffset)) & 0x3f)
             let inputAddressSize = 64 - tsz
@@ -2002,7 +2025,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 virtualAddress: effectiveVA,
                 originalVirtualAddress: virtualAddress,
                 access: access,
-                tableBase: tableBase
+                tableBase: tableBase,
+                startLevel: ARM64Stage1Translator.initial4KBLookupLevel(
+                    inputAddressSize: inputAddressSize
+                )
             )
         }
 
@@ -2010,11 +2036,12 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             virtualAddress: GuestAddress,
             originalVirtualAddress: GuestAddress,
             access: GuestMemoryAccessKind,
-            tableBase: GuestAddress
+            tableBase: GuestAddress,
+            startLevel: Int
         ) throws -> GuestAddress {
             var currentTable = tableBase
 
-            for level in 0...3 {
+            for level in startLevel...3 {
                 let shift = 39 - (level * 9)
                 let index = (virtualAddress >> UInt64(shift)) & 0x1ff
                 let descriptorAddress = currentTable + index * 8
@@ -2382,6 +2409,15 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         guard requestedSteps > 0 else {
             return 0
         }
+        // Parallel vCPUs use a shared host-monotonic counter. The native
+        // service boundary already refreshes that clock every 1,024 retired
+        // instructions and exits when a timer IRQ becomes due. Converting a
+        // host-clock tick distance back into an instruction allowance here is
+        // both dimensionally wrong and can collapse execution to one-step
+        // bursts around a deadline.
+        if vm.nativeCounterClock != nil {
+            return requestedSteps
+        }
         guard vm.timerCyclesPerInstruction > 0 else {
             return requestedSteps
         }
@@ -2706,7 +2742,9 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     private func nativeInstructionUsesVectorState(_ kind: UInt16) -> Bool {
         switch Int(kind) {
-        case AVZ_NATIVE_OP_SIMD_MOVE_VECTOR_ELEMENT_TO_GENERAL,
+        case AVZ_NATIVE_OP_SIMD_FP_LOAD_LITERAL,
+             AVZ_NATIVE_OP_SIMD_SATURATING_MULTIPLY_HIGH,
+             AVZ_NATIVE_OP_SIMD_MOVE_VECTOR_ELEMENT_TO_GENERAL,
              AVZ_NATIVE_OP_FP_SCALAR_GENERAL_MOVE,
              AVZ_NATIVE_OP_FP_SCALAR_REGISTER_MOVE,
              AVZ_NATIVE_OP_FP_SCALAR_IMMEDIATE_MOVE,
@@ -2745,6 +2783,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
              AVZ_NATIVE_OP_SIMD_TABLE_LOOKUP,
              AVZ_NATIVE_OP_SIMD_PERMUTE_TWO_VECTOR,
              AVZ_NATIVE_OP_SIMD_ADD_VECTOR,
+             AVZ_NATIVE_OP_SIMD_HALVING_ADD_SUBTRACT,
+             AVZ_NATIVE_OP_SIMD_SHA256,
              AVZ_NATIVE_OP_SIMD_COMPARE_EQUAL_VECTOR,
              AVZ_NATIVE_OP_SIMD_COUNT_SET_BITS,
              AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS,
@@ -2777,7 +2817,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         switch Int(kind) {
         case AVZ_NATIVE_OP_LOAD_ACQUIRE_STORE_RELEASE,
              AVZ_NATIVE_OP_LOAD_STORE_EXCLUSIVE,
-             AVZ_NATIVE_OP_LOAD_STORE_EXCLUSIVE_PAIR:
+             AVZ_NATIVE_OP_LOAD_STORE_EXCLUSIVE_PAIR,
+             AVZ_NATIVE_OP_LSE_ATOMIC:
             return true
         default:
             return false
@@ -3440,25 +3481,28 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             recordNativeMemoryStatistics(memorySession.takeStatisticsDelta())
         }
         let result = block.nativeInstructions.withUnsafeBufferPointer { instructionBuffer in
-            registers.withUnsafeMutableBufferPointer { registerBuffer in
-                runNativeDecodedBlock(
-                    instructions: instructionBuffer,
-                    basePC: block.key.pc,
-                    maxSteps: nativeStepLimit,
-                    registers: registerBuffer,
-                    vectorLows: &vectorLows,
-                    vectorHighs: &vectorHighs,
-                    usesVectorState: block.usesVectorState,
-                    sp: &sp,
-                    pc: &pc,
-                    pstate: &pstate,
-                    exclusiveAddress: &exclusiveAddress,
-                    exclusiveGeneration: &exclusiveGeneration,
-                    exclusiveSize: &exclusiveSize,
-                    exclusiveValid: &exclusiveValid,
-                    halted: &halted,
-                    memoryContext: memoryContext
-                )
+            block.nativeSemanticCandidates.withUnsafeBufferPointer { semanticCandidateBuffer in
+                registers.withUnsafeMutableBufferPointer { registerBuffer in
+                    runNativeDecodedBlock(
+                        instructions: instructionBuffer,
+                        semanticCandidates: semanticCandidateBuffer,
+                        basePC: block.key.pc,
+                        maxSteps: nativeStepLimit,
+                        registers: registerBuffer,
+                        vectorLows: &vectorLows,
+                        vectorHighs: &vectorHighs,
+                        usesVectorState: block.usesVectorState,
+                        sp: &sp,
+                        pc: &pc,
+                        pstate: &pstate,
+                        exclusiveAddress: &exclusiveAddress,
+                        exclusiveGeneration: &exclusiveGeneration,
+                        exclusiveSize: &exclusiveSize,
+                        exclusiveValid: &exclusiveValid,
+                        halted: &halted,
+                        memoryContext: memoryContext
+                    )
+                }
             }
         }
         if collectPerformanceTimings {
@@ -3575,6 +3619,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     private func runNativeDecodedBlock(
         instructions: UnsafeBufferPointer<AVZNativeInstruction>,
+        semanticCandidates: UnsafeBufferPointer<UInt8>? = nil,
         basePC: GuestAddress,
         maxSteps: Int,
         registers: UnsafeMutableBufferPointer<UInt64>,
@@ -3633,9 +3678,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if usesVectorState {
             result = vectorLows.withUnsafeMutableBufferPointer { vectorLowBuffer in
                 vectorHighs.withUnsafeMutableBufferPointer { vectorHighBuffer in
-                    avz_native_run_threaded_decoded_block_full_registers_with_exclusive(
+                    avz_native_run_threaded_decoded_block_full_registers_with_exclusive_and_semantic_candidates(
                         instructions.baseAddress,
                         instructions.count,
+                        semanticCandidates?.baseAddress,
                         basePC,
                         UInt64(maxSteps),
                         registers.baseAddress,
@@ -3666,9 +3712,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 }
             }
         } else {
-            result = avz_native_run_threaded_decoded_block_full_registers_with_exclusive(
+            result = avz_native_run_threaded_decoded_block_full_registers_with_exclusive_and_semantic_candidates(
                 instructions.baseAddress,
                 instructions.count,
+                semanticCandidates?.baseAddress,
                 basePC,
                 UInt64(maxSteps),
                 registers.baseAddress,
@@ -4090,6 +4137,15 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 return 1
             }
             let blockSize = UInt64(4) << UInt64(dczid & 0xf)
+            if let fastPath = nativeContext.fastPath {
+                return avz_native_fast_memory_fill(
+                    UnsafeMutableRawPointer(fastPath),
+                    operand & ~(blockSize - 1),
+                    blockSize,
+                    0,
+                    8
+                )
+            }
             do {
                 return try nativeContext.fillRAM(
                     operand & ~(blockSize - 1),
@@ -4304,10 +4360,6 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
         _ = cachedDecodedInstruction(for: instruction)
 
-        if (instruction & 0xffff_f0ff) == 0xd503_305f {
-            return false
-        }
-
         let cachedNative = cachedNativeInstruction(for: instruction)
         guard cachedNative.supported else {
             return false
@@ -4327,7 +4379,12 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         var halted: UInt8 = vm.cpu.halted ? 1 : 0
         let sharedMemorySession: NativeMemorySession?
         let memoryContext: NativeMemoryContext
-        if nativeInstructionRequiresSharedExclusiveMemory(cachedNative.nativeInstruction.kind) {
+        let isDCZVA = cachedNative.nativeInstruction.kind == AVZ_NATIVE_OP_SYSTEM_INSTRUCTION &&
+            (instruction & 0xffff_ffe0) == 0xd50b_7420
+        // DC ZVA writes guest memory and must use the tracked native session so
+        // its fast fill preserves translation faults and write observation.
+        if nativeInstructionRequiresSharedExclusiveMemory(cachedNative.nativeInstruction.kind) ||
+            isDCZVA {
             guard let session = memorySession(for: vm) else {
                 return false
             }
@@ -4687,7 +4744,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             return
         }
 
-        if (instruction & 0x7fe0_c000) == 0x1ac0_0000 {
+        if (instruction & 0x7fe0_0000) == 0x1ac0_0000 {
             try executeDataProcessingTwoSource(vm, instruction: instruction)
             return
         }
@@ -4716,6 +4773,12 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 is64Bit: ((instruction >> 31) & 0x1) == 1
             )
             return
+        }
+
+        if isLSEAtomicRMWEncoding(instruction) ||
+            isLSECompareExchangeEncoding(instruction) ||
+            isLSECompareExchangePairEncoding(instruction) {
+            throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
         }
 
         if (instruction & 0x3fa0_0000) == 0x0820_0000 {
@@ -5107,6 +5170,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         case systemRegisterWrite
         case pcRelativeAddress(page: Bool)
         case loadLiteral
+        case simdFPLoadLiteral(bytes: Int)
         case compareAndBranch
         case testAndBranch
         case conditionalCompareRegister
@@ -5130,6 +5194,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         case addSubExtendedRegister
         case moveWide
         case addSubImmediate
+        case nativeLSEAtomic
         case loadStoreExclusivePair
         case loadStoreExclusive
         case loadAcquireStoreRelease
@@ -5204,6 +5269,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             case .advancePC,
                  .pcRelativeAddress,
                  .loadLiteral,
+                 .simdFPLoadLiteral,
                  .compareAndBranch,
                  .testAndBranch,
                  .conditionalCompareRegister,
@@ -5227,6 +5293,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                  .addSubExtendedRegister,
                  .moveWide,
                  .addSubImmediate,
+                 .nativeLSEAtomic,
                  .loadStoreExclusivePair,
                  .loadStoreExclusive,
                  .loadAcquireStoreRelease,
@@ -5336,6 +5403,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             return BasicBlockGadget(name: "load-literal") { backend, vm, instruction, _ in
                 try backend.executeLoadLiteralFast(vm, instruction: instruction)
             }
+        case let .simdFPLoadLiteral(bytes):
+            return BasicBlockGadget(name: "simd-fp-load-literal") { backend, vm, instruction, _ in
+                try backend.executeSIMDFPLoadLiteralFast(vm, instruction: instruction, bytes: bytes)
+            }
         case .compareAndBranch:
             return BasicBlockGadget(name: "compare-and-branch", terminatesBlock: true) { backend, vm, instruction, _ in
                 backend.executeCompareAndBranch(vm, instruction: instruction)
@@ -5433,6 +5504,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                     setFlags: ((instruction >> 29) & 0x1) == 1,
                     is64Bit: ((instruction >> 31) & 0x1) == 1
                 )
+            }
+        case .nativeLSEAtomic:
+            return BasicBlockGadget(name: "native-lse-atomic") { _, _, instruction, pc in
+                throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
             }
         case .fpScalarGeneralMove:
             return BasicBlockGadget(name: "fp-general-move") { backend, vm, instruction, _ in
@@ -5814,6 +5889,42 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
     }
 
+    private func executeSIMDFPLoadLiteralFast(
+        _ vm: VirtualMachine,
+        instruction: UInt32,
+        bytes: Int
+    ) throws {
+        let pc = vm.cpu.pc
+        let rt = Int(instruction & 0x1f)
+        let offset = signExtend((instruction >> 5) & 0x7ffff, bits: 19) << 2
+        let address = addSignedOffset(pc, offset)
+
+        do {
+            switch bytes {
+            case 4:
+                vm.cpu.v[rt] = ARM64VectorRegister(
+                    low: try readGuestFastOrFallback(vm, address: address, width: .word),
+                    high: 0
+                )
+            case 8:
+                vm.cpu.v[rt] = ARM64VectorRegister(
+                    low: try readGuestFastOrFallback(vm, address: address, width: .doubleword),
+                    high: 0
+                )
+            case 16:
+                vm.cpu.v[rt] = ARM64VectorRegister(
+                    low: try readGuestFastOrFallback(vm, address: address, width: .doubleword),
+                    high: try readGuestFastOrFallback(vm, address: address + 8, width: .doubleword)
+                )
+            default:
+                throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+            }
+            vm.cpu.pc = pc + 4
+        } catch let fault as ARM64TranslationFault {
+            routeTranslationFault(vm, fault: fault, returnAddress: pc)
+        }
+    }
+
     private func executeStoreUnsignedImmediateFast(
         _ vm: VirtualMachine,
         instruction: UInt32,
@@ -5881,6 +5992,9 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     private func executeLoadStoreSignedImmediateFast(_ vm: VirtualMachine, instruction: UInt32) throws {
         let pc = vm.cpu.pc
+        guard !isLSEAtomicRMWEncoding(instruction) else {
+            throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+        }
         let size = Int((instruction >> 30) & 0x3)
         let opcode = (instruction >> 22) & 0x3
         let imm9 = signExtend((instruction >> 12) & 0x1ff, bits: 9)
@@ -6140,6 +6254,29 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         return (nativeInstruction, supported)
     }
 
+    @inline(__always)
+    private func isLSEAtomicRMWEncoding(_ instruction: UInt32) -> Bool {
+        (instruction & 0x3f20_0c00) == 0x3820_0000
+    }
+
+    @inline(__always)
+    private func isLSECompareExchangeEncoding(_ instruction: UInt32) -> Bool {
+        (instruction & 0x3fa0_7c00) == 0x08a0_7c00
+    }
+
+    @inline(__always)
+    private func isLSECompareExchangePairEncoding(_ instruction: UInt32) -> Bool {
+        (instruction & 0x3fa0_7c00) == 0x0820_7c00
+    }
+
+    @inline(__always)
+    private func isSupportedNativeLSEEncoding(_ instruction: UInt32) -> Bool {
+        if isLSECompareExchangeEncoding(instruction) {
+            return true
+        }
+        return isLSEAtomicRMWEncoding(instruction) && ((instruction >> 12) & 0xf) <= 8
+    }
+
     private func decodeInstruction(_ instruction: UInt32) -> DecodedInstruction? {
         if instruction == 0xd503_201f { return .advancePC }
         if instruction == 0xd503_205f { return .waitForEvent }
@@ -6174,7 +6311,12 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             break
         }
 
-        if (instruction & 0x3b00_0000) == 0x1800_0000 { return .loadLiteral }
+        if (instruction & 0x3f00_0000) == 0x1c00_0000 {
+            let opcode = Int((instruction >> 30) & 0x3)
+            guard opcode != 3 else { return nil }
+            return .simdFPLoadLiteral(bytes: 4 << opcode)
+        }
+        if (instruction & 0x3f00_0000) == 0x1800_0000 { return .loadLiteral }
         if (instruction & 0x7e00_0000) == 0x3400_0000 { return .compareAndBranch }
         if (instruction & 0x7e00_0000) == 0x3600_0000 { return .testAndBranch }
         if (instruction & 0x3fe0_0c10) == 0x3a40_0000 { return .conditionalCompareRegister }
@@ -6195,11 +6337,15 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         if (instruction & 0xffe0_fc00) == 0x9b40_7c00 { return .signedMultiplyHigh }
         if (instruction & 0xffe0_fc00) == 0x9bc0_7c00 { return .unsignedMultiplyHigh }
         if (instruction & 0x5fe0_0000) == 0x5ac0_0000 { return .dataProcessingOneSource }
-        if (instruction & 0x7fe0_c000) == 0x1ac0_0000 { return .dataProcessingTwoSource }
+        if (instruction & 0x7fe0_0000) == 0x1ac0_0000 { return .dataProcessingTwoSource }
         if (instruction & 0x1f20_0000) == 0x0b00_0000 { return .addSubShiftedRegister }
         if (instruction & 0x1f20_0000) == 0x0b20_0000 { return .addSubExtendedRegister }
         if (instruction & 0x1f80_0000) == 0x1280_0000 { return .moveWide }
         if (instruction & 0x1f00_0000) == 0x1100_0000 { return .addSubImmediate }
+        if isLSECompareExchangePairEncoding(instruction) { return nil }
+        if isLSEAtomicRMWEncoding(instruction) || isLSECompareExchangeEncoding(instruction) {
+            return isSupportedNativeLSEEncoding(instruction) ? .nativeLSEAtomic : nil
+        }
         if (instruction & 0x3fa0_0000) == 0x0820_0000 { return .loadStoreExclusivePair }
         if (instruction & 0x3fa0_7c00) == 0x0800_7c00 { return .loadStoreExclusive }
         if (instruction & 0x3fa0_fc00) == 0x0880_fc00 { return .loadAcquireStoreRelease }
@@ -6373,6 +6519,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             executePCRelativeAddress(vm, instruction: instruction, page: page)
         case .loadLiteral:
             try executeLoadLiteral(vm, instruction: instruction)
+        case let .simdFPLoadLiteral(bytes):
+            try executeSIMDFPLoadLiteral(vm, instruction: instruction, bytes: bytes)
         case .compareAndBranch:
             executeCompareAndBranch(vm, instruction: instruction)
         case .testAndBranch:
@@ -6425,6 +6573,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 setFlags: ((instruction >> 29) & 0x1) == 1,
                 is64Bit: ((instruction >> 31) & 0x1) == 1
             )
+        case .nativeLSEAtomic:
+            throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
         case .loadStoreExclusivePair:
             try executeLoadStoreExclusivePair(vm, instruction: instruction)
         case .loadStoreExclusive:
@@ -6871,6 +7021,42 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 writeRegister(vm, rt, signExtendLoaded(value, bits: 32))
             case 3:
                 break
+            default:
+                throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+            }
+            vm.cpu.pc = pc + 4
+        } catch let fault as ARM64TranslationFault {
+            routeTranslationFault(vm, fault: fault, returnAddress: pc)
+        }
+    }
+
+    private func executeSIMDFPLoadLiteral(
+        _ vm: VirtualMachine,
+        instruction: UInt32,
+        bytes: Int
+    ) throws {
+        let pc = vm.cpu.pc
+        let rt = Int(instruction & 0x1f)
+        let offset = signExtend((instruction >> 5) & 0x7ffff, bits: 19) << 2
+        let address = addSignedOffset(pc, offset)
+
+        do {
+            switch bytes {
+            case 4:
+                vm.cpu.v[rt] = ARM64VectorRegister(
+                    low: try vm.readGuest(address, width: .word),
+                    high: 0
+                )
+            case 8:
+                vm.cpu.v[rt] = ARM64VectorRegister(
+                    low: try vm.readGuest(address, width: .doubleword),
+                    high: 0
+                )
+            case 16:
+                vm.cpu.v[rt] = ARM64VectorRegister(
+                    low: try vm.readGuest(address, width: .doubleword),
+                    high: try vm.readGuest(address + 8, width: .doubleword)
+                )
             default:
                 throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
             }
@@ -7343,6 +7529,21 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             writeRegister(vm, rd, signedDivide(readRegister(vm, rn), by: readRegister(vm, rm), bits: bits))
             vm.cpu.pc = pc + 4
             return
+        case 0x10...0x17:
+            let byteCount = 1 << Int(opcode & 0x3)
+            guard (byteCount == 8) == is64Bit else {
+                throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+            }
+            let polynomial: UInt32 = opcode >= 0x14 ? 0x82f6_3b78 : 0xedb8_8320
+            let checksum = crc32(
+                accumulator: UInt32(truncatingIfNeeded: readRegister(vm, rn)),
+                value: readRegister(vm, rm),
+                byteCount: byteCount,
+                polynomial: polynomial
+            )
+            writeRegister(vm, rd, UInt64(checksum))
+            vm.cpu.pc = pc + 4
+            return
         case 0x08:
             shiftType = 0
         case 0x09:
@@ -7357,6 +7558,22 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
         writeRegister(vm, rd, shiftedRegisterValue(source, shiftType: shiftType, amount: amount, bits: bits))
         vm.cpu.pc = pc + 4
+    }
+
+    private func crc32(
+        accumulator: UInt32,
+        value: UInt64,
+        byteCount: Int,
+        polynomial: UInt32
+    ) -> UInt32 {
+        var checksum = accumulator
+        for byteIndex in 0..<byteCount {
+            checksum ^= UInt32((value >> UInt64(byteIndex * 8)) & 0xff)
+            for _ in 0..<8 {
+                checksum = (checksum >> 1) ^ ((checksum & 1) == 0 ? 0 : polynomial)
+            }
+        }
+        return checksum
     }
 
     private func signedDivide(_ dividend: UInt64, by divisor: UInt64, bits: Int) -> UInt64 {
@@ -7952,21 +8169,34 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         let rn = Int((instruction >> 5) & 0x1f)
         let ra = Int((instruction >> 10) & 0x1f)
         let rm = Int((instruction >> 16) & 0x1f)
-        let subtractAddend = ((instruction >> 15) & 0x1) == 1
-        let negateResult = ((instruction >> 21) & 0x1) == 1
+        let scalarByElement = (instruction & 0xff00_b400) == 0x5f00_1000
+        let subtractAddend = scalarByElement
+            ? ((instruction >> 14) & 0x1) == 1
+            : ((instruction >> 15) & 0x1) == 1
+        let negateResult = !scalarByElement && ((instruction >> 21) & 0x1) == 1
         let isDouble = ((instruction >> 22) & 0x1) == 1
+        let sourceLane = isDouble
+            ? Int((instruction >> 11) & 0x1)
+            : Int(((instruction >> 11) & 0x1) << 1 | ((instruction >> 21) & 0x1))
+        let accumulatorRegister = scalarByElement ? rd : ra
 
         if isDouble {
             let lhs = Double(bitPattern: vm.cpu.v[rn].low)
-            let rhs = Double(bitPattern: vm.cpu.v[rm].low)
-            let accumulator = Double(bitPattern: vm.cpu.v[ra].low)
+            let rhsBits = scalarByElement
+                ? readVectorElement(vm.cpu.v[rm], lane: sourceLane, elementBits: 64)
+                : vm.cpu.v[rm].low
+            let rhs = Double(bitPattern: rhsBits)
+            let accumulator = Double(bitPattern: vm.cpu.v[accumulatorRegister].low)
             let addend = subtractAddend ? -accumulator : accumulator
             let result = addend.addingProduct(lhs, rhs)
             vm.cpu.v[rd] = ARM64VectorRegister(low: (negateResult ? -result : result).bitPattern, high: 0)
         } else {
             let lhs = Float(bitPattern: UInt32(truncatingIfNeeded: vm.cpu.v[rn].low))
-            let rhs = Float(bitPattern: UInt32(truncatingIfNeeded: vm.cpu.v[rm].low))
-            let accumulator = Float(bitPattern: UInt32(truncatingIfNeeded: vm.cpu.v[ra].low))
+            let rhsBits = scalarByElement
+                ? readVectorElement(vm.cpu.v[rm], lane: sourceLane, elementBits: 32)
+                : vm.cpu.v[rm].low
+            let rhs = Float(bitPattern: UInt32(truncatingIfNeeded: rhsBits))
+            let accumulator = Float(bitPattern: UInt32(truncatingIfNeeded: vm.cpu.v[accumulatorRegister].low))
             let addend = subtractAddend ? -accumulator : accumulator
             let result = addend.addingProduct(lhs, rhs)
             vm.cpu.v[rd] = ARM64VectorRegister(
@@ -8485,6 +8715,35 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         let rn = Int((instruction >> 5) & 0x1f)
         let rm = Int((instruction >> 16) & 0x1f)
         let size = Int((instruction >> 22) & 0x3)
+        if (instruction & 0xbf20_fc00) == 0x0e20_e000 {
+            guard size == 0 || size == 3 else {
+                throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+            }
+            let sourceBits = size == 0 ? 8 : 64
+            let sourceLaneBase = ((instruction >> 30) & 0x1) == 1 ? 64 / sourceBits : 0
+            var result = ARM64VectorRegister()
+            if sourceBits == 64 {
+                let lhs = readVectorElement(vm.cpu.v[rn], lane: sourceLaneBase, elementBits: 64)
+                let rhs = readVectorElement(vm.cpu.v[rm], lane: sourceLaneBase, elementBits: 64)
+                let product = carrylessMultiply(lhs, rhs)
+                result.low = product.low
+                result.high = product.high
+            } else {
+                for lane in 0..<8 {
+                    let lhs = readVectorElement(vm.cpu.v[rn], lane: sourceLaneBase + lane, elementBits: 8)
+                    let rhs = readVectorElement(vm.cpu.v[rm], lane: sourceLaneBase + lane, elementBits: 8)
+                    writeVectorElement(
+                        &result,
+                        lane: lane,
+                        elementBits: 16,
+                        value: carrylessMultiply(lhs, rhs).low
+                    )
+                }
+            }
+            vm.cpu.v[rd] = result
+            vm.cpu.pc = pc + 4
+            return
+        }
         guard size <= 2 else {
             throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
         }
@@ -8514,6 +8773,18 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         }
         vm.cpu.v[rd] = result
         vm.cpu.pc = pc + 4
+    }
+
+    private func carrylessMultiply(_ lhs: UInt64, _ rhs: UInt64) -> (low: UInt64, high: UInt64) {
+        var low: UInt64 = 0
+        var high: UInt64 = 0
+        for bit in 0..<64 where ((rhs >> UInt64(bit)) & 1) != 0 {
+            low ^= lhs << UInt64(bit)
+            if bit != 0 {
+                high ^= lhs >> UInt64(64 - bit)
+            }
+        }
+        return (low, high)
     }
 
     private func executeSIMDNarrowHigh(_ vm: VirtualMachine, instruction: UInt32) throws {
@@ -8730,6 +9001,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
         let rm = Int((instruction >> 16) & 0x1f)
         let elementBits = 8 << Int((instruction >> 22) & 0x3)
         let vectorBits = ((instruction >> 30) & 1) == 1 ? 128 : 64
+        let selectMinimum = ((instruction >> 11) & 1) == 1
         guard elementBits <= 32 else {
             throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
         }
@@ -8741,8 +9013,10 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             let left1 = readVectorElement(vm.cpu.v[rn], lane: lane * 2 + 1, elementBits: elementBits)
             let right0 = readVectorElement(vm.cpu.v[rm], lane: lane * 2, elementBits: elementBits)
             let right1 = readVectorElement(vm.cpu.v[rm], lane: lane * 2 + 1, elementBits: elementBits)
-            writeVectorElement(&result, lane: lane, elementBits: elementBits, value: max(left0, left1))
-            writeVectorElement(&result, lane: halfLanes + lane, elementBits: elementBits, value: max(right0, right1))
+            let left = selectMinimum ? min(left0, left1) : max(left0, left1)
+            let right = selectMinimum ? min(right0, right1) : max(right0, right1)
+            writeVectorElement(&result, lane: lane, elementBits: elementBits, value: left)
+            writeVectorElement(&result, lane: halfLanes + lane, elementBits: elementBits, value: right)
         }
         vm.cpu.v[rd] = result
         vm.cpu.pc = pc + 4
@@ -8829,6 +9103,9 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     private func executeLoadStoreSignedImmediate(_ vm: VirtualMachine, instruction: UInt32) throws {
         let pc = vm.cpu.pc
+        guard !isLSEAtomicRMWEncoding(instruction) else {
+            throw VMError.unsupportedInstruction(instruction: instruction, pc: pc)
+        }
         let size = Int((instruction >> 30) & 0x3)
         let opcode = (instruction >> 22) & 0x3
         let imm9 = signExtend((instruction >> 12) & 0x1ff, bits: 9)
@@ -9719,7 +9996,11 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     }
 
     private func isSIMDMultiplyLong(_ instruction: UInt32) -> Bool {
-        (instruction & 0x9f20_fc00) == 0x0e20_c000 && ((instruction >> 22) & 0x3) <= 2
+        if (instruction & 0xbf20_fc00) == 0x0e20_e000 {
+            let size = (instruction >> 22) & 0x3
+            return size == 0 || size == 3
+        }
+        return (instruction & 0x9f20_fc00) == 0x0e20_c000 && ((instruction >> 22) & 0x3) <= 2
     }
 
     private func isSIMDNarrowHigh(_ instruction: UInt32) -> Bool {
@@ -9780,7 +10061,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     }
 
     private func isSIMDUnsignedMaxPairwise(_ instruction: UInt32) -> Bool {
-        (instruction & 0xbf20_fc00) == 0x2e20_a400 && ((instruction >> 22) & 3) != 3
+        (instruction & 0xbf20_f400) == 0x2e20_a400 && ((instruction >> 22) & 3) != 3
     }
 
     private func isSIMDTableLookup(_ instruction: UInt32) -> Bool {
@@ -9953,7 +10234,8 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
     }
 
     private func isFPScalarFusedMultiplyAdd(_ instruction: UInt32) -> Bool {
-        (instruction & 0xff80_0000) == 0x1f00_0000
+        (instruction & 0xff80_0000) == 0x1f00_0000 ||
+            (instruction & 0xff00_b400) == 0x5f00_1000
     }
 
     private func isFPScalarUnary(_ instruction: UInt32) -> Bool {

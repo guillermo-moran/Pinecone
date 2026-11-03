@@ -157,6 +157,9 @@ AGServiceResult ag_service_chain_run(AGServiceChain *chain, AGServiceLimits limi
  * or events. Every edge checks ALL member serial/page tokens and global guards;
  * the full owner validator runs on entry and after every service, including the
  * final service. Memory preparation occurs once, never at ordinary edges.
+ * Prepared edge proofs retain every member serial and each distinct local /
+ * shared page certificate. Identical same-role page pointers with identical
+ * captured values share one live check per edge; shared loads remain acquire.
  * The graph remains pinned through final service/validation. Recursive use is
  * rejected. No side effect is replayed. The generic API is unchanged.
  * Preparation allocation failure returns REVALIDATE/STOP_PREPARATION with zero

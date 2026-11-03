@@ -1,0 +1,76 @@
+diff --git a/virt-common.mk b/virt-common.mk
+index 1111111..2222222 100644
+--- a/virt-common.mk
++++ b/virt-common.mk
+@@ -10,7 +10,7 @@ ifeq ($(AB_OTA_UPDATER),true)
+ endif
+ TARGET_ENABLE_LOGCAT_TO_SERIAL := true
+ TARGET_ENABLE_RECOVERY_ETHERNET_DHCP := true
+-TARGET_ENABLE_VIRT_WIFI := true
++TARGET_ENABLE_VIRT_WIFI ?= true
+ TARGET_GRAPHICS := mesa
+ TARGET_HAS_BATTERY := false
+ TARGET_HAS_VIBRATOR := false
+@@ -18,7 +18,7 @@ TARGET_HOSTAPD_AND_WPA_SUPPLICANT_FORM := apex-mainline_common
+ TARGET_KEYMINT_HAL_DEFAULT_INSIDE_APEX := false # To save existing users from doing factory reset
+ TARGET_LIGHT_HAL := none
+ TARGET_MESA_ENABLE_SOFTWARE_RENDERER := true
+-TARGET_SENSORS_HAL := cuttlefish
++TARGET_SENSORS_HAL ?= cuttlefish
+ TARGET_SUPPORTS_SUSPEND := false
+ TARGET_SUPPORTS_USB_ACCESSORY_MODE := false
+ TARGET_USES_TABLET_INPUT_AS_TOUCHSCREEN := true
+@@ -35,10 +35,12 @@ ifeq ($(AB_OTA_UPDATER),true)
+ $(call soong_config_set,VIRT_PREINSTALL_CHECK,AB_OTA_UPDATER,$(AB_OTA_UPDATER))
+ endif
+ 
++ifneq ($(TARGET_AUDIO_HAL),none)
+ # Audio
+ PRODUCT_PACKAGES += \
+     setup_sound_card
++endif
+ 
+ # Bluetooth
+ ifneq ($(PRODUCT_IS_ATV),true)
+ ifneq ($(PRODUCT_IS_AUTOMOTIVE),true)
+@@ -163,15 +165,21 @@ PRODUCT_CHECK_PREBUILT_MAX_PAGE_SIZE := true
+ # Permissions
+ PRODUCT_COPY_FILES += \
+     frameworks/native/data/etc/android.hardware.touchscreen.multitouch.jazzhand.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.touchscreen.multitouch.jazzhand.xml
+ 
++ifneq ($(TARGET_BLUETOOTH_HAL),none)
+ PRODUCT_PACKAGES += \
+     android.hardware.bluetooth.prebuilt.xml \
+-    android.hardware.bluetooth_le.prebuilt.xml \
+-    android.hardware.ethernet.prebuilt.xml \
+-    android.hardware.usb.host.prebuilt.xml \
++    android.hardware.bluetooth_le.prebuilt.xml
++endif
++PRODUCT_PACKAGES += \
++    android.hardware.ethernet.prebuilt.xml \
++    android.hardware.usb.host.prebuilt.xml
++ifeq ($(TARGET_ENABLE_VIRT_WIFI),true)
++PRODUCT_PACKAGES += \
+     android.hardware.wifi.prebuilt.xml \
+     android.hardware.wifi.direct.prebuilt.xml
++endif
+ 
+ ifeq ($(PRODUCT_IS_ATV),true)
+ # nothing
+ else ifeq ($(PRODUCT_IS_AUTOMOTIVE),true)
+@@ -220,13 +226,15 @@ PRODUCT_HOST_PACKAGES += \
+ # Virtualization
+ $(call inherit-product, packages/modules/Virtualization/apex/product_packages.mk)
+ 
++ifeq ($(TARGET_ENABLE_VIRT_WIFI),true)
+ # VirtWifi
+ PRODUCT_PACKAGES += \
+     setup_wifi
+ 
+ # Wi-Fi
+ PRODUCT_PACKAGES += \
+     CuttlefishTetheringOverlay \
+     CuttlefishWifiOverlay
+ 
+ $(call soong_config_set_string_list,mainline_common_apex_wpa_supplicant,include_prebuilts,p2p_supplicant.conf.cf wpa_supplicant.conf.cf wpa_supplicant_overlay.conf.cf)
++endif

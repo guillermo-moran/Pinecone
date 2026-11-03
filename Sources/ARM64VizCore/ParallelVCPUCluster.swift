@@ -2,17 +2,49 @@ import Foundation
 import ARM64VizNative
 
 final class ParallelVCPUClock: @unchecked Sendable {
-    private static let frequency: UInt64 = 24_000_000
+    private let initialTicksPerHostSecond: UInt64
+    private var ticksPerHostSecond: UInt64
     private let lock = NSLock()
     private var clock = AVZNativeCounterClock()
 
-    init() {
-        precondition(avz_native_counter_clock_initialize(&clock, 0, UInt32(Self.frequency)) != 0)
+    init(ticksPerHostSecond: UInt32 = 24_000_000) {
+        precondition(ticksPerHostSecond > 0)
+        self.initialTicksPerHostSecond = UInt64(ticksPerHostSecond)
+        self.ticksPerHostSecond = UInt64(ticksPerHostSecond)
+        precondition(
+            avz_native_counter_clock_initialize(
+                &clock,
+                0,
+                ticksPerHostSecond
+            ) != 0
+        )
     }
 
     func reset() {
         lock.lock()
-        precondition(avz_native_counter_clock_initialize(&clock, 0, UInt32(Self.frequency)) != 0)
+        ticksPerHostSecond = initialTicksPerHostSecond
+        precondition(
+            avz_native_counter_clock_initialize(
+                &clock,
+                0,
+                UInt32(ticksPerHostSecond)
+            ) != 0
+        )
+        lock.unlock()
+    }
+
+    func setTicksPerHostSecond(_ rate: UInt32) {
+        guard rate > 0 else { return }
+        lock.lock()
+        let currentTicks = avz_native_counter_clock_read(&clock)
+        ticksPerHostSecond = UInt64(rate)
+        precondition(
+            avz_native_counter_clock_initialize(
+                &clock,
+                currentTicks,
+                rate
+            ) != 0
+        )
         lock.unlock()
     }
 
@@ -39,18 +71,19 @@ final class ParallelVCPUClock: @unchecked Sendable {
     func nanosecondsUntil(deadlineTicks: UInt64) -> UInt64 {
         lock.lock()
         let current = avz_native_counter_clock_read(&clock)
+        let rate = ticksPerHostSecond
         lock.unlock()
 
         guard deadlineTicks > current else { return 0 }
         let delta = deadlineTicks &- current
-        let wholeSeconds = delta / Self.frequency
-        let remainingTicks = delta % Self.frequency
+        let wholeSeconds = delta / rate
+        let remainingTicks = delta % rate
         let maximumWholeSeconds = UInt64.max / 1_000_000_000
         guard wholeSeconds <= maximumWholeSeconds else { return UInt64.max }
         let wholeNanoseconds = wholeSeconds * 1_000_000_000
         let fractionalNumerator = remainingTicks * 1_000_000_000
-        let fractionalNanoseconds = fractionalNumerator / Self.frequency +
-            (fractionalNumerator % Self.frequency == 0 ? 0 : 1)
+        let fractionalNanoseconds = fractionalNumerator / rate +
+            (fractionalNumerator % rate == 0 ? 0 : 1)
         let result = wholeNanoseconds.addingReportingOverflow(fractionalNanoseconds)
         return result.overflow ? UInt64.max : result.partialValue
     }
@@ -295,7 +328,9 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
     }
 
     public let primary: VirtualMachine
-    private let clock = ParallelVCPUClock()
+    private let clock: ParallelVCPUClock
+    private let initialActiveCounterTicksPerHostSecond: UInt32
+    private var activeCounterTicksPerHostSecond: UInt32
     private let condition = NSCondition()
     private var workers: [SecondaryWorker] = []
     private let stopLock = NSLock()
@@ -324,9 +359,19 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         })
     }
 
-    init(primary: VirtualMachine) {
+    init(
+        primary: VirtualMachine,
+        counterTicksPerHostSecond: UInt32 = 24_000_000,
+        activeCounterTicksPerHostSecond: UInt32 = 24_000_000
+    ) {
         precondition(primary.virtualCPUCount > 1)
         self.primary = primary
+        self.activeCounterTicksPerHostSecond =
+            activeCounterTicksPerHostSecond
+        self.initialActiveCounterTicksPerHostSecond = activeCounterTicksPerHostSecond
+        self.clock = ParallelVCPUClock(
+            ticksPerHostSecond: counterTicksPerHostSecond
+        )
         self.workers = (1..<primary.virtualCPUCount).map { id in
             let backend = SoftwareARM64Backend()
             backend.enableBasicBlockExecution = true
@@ -435,6 +480,22 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         condition.unlock()
     }
 
+    /// Change host-time dilation without changing architectural CNTFRQ or
+    /// jumping the counter. Each vCPU takes the new epoch at its next native
+    /// burst. Wake timer sleepers so they recalculate deadlines at the new rate.
+    public func setCounterTicksPerHostSecond(_ rate: UInt32) {
+        guard rate > 0 else { return }
+        condition.lock()
+        activeCounterTicksPerHostSecond = rate
+        clock.setTicksPerHostSecond(rate)
+        condition.unlock()
+        signal()
+    }
+
+    public var counterTicksPerHostSecond: UInt32 {
+        clock.nativeConfiguration.frequency
+    }
+
     public func configureExecution(
         timerCyclesPerInstruction: UInt64,
         wallClockRunBudgetNanoseconds: UInt64?,
@@ -493,6 +554,16 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         condition.unlock()
     }
 
+    /// Configure before secondary CPUs are started by PSCI.
+    public func setNativeAssemblyExecutorEnabled(_ enabled: Bool) {
+        condition.lock()
+        for worker in workers {
+            (worker.vm.backend as? SoftwareARM64Backend)?
+                .setNativeAssemblyExecutorEnabled(enabled)
+        }
+        condition.unlock()
+    }
+
     public func setNativeDetailedMemoryStatisticsEnabled(_ enabled: Bool) {
         condition.lock()
         for worker in workers {
@@ -524,6 +595,9 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
         guard let worker = workers.first(where: { $0.id == id }) else {
             return false
         }
+        condition.lock()
+        clock.setTicksPerHostSecond(activeCounterTicksPerHostSecond)
+        condition.unlock()
         return worker.activate(
             entryPoint: entryPoint,
             context: context,
@@ -532,7 +606,10 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
     }
 
     private func resetSecondaries() {
+        condition.lock()
+        activeCounterTicksPerHostSecond = initialActiveCounterTicksPerHostSecond
         clock.reset()
+        condition.unlock()
         workers.forEach { $0.reset(counterTicks: 0) }
     }
 }

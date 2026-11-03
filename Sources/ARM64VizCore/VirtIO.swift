@@ -1992,7 +1992,8 @@ public final class VirtualVirtIODevice: MMIODevice {
         inputMaximumX: UInt32 = 639,
         inputMaximumY: UInt32 = 479,
         displayWidth: Int = 480,
-        displayHeight: Int = 800
+        displayHeight: Int = 800,
+        enableVirGL: Bool = false
     ) {
         precondition(length >= 0x200, "virtio-mmio device range must include config space")
         precondition(blockSize > 0)
@@ -2006,7 +2007,11 @@ public final class VirtualVirtIODevice: MMIODevice {
         self.interruptController = interruptController
         self.memory = memory
         self.blockSize = blockSize
-        self.gpu = kind == .gpu ? VirtIOGPUDevice(width: displayWidth, height: displayHeight) : nil
+        // Renderer choice belongs to this VM, not the host process. In
+        // particular, an Android launch flag must not change Alpine's device
+        // features or divert its paravirtual 2D resources through VirGL.
+        self.gpu = kind == .gpu ? VirtIOGPUDevice(width: displayWidth, height: displayHeight,
+            virglRenderer: enableVirGL ? NativeVirGLRenderer.requested() : nil) : nil
 
         if kind == .block {
             let size = blockStorage?.count ?? max(storageSize, blockSize)
@@ -2016,6 +2021,7 @@ public final class VirtualVirtIODevice: MMIODevice {
         } else {
             self.blockStorage = nil
             self.configSpace = Self.configSpace(for: kind, macAddress: macAddress)
+            if let gpu { Self.writeLE32(gpu.virglCapsetCount, into: &self.configSpace, at: 12) }
         }
     }
 
@@ -2197,6 +2203,13 @@ public final class VirtualVirtIODevice: MMIODevice {
         return gpu?.backingSnapshot(memory: memory)
     }
 
+    public func displayResourceDiagnostics(
+        memory: PhysicalMemory
+    ) -> VirtualGPUResourceDiagnosticsSnapshot? {
+        guard kind == .gpu else { return nil }
+        return gpu?.resourceDiagnostics(memory: memory)
+    }
+
     public var displayDiagnostics: String {
         guard kind == .gpu else { return "" }
         return gpu?.diagnosticsSummary() ?? ""
@@ -2369,6 +2382,21 @@ public final class VirtualVirtIODevice: MMIODevice {
         default:
             return
         }
+        }
+    }
+
+    /// Implements the modern VirtIO PCI ISR capability's read-and-clear
+    /// semantics as one device-locked operation.  Performing the status read
+    /// and acknowledgement as separate MMIO operations leaves a window where
+    /// another vCPU can publish a used buffer and have its interrupt erased by
+    /// the stale acknowledgement.  A lost virtio-gpu completion leaves the
+    /// kernel's display fence unsignaled and eventually wedges atomic commits.
+    func consumePCIInterruptStatus() -> UInt32 {
+        withDeviceLock {
+            let consumed = interruptStatus
+            interruptStatus = 0
+            updateInterruptLine()
+            return consumed
         }
     }
 
@@ -3325,7 +3353,7 @@ public final class VirtualVirtIODevice: MMIODevice {
     private func deviceFeatures(for selector: UInt32) -> UInt32 {
         switch selector {
         case 0:
-            return kind.lowFeatureBits
+            return kind.lowFeatureBits | (gpu?.supportsVirGL == true ? 1 : 0)
         case 1:
             return Self.version1FeatureSelectorValue
         default:

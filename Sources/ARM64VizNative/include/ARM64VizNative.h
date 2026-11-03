@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "ARM64VizVirGL.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -128,7 +129,25 @@ enum {
     AVZ_NATIVE_OP_FP_RECIPROCAL_STEP = 103,
     AVZ_NATIVE_OP_SIMD_FP_CONVERT_TO_INTEGER = 104,
     AVZ_NATIVE_OP_SIMD_COUNT_LEADING_ZEROS = 105,
-    AVZ_NATIVE_OP_COUNT = 106
+    AVZ_NATIVE_OP_LSE_ATOMIC = 106,
+    AVZ_NATIVE_OP_SIMD_FP_LOAD_LITERAL = 107,
+    AVZ_NATIVE_OP_SIMD_SATURATING_MULTIPLY_HIGH = 108,
+    AVZ_NATIVE_OP_SIMD_HALVING_ADD_SUBTRACT = 109,
+    AVZ_NATIVE_OP_SIMD_SHA256 = 110,
+    AVZ_NATIVE_OP_COUNT = 111
+};
+
+enum {
+    AVZ_NATIVE_LSE_COMPARE_EXCHANGE = 0,
+    AVZ_NATIVE_LSE_ADD = 1,
+    AVZ_NATIVE_LSE_CLEAR = 2,
+    AVZ_NATIVE_LSE_SWAP = 3,
+    AVZ_NATIVE_LSE_XOR = 4,
+    AVZ_NATIVE_LSE_SET = 5,
+    AVZ_NATIVE_LSE_SIGNED_MAX = 6,
+    AVZ_NATIVE_LSE_SIGNED_MIN = 7,
+    AVZ_NATIVE_LSE_UNSIGNED_MAX = 8,
+    AVZ_NATIVE_LSE_UNSIGNED_MIN = 9
 };
 
 typedef struct {
@@ -1070,6 +1089,15 @@ int avz_native_fast_memory_exclusive_write_pair(
     uint64_t second_value,
     uint64_t expected_generation
 );
+int avz_native_fast_memory_atomic_rmw(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint8_t operation,
+    uint64_t operand,
+    uint64_t replacement,
+    uint64_t *old_value
+);
 int avz_native_fast_memory_read_bytes(
     void *context,
     uint64_t virtual_address,
@@ -1253,6 +1281,41 @@ AVZNativeBlockResult avz_native_run_threaded_decoded_block_full_registers(
 AVZNativeBlockResult avz_native_run_threaded_decoded_block_full_registers_with_exclusive(
     const AVZNativeInstruction *instructions,
     size_t instruction_count,
+    uint64_t base_pc,
+    uint64_t max_steps,
+    uint64_t *x31,
+    uint64_t *v32_low,
+    uint64_t *v32_high,
+    uint64_t *sp,
+    uint64_t *pc,
+    uint64_t *pstate,
+    uint64_t *fpcr,
+    uint64_t *fpsr,
+    uint64_t *exclusive_address,
+    uint64_t *exclusive_generation,
+    uint8_t *exclusive_size,
+    uint8_t *exclusive_valid,
+    uint8_t *halted,
+    AVZNativeMemoryReadCallback read_memory,
+    AVZNativeMemoryWriteCallback write_memory,
+    AVZNativeMemoryCanAccessCallback can_access_memory,
+    AVZNativeMemoryFillCallback fill_memory,
+    AVZNativeSystemRegisterReadCallback read_system_register,
+    AVZNativeSystemRegisterWriteCallback write_system_register,
+    AVZNativeSystemInstructionCallback execute_system_instruction,
+    AVZNativeExceptionReturnCallback exception_return,
+    AVZNativeSynchronousExceptionCallback synchronous_exception,
+    AVZNativeWaitCallback wait,
+    void *memory_context
+);
+
+/* Cached-candidate variant for callers that retain decoded blocks. The
+ * candidate array must contain instruction_count entries. Passing NULL keeps
+ * the legacy on-demand classification behavior. */
+AVZNativeBlockResult avz_native_run_threaded_decoded_block_full_registers_with_exclusive_and_semantic_candidates(
+    const AVZNativeInstruction *instructions,
+    size_t instruction_count,
+    const uint8_t *semantic_candidates,
     uint64_t base_pc,
     uint64_t max_steps,
     uint64_t *x31,

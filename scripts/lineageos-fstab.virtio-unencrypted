@@ -1,0 +1,56 @@
+# EFI
+/dev/block/by-name/EFI /mnt/vendor/EFI vfat rw,discard,shortname=lower,uid=0,gid=0,dmask=007,fmask=117,context=u:object_r:efi_file:s0 nofail
+
+# Misc
+/dev/block/by-name/misc /misc emmc defaults defaults
+
+# Metadata
+/dev/block/by-name/metadata /metadata ext4 nodev,noatime,nosuid,discard,data=journal,commit=1 check,formattable,first_stage_mount,metadata_csum
+
+# Persist
+/dev/block/by-name/persist /mnt/vendor/persist vfat rw,sync,shortname=lower,uid=1000,gid=1000,dmask=007,fmask=117,context=u:object_r:persist_file:s0 formattable
+
+# CD-ROM
+/devices/*/block/sr* auto auto defaults voldmanaged=cdrom:auto
+
+# USB
+/devices/*/usb* auto auto defaults voldmanaged=usb:auto
+
+# ZRAM
+/dev/block/zram0 none swap defaults zramsize=50%
+# Userdata (on separate disk; emulator-only unencrypted profile)
+/dev/block/vdb /data ext4 nodev,noatime,nosuid,discard latemount,check,quota,formattable
+/dev/block/vdb /data f2fs nodev,noatime,nosuid,discard,reserve_root=32768 latemount,check,quota,formattable,fscompress
+
+# SD card (recovery only)
+/dev/block/sda /sdcard vfat ro,defaults recoveryonly
+
+# VirtioFS
+share /mnt/vendor/shared virtiofs nosuid,nodev,noatime nofail
+share /mnt/vendor/shared 9p trans=virtio,version=9p2000.L,nosuid,nodev,noatime nofail
+# Super
+odm /odm ext4 noatime,ro logical,first_stage_mount
+odm /odm erofs noatime,ro logical,first_stage_mount
+product /product ext4 noatime,ro logical,first_stage_mount
+product /product erofs noatime,ro logical,first_stage_mount
+system /system ext4 noatime,ro logical,first_stage_mount
+system /system erofs noatime,ro logical,first_stage_mount
+system_dlkm /system_dlkm ext4 noatime,ro,errors=panic logical,first_stage_mount
+system_dlkm /system_dlkm erofs ro logical,first_stage_mount
+system_ext /system_ext ext4 noatime,ro logical,first_stage_mount
+system_ext /system_ext erofs noatime,ro logical,first_stage_mount
+vendor /vendor ext4 noatime,ro logical,first_stage_mount
+vendor /vendor erofs noatime,ro logical,first_stage_mount
+vendor_dlkm /vendor_dlkm ext4 noatime,ro,errors=panic logical,first_stage_mount
+vendor_dlkm /vendor_dlkm erofs ro logical,first_stage_mount
+
+# Cache
+/dev/block/by-name/cache /cache ext4 nodev,noatime,nosuid,discard check,formattable
+/dev/block/by-name/cache /cache f2fs nodev,noatime,nosuid,discard check,formattable
+
+# Boot
+/dev/block/by-name/boot /boot emmc defaults defaults
+/dev/block/by-name/vendor_boot /vendor_boot emmc defaults defaults
+
+# Recovery
+/dev/block/by-name/recovery /recovery emmc defaults defaults

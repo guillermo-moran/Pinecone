@@ -465,6 +465,32 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
     }
 
+    func testNativeSingleInstructionCLREXClearsReservationWithoutFallback() throws {
+        let backend = SoftwareARM64Backend()
+        backend.enableBasicBlockExecution = false
+        backend.fallbackInterpreterPolicy = .nativeOnly
+        let machine = try MachineFactory.makeResearchMachine(backend: backend)
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        try machine.vm.loadBinary(littleEndianWords([
+            0xd503_3f5f, // clrex
+            0xd440_0000  // hlt #0
+        ]), at: entry)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.cpu.exclusiveReservationAddress = 0x12_340
+        machine.vm.cpu.exclusiveReservationSize = 8
+        machine.vm.cpu.exclusiveReservationGeneration = 99
+
+        let result = try machine.vm.run(maxSteps: 2)
+
+        XCTAssertEqual(result.stopReason, .maxSteps(2))
+        XCTAssertTrue(machine.vm.cpu.halted)
+        XCTAssertNil(machine.vm.cpu.exclusiveReservationAddress)
+        XCTAssertNil(machine.vm.cpu.exclusiveReservationSize)
+        XCTAssertNil(machine.vm.cpu.exclusiveReservationGeneration)
+        XCTAssertEqual(backend.nativeSingleInstructionSteps, 2)
+        XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
+    }
+
     func testMMIOBusRejectsOverlappingDevices() throws {
         let bus = MMIOBus()
         let first = VirtualUART(name: "uart-a", base: 0x1000)
@@ -1307,6 +1333,31 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertTrue(backend.nativeIneligibleGadgetCounts.isEmpty, "\(backend.nativeIneligibleGadgetCounts)")
         XCTAssertGreaterThanOrEqual(backend.nativeBasicBlockExecutions, 1)
         XCTAssertGreaterThanOrEqual(backend.nativeBasicBlockSteps, 2)
+    }
+
+    func testCRC32CInstructionsSupportAndroidInit() throws {
+        let backend = SoftwareARM64Backend()
+        backend.fallbackInterpreterPolicy = .nativeOnly
+        let machine = try MachineFactory.makeResearchMachine(backend: backend)
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        try machine.vm.loadBinary(littleEndianWords([
+            0x9acb_5d49, // crc32cx w9, w10, x11
+            0x1acc_5129, // crc32cb w9, w9, w12
+            0xd440_0000
+        ]), at: entry)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.enableInstructionTrace(capacity: 3)
+        machine.vm.cpu.x[10] = 0xffff_ffff
+        machine.vm.cpu.x[11] = 0x3837_3635_3433_3231 // "12345678"
+        machine.vm.cpu.x[12] = 0x39 // "9"
+
+        let result = try machine.vm.run(maxSteps: 5)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(machine.vm.cpu.x[9], 0x1cf9_6d7c)
+        XCTAssertEqual(machine.vm.instructionTrace[0].decode, "crc32cx")
+        XCTAssertEqual(machine.vm.instructionTrace[1].decode, "crc32cb")
+        XCTAssertTrue(backend.nativeIneligibleGadgetCounts.isEmpty)
     }
 
     func testNativeCorePreservesLinuxPrimaryPlaneMaskSequence() throws {
@@ -2718,6 +2769,176 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(try reopened.read(at: 96 * 1024, count: 32), Array(repeating: 0x5a, count: 32))
     }
 
+#if os(macOS)
+    func testFileBackedVirtIOBlockStorageZeroKeepsLargeImageSparse() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let imageURL = directory.appendingPathComponent("userdata.raw")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let imageSize = 16 * 1024 * 1024
+        let holeOffset = 2 * 1024 * 1024
+        let holeSize = 12 * 1024 * 1024
+        try Data(repeating: 0x5a, count: imageSize).write(to: imageURL)
+        let allocatedBefore = try XCTUnwrap(
+            imageURL.resourceValues(forKeys: [.fileAllocatedSizeKey]).fileAllocatedSize
+        )
+
+        do {
+            let storage = try FileBackedVirtIOBlockStorage(url: imageURL)
+            try storage.zero(at: holeOffset, count: holeSize)
+            try storage.flush()
+            XCTAssertEqual(
+                try storage.read(at: holeOffset, count: holeSize),
+                Array(repeating: 0, count: holeSize)
+            )
+        }
+
+        let uncachedImageURL = URL(fileURLWithPath: imageURL.path)
+        let allocatedAfter = try XCTUnwrap(
+            uncachedImageURL.resourceValues(forKeys: [.fileAllocatedSizeKey]).fileAllocatedSize
+        )
+        XCTAssertEqual(
+            try FileManager.default.attributesOfItem(atPath: imageURL.path)[.size] as? Int,
+            imageSize
+        )
+        XCTAssertLessThan(allocatedAfter, allocatedBefore)
+    }
+#endif
+
+    func testResearchMachinePublishesSecondaryBlockDevice() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let imageURL = directory.appendingPathComponent("userdata.img")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(repeating: 0, count: 64 * 1024).write(to: imageURL)
+
+        let storage = try FileBackedVirtIOBlockStorage(url: imageURL)
+        let machine = try MachineFactory.makeResearchMachine(
+            secondaryBlockStorage: storage
+        )
+
+        let secondary = try XCTUnwrap(machine.virtioSecondaryBlock)
+        XCTAssertEqual(secondary.range.start, ARM64VizMachineLayout.virtioSecondaryBlockBase)
+        XCTAssertEqual(secondary.storageByteCount, storage.count)
+        XCTAssertTrue(machine.vm.bootDevices.contains { descriptor in
+            descriptor.name == "virtio_mmio5"
+                && descriptor.base == ARM64VizMachineLayout.virtioSecondaryBlockBase
+                && descriptor.interrupts == [0, 41, 4]
+        })
+    }
+
+    func testResearchMachinePublishesModernVirtIOPCIEndpoints() throws {
+        let secondaryStorage = InMemoryVirtIOBlockStorage(count: 64 * 1024)
+        let machine = try MachineFactory.makeResearchMachine(
+            secondaryBlockStorage: secondaryStorage,
+            virtioTransport: .pci
+        )
+        let ecam = ARM64VizMachineLayout.pciECAMBase
+
+        XCTAssertNotNil(machine.pciHost)
+        XCTAssertEqual(machine.virtioPCITransports.count, 6)
+        XCTAssertEqual(
+            try machine.vm.readPhysical(ecam + (1 << 15), width: .word),
+            0x1042_1af4
+        )
+        XCTAssertEqual(
+            try machine.vm.readPhysical(ecam + (2 << 15), width: .word),
+            0x1042_1af4
+        )
+        XCTAssertEqual(
+            try machine.vm.readPhysical(ecam + (5 << 15), width: .word),
+            0x1050_1af4
+        )
+        XCTAssertEqual(
+            try machine.vm.readPhysical(ecam + (1 << 15) + 0x34, width: .byte),
+            0x40
+        )
+        XCTAssertEqual(
+            try machine.vm.readPhysical(ecam + (1 << 15) + 0x40, width: .word),
+            0x0110_5009
+        )
+
+        let barRegister = ecam + (1 << 15) + 0x10
+        XCTAssertEqual(
+            try machine.vm.readPhysical(barRegister, width: .word),
+            ARM64VizMachineLayout.pciMMIOBase
+        )
+        try machine.vm.writePhysical(barRegister, width: .word, value: UInt64(UInt32.max))
+        XCTAssertEqual(
+            try machine.vm.readPhysical(barRegister, width: .word),
+            0xffff_c000
+        )
+        try machine.vm.writePhysical(
+            barRegister,
+            width: .word,
+            value: ARM64VizMachineLayout.pciMMIOBase
+        )
+
+        let pciDescriptor = try XCTUnwrap(machine.vm.bootDevices.first {
+            $0.compatible.contains("pci-host-ecam-generic")
+        })
+        XCTAssertEqual(pciDescriptor.base, ARM64VizMachineLayout.pciECAMBase)
+        XCTAssertNotNil(pciDescriptor.properties["interrupt-map"])
+        XCTAssertFalse(machine.vm.bootDevices.contains {
+            $0.compatible.contains("virtio,mmio")
+        })
+    }
+
+    func testVirtIOPCIBlockTransportExecutesDescriptorChain() throws {
+        let machine = try MachineFactory.makeResearchMachine(
+            blockStorageSize: 4096,
+            virtioTransport: .pci
+        )
+        let bar = ARM64VizMachineLayout.pciMMIOBase
+        let descriptorTable: GuestAddress = 0x4010_0000
+        let availableRing: GuestAddress = 0x4010_1000
+        let usedRing: GuestAddress = 0x4010_2000
+        let header: GuestAddress = 0x4010_3000
+        let data: GuestAddress = 0x4010_4000
+        let status: GuestAddress = 0x4010_5000
+        var disk = [UInt8](repeating: 0, count: 4096)
+        for index in 0..<512 {
+            disk[512 + index] = UInt8(index & 0xff)
+        }
+        try machine.virtioBlock.replaceStorage(disk, notifyConfigChange: false)
+
+        try machine.vm.writePhysical(bar + 0x16, width: .halfword, value: 0)
+        XCTAssertEqual(
+            try machine.vm.readPhysical(bar + 0x18, width: .halfword),
+            256
+        )
+        try machine.vm.writePhysical(bar + 0x16, width: .halfword, value: 1)
+        XCTAssertEqual(
+            try machine.vm.readPhysical(bar + 0x18, width: .halfword),
+            0
+        )
+        try machine.vm.writePhysical(bar + 0x16, width: .halfword, value: 0)
+        try machine.vm.writePhysical(bar + 0x18, width: .halfword, value: 8)
+        try machine.vm.writePhysical(bar + 0x20, width: .doubleword, value: descriptorTable)
+        try machine.vm.writePhysical(bar + 0x28, width: .doubleword, value: availableRing)
+        try machine.vm.writePhysical(bar + 0x30, width: .doubleword, value: usedRing)
+        try machine.vm.writePhysical(bar + 0x1c, width: .halfword, value: 1)
+
+        try writeVirtioBlockHeader(machine: machine, at: header, requestType: 0, sector: 1)
+        try writeVirtioDescriptor(machine: machine, at: descriptorTable, index: 0, address: header, length: 16, flags: 1, next: 1)
+        try writeVirtioDescriptor(machine: machine, at: descriptorTable, index: 1, address: data, length: 512, flags: 3, next: 2)
+        try writeVirtioDescriptor(machine: machine, at: descriptorTable, index: 2, address: status, length: 1, flags: 2, next: 0)
+        try machine.vm.memory.write16(1, at: availableRing + 2)
+        try machine.vm.memory.write16(0, at: availableRing + 4)
+        machine.vm.memory.beginConcurrentExecution()
+        try machine.vm.writePhysical(bar + 0x1000, width: .halfword, value: 0)
+
+        XCTAssertEqual(machine.virtioBlock.completedBlockRequests, 1)
+        XCTAssertEqual(try machine.vm.memory.read8(at: status), 0)
+        XCTAssertEqual(try machine.vm.memory.read16(at: usedRing + 2), 1)
+        XCTAssertEqual(try machine.vm.memory.read8(at: data + 255), 255)
+        XCTAssertEqual(try machine.vm.readPhysical(bar + 0x2000, width: .byte), 1)
+        XCTAssertEqual(try machine.vm.readPhysical(bar + 0x2000, width: .byte), 0)
+    }
+
     func testMappedBlockStorageRejectsInvalidRangesAndSkipsEmptyVectorSegments() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -4006,6 +4227,162 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertTrue(String(decoding: result.deviceTreeBlob, as: UTF8.self).contains("virtio,mmio"))
         XCTAssertFalse(result.layout.usedSuppliedDeviceTree)
         XCTAssertTrue(result.layout.bootArguments.contains("root=/dev/vda"))
+    }
+
+    func testAndroidBootImageV4ExtractsKernelRamdiskAndCommandLine() throws {
+        let kernel: [UInt8] = [0xaa, 0xbb, 0xcc]
+        let ramdisk: [UInt8] = [0x11, 0x22, 0x33, 0x44]
+        var bytes = [UInt8](repeating: 0, count: 8192 + ramdisk.count)
+        bytes.replaceSubrange(0..<AndroidBootImage.magic.count, with: AndroidBootImage.magic)
+        putLittleEndian(UInt32(kernel.count), in: &bytes, at: 8)
+        putLittleEndian(UInt32(ramdisk.count), in: &bytes, at: 12)
+        putLittleEndian(1584, in: &bytes, at: 20)
+        putLittleEndian(4, in: &bytes, at: 40)
+        let commandLine = Array("androidboot.hardware=virtio".utf8)
+        bytes.replaceSubrange(44..<(44 + commandLine.count), with: commandLine)
+        bytes.replaceSubrange(4096..<(4096 + kernel.count), with: kernel)
+        bytes.replaceSubrange(8192..<(8192 + ramdisk.count), with: ramdisk)
+
+        let image = try AndroidBootImage(bytes: bytes)
+
+        XCTAssertEqual(image.headerVersion, 4)
+        XCTAssertEqual(image.kernel, kernel)
+        XCTAssertEqual(image.ramdisk, ramdisk)
+        XCTAssertEqual(image.commandLine, "androidboot.hardware=virtio")
+    }
+
+    func testAndroidVendorBootImageV4AssemblesRamdisksAndBootconfigTrailer() throws {
+        let pageSize = 2048
+        let headerSize = 2128
+        let vendorRamdisk: [UInt8] = [0x02, 0x21, 0x4c, 0x18, 0xaa]
+        let bootconfig = Array("androidboot.hardware=virtio\n".utf8)
+        let ramdiskStart = 4096
+        let tableStart = ramdiskStart + pageSize
+        let bootconfigStart = tableStart + pageSize
+        var bytes = [UInt8](repeating: 0, count: bootconfigStart + bootconfig.count)
+        bytes.replaceSubrange(0..<AndroidVendorBootImage.magic.count, with: AndroidVendorBootImage.magic)
+        putLittleEndian(4, in: &bytes, at: 8)
+        putLittleEndian(UInt32(pageSize), in: &bytes, at: 12)
+        putLittleEndian(UInt32(vendorRamdisk.count), in: &bytes, at: 24)
+        let commandLine = Array("binder.impl=rust".utf8)
+        bytes.replaceSubrange(28..<(28 + commandLine.count), with: commandLine)
+        putLittleEndian(UInt32(headerSize), in: &bytes, at: 2096)
+        putLittleEndian(108, in: &bytes, at: 2112)
+        putLittleEndian(1, in: &bytes, at: 2116)
+        putLittleEndian(108, in: &bytes, at: 2120)
+        putLittleEndian(UInt32(bootconfig.count), in: &bytes, at: 2124)
+        bytes.replaceSubrange(ramdiskStart..<(ramdiskStart + vendorRamdisk.count), with: vendorRamdisk)
+        putLittleEndian(UInt32(vendorRamdisk.count), in: &bytes, at: tableStart)
+        bytes.replaceSubrange(bootconfigStart..<(bootconfigStart + bootconfig.count), with: bootconfig)
+
+        let image = try AndroidVendorBootImage(bytes: bytes)
+        let assembled = image.assembledRamdisk(genericRamdisk: [0x1f, 0x8b])
+        let paddedBootconfig = bootconfig + Array(
+            repeating: 0,
+            count: (4 - (bootconfig.count & 3)) & 3
+        )
+        let trailerStart = vendorRamdisk.count + 2 + paddedBootconfig.count
+
+        XCTAssertEqual(image.headerVersion, 4)
+        XCTAssertEqual(image.commandLine, "binder.impl=rust")
+        XCTAssertEqual(Array(assembled.prefix(vendorRamdisk.count)), vendorRamdisk)
+        XCTAssertEqual(Array(assembled[vendorRamdisk.count..<(vendorRamdisk.count + 2)]), [0x1f, 0x8b])
+        XCTAssertEqual(Array(assembled[(vendorRamdisk.count + 2)..<trailerStart]), paddedBootconfig)
+        XCTAssertEqual(readLE32ForTest(assembled, at: trailerStart), UInt32(paddedBootconfig.count))
+        XCTAssertEqual(
+            readLE32ForTest(assembled, at: trailerStart + 4),
+            paddedBootconfig.reduce(UInt32(0)) { $0 + UInt32($1) }
+        )
+        XCTAssertEqual(String(decoding: assembled[(trailerStart + 8)...], as: UTF8.self), "#BOOTCONFIG\n")
+    }
+
+    func testLineageOSProfileStagesAndroidHandoff() throws {
+        let machine = try MachineFactory.makeResearchMachine(
+            memorySize: 32 * 1024 * 1024,
+            virtualCPUCount: LinuxGuestProfile.lineageOS.recommendedVirtualCPUCount
+        )
+        let adapter = LineageOSBootAdapter(
+            artifacts: LinuxBootArtifacts(
+                kernelImage: [UInt8](repeating: 0x5a, count: 4096),
+                initrd: [0x01, 0x02, 0x03]
+            )
+        )
+
+        let result = try adapter.loadWithResult(into: machine.vm)
+
+        XCTAssertEqual(result.configuration.machineName, "arm64viz-lineageos")
+        XCTAssertEqual(result.layout.profile, .lineageOS)
+        XCTAssertTrue(result.layout.bootArguments.contains("androidboot.hardware=virtio"))
+        XCTAssertTrue(result.layout.bootArguments.contains("androidboot.console=ttyAMA0"))
+        XCTAssertEqual(machine.vm.cpu.x[0], result.layout.fdtLoadAddress)
+        let fdtText = String(decoding: result.deviceTreeBlob, as: UTF8.self)
+        XCTAssertTrue(fdtText.contains("android,firmware"))
+        XCTAssertTrue(fdtText.contains("android,fstab"))
+        XCTAssertTrue(fdtText.contains("first_stage_mount"))
+        XCTAssertTrue(fdtText.contains("/dev/block/by-name/metadata"))
+        XCTAssertTrue(fdtText.contains("cpu@0"))
+        XCTAssertTrue(fdtText.contains("cpu@1"))
+        XCTAssertTrue(fdtText.contains("cpu@2"))
+        XCTAssertTrue(fdtText.contains("cpu@3"))
+        XCTAssertTrue(fdtText.contains("enable-method"))
+        XCTAssertTrue(fdtText.contains("psci"))
+    }
+
+    func testLinuxProfilesRecommendInteractiveVCPUTopologies() {
+        XCTAssertEqual(LinuxGuestProfile.generic.recommendedVirtualCPUCount, 2)
+        XCTAssertEqual(LinuxGuestProfile.postmarketOS.recommendedVirtualCPUCount, 2)
+        XCTAssertEqual(LinuxGuestProfile.lineageOS.recommendedVirtualCPUCount, 4)
+        XCTAssertFalse(
+            LinuxGuestProfile.lineageOS.defaultBootArguments
+                .contains("console=tty0")
+        )
+        XCTAssertTrue(
+            LinuxGuestProfile.lineageOS.defaultBootArguments
+                .contains("loglevel=6")
+        )
+        XCTAssertFalse(
+            LinuxGuestProfile.lineageOS.defaultBootArguments
+                .contains(" quiet ")
+        )
+        XCTAssertFalse(
+            LinuxGuestProfile.lineageOS.defaultBootArguments
+                .contains("androidboot.low_perf=1")
+        )
+        XCTAssertEqual(
+            LinuxGuestProfile.lineageOS.recommendedCounterTicksPerHostSecond,
+            1_000_000
+        )
+        XCTAssertEqual(
+            LinuxGuestProfile.lineageOS
+                .recommendedSMPActiveCounterTicksPerHostSecond,
+            6_000_000
+        )
+        XCTAssertEqual(
+            LinuxGuestProfile.generic.recommendedCounterTicksPerHostSecond,
+            24_000_000
+        )
+    }
+
+    func testEmbeddedAndroidArgumentsCannotReenableFramebufferConsole() {
+        let fragments = ["console=ttyAMA0 loglevel=7", "rw console=tty0 bootconfig"]
+        XCTAssertEqual(LinuxGuestProfile.lineageOS.mergedBootArguments(fragments),
+                       "console=ttyAMA0 loglevel=7 rw bootconfig")
+        XCTAssertEqual(LinuxGuestProfile.generic.mergedBootArguments(fragments),
+                       "console=ttyAMA0 loglevel=7 rw console=tty0 bootconfig")
+    }
+
+    func testLineageOSProfileRequiresRamdisk() throws {
+        let machine = try MachineFactory.makeResearchMachine()
+        let adapter = LineageOSBootAdapter(
+            artifacts: LinuxBootArtifacts(kernelImage: [0x00])
+        )
+
+        XCTAssertThrowsError(try adapter.loadWithResult(into: machine.vm)) { error in
+            guard case VMError.unsupportedGuest = error else {
+                XCTFail("expected unsupportedGuest, got \(error)")
+                return
+            }
+        }
     }
 
     func testInstructionTraceRecordsUnsupportedInstruction() throws {
@@ -6054,6 +6431,34 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.vm.instructionTrace[0].decode, "umaxp-vector")
     }
 
+    func testSIMDUnsignedMinPairwiseSupportsAndroidInit() throws {
+        let machine = try MachineFactory.makeResearchMachine()
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        try machine.vm.loadBinary(littleEndianWords([
+            0x6e22_ac20, // uminp v0.16b, v1.16b, v2.16b
+            0xd440_0000
+        ]), at: entry)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.enableInstructionTrace(capacity: 2)
+        machine.vm.cpu.v[1] = ARM64VectorRegister(
+            low: 0x0406_0307_0208_0109,
+            high: 0x0d0c_feff_000b_0a05
+        )
+        machine.vm.cpu.v[2] = ARM64VectorRegister(
+            low: 0x0d0e_0f10_1112_1314,
+            high: 0x0506_0708_090a_0b0c
+        )
+
+        let result = try machine.vm.run(maxSteps: 4)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(machine.vm.cpu.v[0], ARM64VectorRegister(
+            low: 0x0cfe_0005_0403_0201,
+            high: 0x0507_090b_0d0f_1113
+        ))
+        XCTAssertEqual(machine.vm.instructionTrace[0].decode, "uminp-vector")
+    }
+
     func testSIMDScalarPairwiseAddSupportsSettingsPathWithoutFallback() throws {
         let backend = SoftwareARM64Backend()
         backend.fallbackInterpreterPolicy = .nativeOnly
@@ -6163,6 +6568,35 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.vm.cpu.v[3], ARM64VectorRegister(low: 0x7fff_ffff, high: 0xffff_ffff_8000_0000))
         XCTAssertEqual(machine.vm.instructionTrace[0].decode, "sshll-s-to-d")
         XCTAssertEqual(machine.vm.instructionTrace[2].decode, "sshll2-s-to-d")
+    }
+
+    func testSIMDPolynomialMultiplySupportsAndroidCryptoPath() throws {
+        let machine = try MachineFactory.makeResearchMachine()
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        let program = littleEndianWords([
+            0x0e23_e210, // pmull v16.8h, v16.8b, v3.8b (live Android instruction)
+            0x4e25_e083, // pmull2 v3.8h, v4.16b, v5.16b
+            0xd440_0000
+        ])
+
+        try machine.vm.loadBinary(program, at: entry)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.cpu.v[16] = ARM64VectorRegister(low: 0x0807_0605_0403_0201, high: 0)
+        machine.vm.cpu.v[3] = ARM64VectorRegister(low: 0x1110_0f0e_0d0c_0b0a, high: 0)
+        machine.vm.cpu.v[4] = ARM64VectorRegister(low: 0, high: 0x1817_1615_1413_1211)
+        machine.vm.cpu.v[5] = ARM64VectorRegister(low: 0, high: 0x2827_2625_2423_2221)
+
+        let result = try machine.vm.run(maxSteps: 5)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(
+            machine.vm.cpu.v[16],
+            ARM64VectorRegister(low: 0x0034_0014_0016_000a, high: 0x0088_0070_0022_0036)
+        )
+        XCTAssertEqual(
+            machine.vm.cpu.v[3],
+            ARM64VectorRegister(low: 0x02d0_0255_0264_0231, high: 0x03c0_0285_02b4_02e1)
+        )
     }
 
     func testSIMDAddVectorSupportsBusyBoxProcessPath() throws {
@@ -6359,6 +6793,62 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.vm.cpu.v[16], ARM64VectorRegister(low: 0x1122_3344_5566_7788, high: 0))
         XCTAssertEqual(machine.vm.instructionTrace[0].decode, "str-d-unsigned-immediate")
         XCTAssertEqual(machine.vm.instructionTrace[1].decode, "ldr-d-unsigned-immediate")
+    }
+
+    func testNativeSIMDFPScalarLoadDoesNotClobberAliasedBaseRegister() throws {
+        let backend = SoftwareARM64Backend()
+        backend.fallbackInterpreterPolicy = .nativeOnly
+        let machine = try MachineFactory.makeResearchMachine(backend: backend)
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        let dataBase = entry + 0x1000
+        let program = littleEndianWords([
+            0xbd40_2421, // ldr s1, [x1, #0x24]
+            0xd440_0000
+        ])
+
+        try machine.vm.loadBinary(program, at: entry)
+        try machine.vm.memory.write32(0x4e80_0000, at: dataBase + 0x24)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.cpu.x[1] = dataBase
+
+        let result = try machine.vm.run(maxSteps: 3)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(machine.vm.cpu.x[1], dataBase)
+        XCTAssertEqual(machine.vm.cpu.v[1], ARM64VectorRegister(low: 0x4e80_0000, high: 0))
+        XCTAssertGreaterThanOrEqual(
+            backend.nativeBasicBlockSteps + backend.nativeSingleInstructionSteps,
+            2
+        )
+        XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
+    }
+
+    func testNativeSIMDFPLiteralLoadWritesVectorRegisterWithoutClobberingGeneralRegister() throws {
+        let backend = SoftwareARM64Backend()
+        backend.fallbackInterpreterPolicy = .nativeOnly
+        let machine = try MachineFactory.makeResearchMachine(backend: backend)
+        let entry = ARM64VizMachineLayout.toyEntryPoint
+        let sentinel: UInt64 = 0x1234_5678_9abc_def0
+        let program = littleEndianWords([
+            0x1c00_0041, // ldr s1, [pc, #8]
+            0xd440_0000,
+            0x4e80_0000
+        ])
+
+        try machine.vm.loadBinary(program, at: entry)
+        machine.vm.reset(entryPoint: entry)
+        machine.vm.cpu.x[1] = sentinel
+
+        let result = try machine.vm.run(maxSteps: 3)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(machine.vm.cpu.x[1], sentinel)
+        XCTAssertEqual(machine.vm.cpu.v[1], ARM64VectorRegister(low: 0x4e80_0000, high: 0))
+        XCTAssertGreaterThanOrEqual(
+            backend.nativeBasicBlockSteps + backend.nativeSingleInstructionSteps,
+            2
+        )
+        XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
     }
 
     func testSIMDMoveInvertedImmediateSupportsBusyBoxVectorFill() throws {
@@ -7448,6 +7938,63 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
     }
 
+    func testNativeDataAbortAfterRetiredPrefixKeepsFaultingStorePC() throws {
+        let backend = SoftwareARM64Backend()
+        backend.fallbackInterpreterPolicy = .nativeOnly
+        let machine = try MachineFactory.makeResearchMachine(backend: backend)
+        let table0 = ARM64VizMachineLayout.ramBase + 0x1000
+        let table1 = ARM64VizMachineLayout.ramBase + 0x2000
+        let table2 = ARM64VizMachineLayout.ramBase + 0x3000
+        let table3 = ARM64VizMachineLayout.ramBase + 0x4000
+        let codeVirtual: GuestAddress = 0x1000
+        let dataVirtual: GuestAddress = 0x4e80_0000
+        let vectorBase: GuestAddress = 0x3000
+        let codePhysical = ARM64VizMachineLayout.toyEntryPoint
+        let vectorPhysical = codePhysical + 0x1000
+        let program = littleEndianWords([
+            0xaa00_03f7, // mov x23, x0
+            0xb900_2026, // str w6, [x1, #0x20]
+            0xaa05_03f8, // mov x24, x5
+            0xd440_0000
+        ])
+        let vector = littleEndianWords([
+            encodeMRS(rt: 3, key: ARM64SystemRegister.esrEL1),
+            encodeMRS(rt: 4, key: ARM64SystemRegister.farEL1),
+            encodeMRS(rt: 5, key: ARM64SystemRegister.elrEL1),
+            0xd440_0000
+        ])
+
+        try machine.vm.memory.write64(table1 | 0x3, at: table0)
+        try machine.vm.memory.write64(table2 | 0x3, at: table1)
+        try machine.vm.memory.write64(table3 | 0x3, at: table2)
+        try machine.vm.memory.write64(codePhysical | 0x403, at: table3 + 8)
+        try machine.vm.memory.write64(vectorPhysical | 0x403, at: table3 + 24)
+        try machine.vm.loadBinary(program, at: codePhysical)
+        try machine.vm.loadBinary(vector, at: vectorPhysical + 0x200)
+        machine.vm.reset(entryPoint: codeVirtual)
+        machine.vm.cpu.pstate = ARM64PState.el1hMasked
+        machine.vm.cpu.x[1] = dataVirtual
+        machine.vm.cpu.x[6] = 0x7fff_ffff
+        try writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0, into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.tcrEL1, value: 16, into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.vbarEL1, value: vectorBase, into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1, into: machine.vm)
+
+        let result = try machine.vm.run(maxSteps: 8)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(machine.vm.cpu.x[4], dataVirtual + 0x20)
+        XCTAssertEqual(machine.vm.cpu.x[5], codeVirtual + 4)
+        XCTAssertEqual(result.lastException?.returnAddress, codeVirtual + 4)
+        XCTAssertEqual(result.lastException?.faultAddress, dataVirtual + 0x20)
+        XCTAssertEqual(result.lastException?.access, .dataWrite)
+        XCTAssertGreaterThanOrEqual(
+            backend.nativeBasicBlockSteps + backend.nativeSingleInstructionSteps,
+            2
+        )
+        XCTAssertEqual(backend.swiftFallbackSingleInstructionSteps, 0)
+    }
+
     func testInstructionAbortVectorSelfLoopStopsWithTelemetry() throws {
         let machine = try MachineFactory.makeResearchMachine()
         machine.vm.reset(entryPoint: 0x1000)
@@ -7660,6 +8207,61 @@ final class ARM64VizCoreTests: XCTestCase {
         XCTAssertEqual(machine.vm.cpu.pc, codeVirtual + 4)
     }
 
+    func testMMUTopByteIgnoreUsesTTBR0ForTaggedUserAddress() throws {
+        let machine = try MachineFactory.makeResearchMachine()
+        let table0 = ARM64VizMachineLayout.ramBase + 0x5000
+        let table1 = ARM64VizMachineLayout.ramBase + 0x6000
+        let table2 = ARM64VizMachineLayout.ramBase + 0x7000
+        let table3 = ARM64VizMachineLayout.ramBase + 0x8000
+        let taggedVirtual: GuestAddress = 0xb400_0000_0000_1000
+        let physical = ARM64VizMachineLayout.toyEntryPoint
+
+        try machine.vm.memory.write64(table1 | 0x3, at: table0)
+        try machine.vm.memory.write64(table2 | 0x3, at: table1)
+        try machine.vm.memory.write64(table3 | 0x3, at: table2)
+        try machine.vm.memory.write64(physical | 0x403, at: table3 + 8)
+        try writeSystemRegister(ARM64SystemRegister.ttbr0EL1, value: table0, into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.ttbr1EL1, value: table3, into: machine.vm)
+        try writeSystemRegister(
+            ARM64SystemRegister.tcrEL1,
+            value: 16 | (UInt64(1) << 37),
+            into: machine.vm
+        )
+        try writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1, into: machine.vm)
+
+        XCTAssertEqual(
+            try ARM64Stage1Translator.translate(
+                virtualAddress: taggedVirtual,
+                access: .dataRead,
+                vm: machine.vm
+            ),
+            physical
+        )
+    }
+
+    func testMMUStartsAtLevelOneFor39BitTTBR1AddressSpace() throws {
+        let machine = try MachineFactory.makeResearchMachine()
+        let level1 = ARM64VizMachineLayout.ramBase + 0x5000
+        let level2 = ARM64VizMachineLayout.ramBase + 0x6000
+        let level3 = ARM64VizMachineLayout.ramBase + 0x7000
+        let codeVirtual: GuestAddress = 0xffff_ffc0_0000_1000
+        let codePhysical = ARM64VizMachineLayout.toyEntryPoint
+
+        try machine.vm.memory.write64(level2 | 0x3, at: level1 + 0x100 * 8)
+        try machine.vm.memory.write64(level3 | 0x3, at: level2)
+        try machine.vm.memory.write64(codePhysical | 0x403, at: level3 + 8)
+        try machine.vm.loadBinary(littleEndianWords([0xd440_0000]), at: codePhysical)
+        machine.vm.reset(entryPoint: codeVirtual)
+        try writeSystemRegister(ARM64SystemRegister.ttbr1EL1, value: level1, into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.tcrEL1, value: UInt64(25 << 16), into: machine.vm)
+        try writeSystemRegister(ARM64SystemRegister.sctlrEL1, value: 1, into: machine.vm)
+
+        let result = try machine.vm.run(maxSteps: 4)
+
+        XCTAssertEqual(result.stopReason, .halted)
+        XCTAssertEqual(machine.vm.cpu.pc, codeVirtual + 4)
+    }
+
     func testSnapshotRestoresCPUAndUARTOutput() throws {
         let machine = try MachineFactory.makeResearchMachine()
         _ = try ToyUARTGuestAdapter(message: "snap\n").load(into: machine.vm)
@@ -7776,6 +8378,23 @@ final class ARM64VizCoreTests: XCTestCase {
         let artifact = BootArtifactDescriptor(name: "example.ipsw", byteCount: 123)
 
         XCTAssertEqual(artifact.kind, .restrictedPackage)
+    }
+
+    func testBootArtifactClassifierRecognizesAndroidBootPartitions() {
+        XCTAssertEqual(BootArtifactClassifier.classify(name: "boot.img"), .androidBootImage)
+        XCTAssertEqual(BootArtifactClassifier.classify(name: "init_boot.img"), .androidInitBootImage)
+        XCTAssertEqual(BootArtifactClassifier.classify(name: "vendor_boot.img"), .androidVendorBootImage)
+    }
+
+    func testBootAdapterRegistryPlansLineageOSPackedBootImage() {
+        let plans = BootAdapterRegistry.plans(for: [
+            BootArtifactDescriptor(name: "boot.img", byteCount: 64 * 1024 * 1024)
+        ])
+        let lineagePlan = plans.first { $0.adapter.identifier == "lineageos" }
+
+        XCTAssertEqual(lineagePlan?.matchesArtifacts, true)
+        XCTAssertEqual(lineagePlan?.canLaunchNow, false)
+        XCTAssertEqual(lineagePlan?.adapter.useCase, .lineageOS)
     }
 
     func testBootAdapterRegistryPlansLinuxDirectBoot() {
@@ -8134,6 +8753,13 @@ final class ARM64VizCoreTests: XCTestCase {
         bytes.append(UInt8((value >> 16) & 0xff))
         bytes.append(UInt8((value >> 8) & 0xff))
         bytes.append(UInt8(value & 0xff))
+    }
+
+    private func putLittleEndian(_ value: UInt32, in bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8(value & 0xff)
+        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
+        bytes[offset + 2] = UInt8((value >> 16) & 0xff)
+        bytes[offset + 3] = UInt8((value >> 24) & 0xff)
     }
 
     private final class FakeOutboundTCPConnection: VirtIOOutboundTCPConnection {

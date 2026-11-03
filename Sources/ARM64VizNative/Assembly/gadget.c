@@ -8,6 +8,11 @@
 DECLARE(outside); DECLARE(unsupported); DECLARE(nop); DECLARE(move); DECLARE(movk);
 DECLARE(branch); DECLARE(link); DECLARE(bcond); DECLARE(zero); DECLARE(nonzero);
 DECLARE(indirect); DECLARE(indirect_link);
+DECLARE(cmpbranch32); DECLARE(cmpbranch64);
+#define SUBBRANCH(prefix) DECLARE(subbranch##prefix##32); DECLARE(subbranch##prefix##64)
+SUBBRANCH(imm); SUBBRANCH(reg); SUBBRANCH(lsl); SUBBRANCH(lsr); SUBBRANCH(asr);
+#define CMPBRANCH(prefix) DECLARE(cmpbranch##prefix##32); DECLARE(cmpbranch##prefix##64)
+CMPBRANCH(reg); CMPBRANCH(lsl); CMPBRANCH(lsr); CMPBRANCH(asr);
 #define CONDITIONAL(bits) \
     DECLARE(csel##bits); DECLARE(csinc##bits); DECLARE(csinv##bits); DECLARE(csneg##bits); \
     DECLARE(ccmpreg##bits); DECLARE(ccmnreg##bits); DECLARE(ccmpimm##bits); DECLARE(ccmnimm##bits)
@@ -46,6 +51,8 @@ static uint16_t reg_offset(unsigned reg, int sp) {
     return reg == 31 ? (sp ? (uint16_t)offsetof(AVZNativeCPU, sp) : UINT16_MAX) :
         (uint16_t)(offsetof(AVZNativeCPU, x) + reg * sizeof(uint64_t));
 }
+#include "fp_moves.h"
+#include "simd_logic.h"
 static const AGOperation *lookup(const AGProgram *p, uint64_t pc) {
     uint64_t delta = pc - p->targets.base;
     return pc < p->targets.base || (delta & 3) || delta / 4 >= p->targets.count ?
@@ -79,6 +86,11 @@ AGProgram *ag_create(const uint32_t *words, size_t count, uint64_t base) {
         op->source = reg_offset(d.rn, 0); op->destination = reg_offset(d.rd, 0);
         op->immediate = (uint64_t)d.immediate;
         switch (d.kind) {
+        case AVZ_NATIVE_OP_FP_SCALAR_GENERAL_MOVE:
+        case AVZ_NATIVE_OP_FP_SCALAR_REGISTER_MOVE:
+        case AVZ_NATIVE_OP_FP_SCALAR_IMMEDIATE_MOVE:
+            ag_prepare_fp_move(op, &d);
+            break;
         case AVZ_NATIVE_OP_LOAD_STORE_PAIR: {
             p->capability = 2;
             static const AGHandler handlers[2][5] = {
@@ -152,6 +164,10 @@ AGProgram *ag_create(const uint32_t *words, size_t count, uint64_t base) {
             op->handler = handler;
             break;
         }
+        case AVZ_NATIVE_OP_SIMD_ORR_VECTOR:
+        case AVZ_NATIVE_OP_SIMD_BITWISE_NOT:
+            ag_prepare_simd_logic(op, &d);
+            break;
         case AVZ_NATIVE_OP_NOP:
             if (d.raw == UINT32_C(0xd503201f)) op->handler = ag_nop;
             break;
@@ -263,6 +279,37 @@ AGProgram *ag_create(const uint32_t *words, size_t count, uint64_t base) {
     for (size_t i = 0; i < count; i++) {
         if (p->operations[i].handler == ag_unsupported) { p->capability = 0; break; }
     }
+    /* Keep the branch operation addressable: a guest can enter it directly,
+     * and a budget boundary can stop between the compare and branch. The
+     * fused handler only replaces the intervening indirect dispatch. */
+#if !defined(AG_COMPARE_BRANCH_FUSION) || AG_COMPARE_BRANCH_FUSION
+    for (size_t i = 0; i + 1 < count; i++) {
+        AGOperation *op = &p->operations[i];
+        if (p->operations[i + 1].handler != ag_bcond) continue;
+        if (op->destination == UINT16_MAX && op->handler == ag_imm32_subs)
+            op->handler = ag_cmpbranch32;
+        else if (op->destination == UINT16_MAX && op->handler == ag_imm64_subs)
+            op->handler = ag_cmpbranch64;
+        else {
+#define FUSE_SUB(prefix, bits) \
+            if (op->handler == ag_##prefix##bits##_subs) \
+                op->handler = ag_subbranch##prefix##bits
+#define FUSE_REGISTER(prefix, bits) \
+            if (op->handler == ag_##prefix##bits##_subs) \
+                op->handler = op->destination == UINT16_MAX ? \
+                    ag_cmpbranch##prefix##bits : ag_subbranch##prefix##bits
+#define FUSE_WIDTHS(prefix) FUSE_SUB(prefix, 32); else FUSE_SUB(prefix, 64)
+            FUSE_WIDTHS(imm);
+#undef FUSE_WIDTHS
+#define FUSE_WIDTHS(prefix) FUSE_REGISTER(prefix, 32); else FUSE_REGISTER(prefix, 64)
+            else FUSE_WIDTHS(reg); else FUSE_WIDTHS(lsl);
+            else FUSE_WIDTHS(lsr); else FUSE_WIDTHS(asr);
+#undef FUSE_WIDTHS
+#undef FUSE_REGISTER
+#undef FUSE_SUB
+        }
+    }
+#endif
     return p;
 }
 void ag_destroy(AGProgram *p) {

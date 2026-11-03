@@ -21,7 +21,7 @@ for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype A
         -c "$native/$source.c" -o "$work/$name.o"
 done
 clang -arch arm64 -g -c "$native/Assembly/gadget_arm64.S" -o "$work/assembly.o"
-for fixture in threaded-runtime-regression threaded-memory-continuation-regression; do
+for fixture in threaded-runtime-regression threaded-memory-continuation-regression assembly-fusion-regression assembly-fp-moves-regression assembly-simd-logic-regression; do
     clang -std=c11 $flags -DAVZ_TEST_ASSEMBLY=1 -DAG_ENABLE=1 \
         -DAVZ_ASSEMBLY_EXECUTOR_ENABLE=1 -DAVZ_THREADED_PROTOTYPE_ENABLE=1 \
         -I "$native/include" "$root/scripts/$fixture.c" "$work"/*.o \

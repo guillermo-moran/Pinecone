@@ -1,0 +1,967 @@
+Analysis of sampling arm64viz (pid 76617) every 1 millisecond
+Process:         arm64viz [76617]
+Path:            /Users/USER/Documents/*/arm64viz
+Load Address:    0x104ac8000
+Identifier:      arm64viz
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  codex [25684]
+Target Type:     live task
+
+Date/Time:       2026-11-01 18:29:55.143 -0600
+Launch Time:     2026-11-01 18:29:02.977 -0600
+OS Version:      macOS 26.5.1 (25F80)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         359.1M
+Physical footprint (peak):  599.5M
+Idle exit:                  untracked
+----
+
+Call graph:
+    2369 Thread_105577822   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 2369 start  (in dyld) + 6992  [0x18e6a3e00]
+    +   2369 arm64viz_main  (in arm64viz) + 12  [0x104c49224]  ARM64VizCommand.swift:0
+    +     2369 static ARM64VizCommand.main()  (in arm64viz) + 48  [0x104c38464]  ARM64VizCommand.swift:9
+    +       2369 static ARM64VizCommand.run(arguments:)  (in arm64viz) + 752  [0x104c38850]  ARM64VizCommand.swift:30
+    +         1196 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 7772  [0x104c3ac48]  ARM64VizCommand.swift:396
+    +         ! 1196 VirtualMachine.run(maxSteps:)  (in arm64viz) + 84  [0x104bc3f24]  VirtualMachine.swift:594
+    +         !   1194 VirtualMachine.runExternallyManagedVirtualCPU(maxSteps:)  (in arm64viz) + 560  [0x104bca034]  VirtualMachine.swift:774
+    +         !   : 1194 protocol witness for VirtualMachineBackend.run(vm:maxSteps:) in conformance SoftwareARM64Backend  (in arm64viz) + 28  [0x104b0ec14]  /<compiler-generated>:0
+    +         !   :   1181 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 1140  [0x104afe108]  EmulatorBackend.swift:548
+    +         !   :   | 1178 SoftwareARM64Backend.executeNativeBasicBlockBurst(_:maxSteps:)  (in arm64viz) + 860  [0x104afef00]  EmulatorBackend.swift:2887
+    +         !   :   | + 1173 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 2864  [0x104b07f30]  EmulatorBackend.swift:3113
+    +         !   :   | + ! 1173 avz_native_execution_context_run_cached_chain_checkpointed_fast_memory  (in arm64viz) + 112  [0x104c1020c]  ARM64VizNative.c:16597
+    +         !   :   | + !   1140 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 6864  [0x104c0f2b4]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 1117 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 32616  [0x104c0c220]  ARM64VizNative.c:0
+    +         !   :   | + !   : | 1117 avz_native_fast_memory_write  (in arm64viz) + 1960  [0x104bf7658]  ARM64VizGuestMemory.c:4226
+    +         !   :   | + !   : |   1116 closure #1 in variable initialization expression of SoftwareARM64Backend.nativeWritePhysicalMemory  (in arm64viz) + 128  [0x104b0a01c]  EmulatorBackend.swift:3860
+    +         !   :   | + !   : |   + 1111 VirtualMachine.writePhysical(_:width:value:)  (in arm64viz) + 1500  [0x104bc1bc0]  VirtualMachine.swift:1843
+    +         !   :   | + !   : |   + ! 1111 StringProtocol.contains<A>(_:)  (in Foundation) + 56  [0x190cbff20]
+    +         !   :   | + !   : |   + !   1111 StringProtocol.range<A>(of:options:range:locale:)  (in Foundation) + 2092  [0x190cbf41c]
+    +         !   :   | + !   : |   + !     1111 specialized _StringCompareOptionsIterable._range<A>(of:toHalfWidth:diacriticsInsensitive:caseFold:anchored:backwards:)  (in Foundation) + 136  [0x190cc25cc]
+    +         !   :   | + !   : |   + !       249 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 496  [0x1909e2adc]
+    +         !   :   | + !   : |   + !       : 116 Substring.subscript.getter  (in libswiftCore.dylib) + 44,156,...  [0x1a246bef0,0x1a246bf60,...]
+    +         !   :   | + !   : |   + !       : 56 Substring.subscript.getter  (in libswiftCore.dylib) + 388  [0x1a246c048]
+    +         !   :   | + !   : |   + !       : | 56 specialized static String._uncheckedFromUTF8(_:isASCII:)  (in libswiftCore.dylib) + 28,20,...  [0x1a256ffc4,0x1a256ffbc,...]
+    +         !   :   | + !   : |   + !       : 51 Substring.subscript.getter  (in libswiftCore.dylib) + 244  [0x1a246bfb8]
+    +         !   :   | + !   : |   + !       : | 51 _allASCII(_:)  (in libswiftCore.dylib) + 0,132,...  [0x1a24478b0,0x1a2447934,...]
+    +         !   :   | + !   : |   + !       : 26 DYLD-STUB$$Substring.subscript.getter  (in Foundation) + 8  [0x190efa2fc]
+    +         !   :   | + !   : |   + !       246 Substring.subscript.getter  (in libswiftCore.dylib) + 396  [0x1a246c050]
+    +         !   :   | + !   : |   + !       227 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 524  [0x1909e2af8]
+    +         !   :   | + !   : |   + !       : 124 Substring.subscript.getter  (in libswiftCore.dylib) + 44,504,...  [0x1a246bef0,0x1a246c0bc,...]
+    +         !   :   | + !   : |   + !       : 48 Substring.subscript.getter  (in libswiftCore.dylib) + 244  [0x1a246bfb8]
+    +         !   :   | + !   : |   + !       : | 48 _allASCII(_:)  (in libswiftCore.dylib) + 96,0,...  [0x1a2447910,0x1a24478b0,...]
+    +         !   :   | + !   : |   + !       : 46 Substring.subscript.getter  (in libswiftCore.dylib) + 388  [0x1a246c048]
+    +         !   :   | + !   : |   + !       : | 46 specialized static String._uncheckedFromUTF8(_:isASCII:)  (in libswiftCore.dylib) + 28,288,...  [0x1a256ffc4,0x1a25700c8,...]
+    +         !   :   | + !   : |   + !       : 9 DYLD-STUB$$Substring.subscript.getter  (in Foundation) + 8  [0x190efa2fc]
+    +         !   :   | + !   : |   + !       179 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 776  [0x1909e2bf4]
+    +         !   :   | + !   : |   + !       : 158 Substring.index(_:offsetBy:)  (in libswiftCore.dylib) + 64,296,...  [0x1a246af54,0x1a246b03c,...]
+    +         !   :   | + !   : |   + !       : 12 DYLD-STUB$$Substring.index(_:offsetBy:)  (in Foundation) + 8  [0x190efa25c]
+    +         !   :   | + !   : |   + !       : 9 Substring.index(_:offsetBy:)  (in libswiftCore.dylib) + 580  [0x1a246b158]
+    +         !   :   | + !   : |   + !       :   9 _StringGuts._opaqueComplexCharacterStride(startingAt:)  (in libswiftCore.dylib) + 140  [0x1a248edd8]
+    +         !   :   | + !   : |   + !       :     9 _GraphemeBreakingState.shouldBreak(between:and:)  (in libswiftCore.dylib) + 76  [0x1a243bb24]
+    +         !   :   | + !   : |   + !       :       9 hasBreakWhenPaired #1 (_:) in _quickHasGraphemeBreakBetween(_:_:)  (in libswiftCore.dylib) + 36,40,...  [0x1a248e924,0x1a248e928,...]
+    +         !   :   | + !   : |   + !       80 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 588  [0x1909e2b38]
+    +         !   :   | + !   : |   + !       : 63 _stringCompareWithSmolCheck(_:_:expecting:)  (in libswiftCore.dylib) + 84,0,...  [0x1a212b06c,0x1a212b018,...]
+    +         !   :   | + !   : |   + !       : 17 DYLD-STUB$$_stringCompareWithSmolCheck(_:_:expecting:)  (in Foundation) + 8  [0x190efb2fc]
+    +         !   :   | + !   : |   + !       52 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 724,740,...  [0x1909e2bc0,0x1909e2bd0,...]
+    +         !   :   | + !   : |   + !       28 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 608  [0x1909e2b4c]
+    +         !   :   | + !   : |   + !       : 15 swift_bridgeObjectRelease  (in libswiftCore.dylib) + 4,0  [0x1a2127e68,0x1a2127e64]
+    +         !   :   | + !   : |   + !       : 13 DYLD-STUB$$swift_bridgeObjectRelease  (in Foundation) + 8  [0x190f0160c]
+    +         !   :   | + !   : |   + !       25 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 600  [0x1909e2b44]
+    +         !   :   | + !   : |   + !       : 13 swift_bridgeObjectRelease  (in libswiftCore.dylib) + 4,0  [0x1a2127e68,0x1a2127e64]
+    +         !   :   | + !   : |   + !       : 12 DYLD-STUB$$swift_bridgeObjectRelease  (in Foundation) + 8  [0x190f0160c]
+    +         !   :   | + !   : |   + !       11 Substring.index(_:offsetBy:)  (in libswiftCore.dylib) + 896  [0x1a246b294]
+    +         !   :   | + !   : |   + !       5 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 336  [0x1909e2a3c]
+    +         !   :   | + !   : |   + !       : 3 Substring._uncheckedIndex(before:)  (in libswiftCore.dylib) + 76  [0x1a246aec0]
+    +         !   :   | + !   : |   + !       : | 2 _StringGuts._opaqueCharacterStride(endingAt:in:)  (in libswiftCore.dylib) + 1916  [0x1a2472ce8]
+    +         !   :   | + !   : |   + !       : | + 2 hasBreakWhenPaired #1 (_:) in _quickHasGraphemeBreakBetween(_:_:)  (in libswiftCore.dylib) + 60,120  [0x1a248e93c,0x1a248e978]
+    +         !   :   | + !   : |   + !       : | 1 _StringGuts._opaqueCharacterStride(endingAt:in:)  (in libswiftCore.dylib) + 1928  [0x1a2472cf4]
+    +         !   :   | + !   : |   + !       : |   1 hasBreakWhenPaired #1 (_:) in _quickHasGraphemeBreakBetween(_:_:)  (in libswiftCore.dylib) + 80  [0x1a248e950]
+    +         !   :   | + !   : |   + !       : 1 Substring._uncheckedIndex(before:)  (in libswiftCore.dylib) + 40  [0x1a246ae9c]
+    +         !   :   | + !   : |   + !       : 1 Substring.index(before:)  (in libswiftCore.dylib) + 44  [0x1a246adec]
+    +         !   :   | + !   : |   + !       :   1 _StringGuts.validateInclusiveCharacterIndex(_:in:)  (in libswiftCore.dylib) + 48  [0x1a245a3ec]
+    +         !   :   | + !   : |   + !       4 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 644  [0x1909e2b70]
+    +         !   :   | + !   : |   + !       : 2 Substring.index(after:)  (in libswiftCore.dylib) + 48  [0x1a246abb8]
+    +         !   :   | + !   : |   + !       : | 2 _StringGuts.validateCharacterIndex(_:in:)  (in libswiftCore.dylib) + 48  [0x1a245ae34]
+    +         !   :   | + !   : |   + !       : 1 Substring.index(after:)  (in libswiftCore.dylib) + 204  [0x1a246ac54]
+    +         !   :   | + !   : |   + !       : 1 _StringGuts.validateCharacterIndex(_:in:)  (in libswiftCore.dylib) + 292  [0x1a245af28]
+    +         !   :   | + !   : |   + !       4 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 672  [0x1909e2b8c]
+    +         !   :   | + !   : |   + !       : 2 Substring.index(after:)  (in libswiftCore.dylib) + 224,380  [0x1a246ac68,0x1a246ad04]
+    +         !   :   | + !   : |   + !       : 1 DYLD-STUB$$Substring.index(after:)  (in Foundation) + 8  [0x190efa22c]
+    +         !   :   | + !   : |   + !       : 1 Substring.index(after:)  (in libswiftCore.dylib) + 48  [0x1a246abb8]
+    +         !   :   | + !   : |   + !       :   1 _StringGuts.validateCharacterIndex(_:in:)  (in libswiftCore.dylib) + 52  [0x1a245ae38]
+    +         !   :   | + !   : |   + !       1 specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation) + 556  [0x1909e2b18]
+    +         !   :   | + !   : |   + !         1 swift_bridgeObjectRelease  (in libswiftCore.dylib) + 4  [0x1a2127e68]
+    +         !   :   | + !   : |   + 3 VirtualMachine.writePhysical(_:width:value:)  (in arm64viz) + 1424  [0x104bc1b74]  VirtualMachine.swift:1843
+    +         !   :   | + !   : |   + ! 2 static String._fromUTF8Repairing(_:)  (in libswiftCore.dylib) + 32  [0x1a22eca78]
+    +         !   :   | + !   : |   + ! : 2 validateUTF8(_:)  (in libswiftCore.dylib) + 36  [0x1a2441eb8]
+    +         !   :   | + !   : |   + ! :   2 _allASCII(_:)  (in libswiftCore.dylib) + 40  [0x1a24478d8]
+    +         !   :   | + !   : |   + ! 1 static String._fromUTF8Repairing(_:)  (in libswiftCore.dylib) + 56  [0x1a22eca90]
+    +         !   :   | + !   : |   + !   1 specialized static String._uncheckedFromUTF8(_:isASCII:)  (in libswiftCore.dylib) + 92  [0x1a2570004]
+    +         !   :   | + !   : |   + !     1 specialized static __StringStorage.create(initializingFrom:codeUnitCapacity:isASCII:)  (in libswiftCore.dylib) + 100  [0x1a256fd34]
+    +         !   :   | + !   : |   + !       1 _platform_memmove  (in libsystem_platform.dylib) + 180  [0x18ea6b414]
+    +         !   :   | + !   : |   + 1 VirtualMachine.writePhysical(_:width:value:)  (in arm64viz) + 176  [0x104bc1694]  VirtualMachine.swift:1822
+    +         !   :   | + !   : |   + ! 1 MMIOBus.device(containing:width:)  (in arm64viz) + 272  [0x104b4a81c]  MMIO.swift:68
+    +         !   :   | + !   : |   + !   1 -[NSRecursiveLock unlock]  (in Foundation) + 48  [0x190318c2c]
+    +         !   :   | + !   : |   + !     1 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 176  [0x18ea5cb68]
+    +         !   :   | + !   : |   + 1 VirtualMachine.writePhysical(_:width:value:)  (in arm64viz) + 256  [0x104bc16e4]  VirtualMachine.swift:1826
+    +         !   :   | + !   : |   +   1 MMIOBus.write(address:width:value:targetVCPU:)  (in arm64viz) + 364  [0x104b4aff4]  MMIO.swift:108
+    +         !   :   | + !   : |   +     1 protocol witness for MMIODevice.write(offset:width:value:) in conformance VirtualUART  (in arm64viz) + 56  [0x104af658c]  /<compiler-generated>:775
+    +         !   :   | + !   : |   +       1 objc_msgSend  (in libobjc.A.dylib) + 0  [0x18e605800]
+    +         !   :   | + !   : |   1 closure #1 in variable initialization expression of SoftwareARM64Backend.nativeWritePhysicalMemory  (in arm64viz) + 136  [0x104b0a024]  /<compiler-generated>:0
+    +         !   :   | + !   : |     1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 240  [0x1a218eb2c]
+    +         !   :   | + !   : 8 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 1120,928,...  [0x104c04718,0x104c04658,...]  ARM64VizNative.c:0
+    +         !   :   | + !   : 2 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 16796,16812  [0x104c08454,0x104c08464]  ARM64VizNative.c:12462
+    +         !   :   | + !   : 2 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 32228,32332  [0x104c0c09c,0x104c0c104]  ARM64VizNative.c:13532
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 32356  [0x104c0c11c]  ARM64VizNative.c:0
+    +         !   :   | + !   : | 1 avz_native_fast_memory_read  (in arm64viz) + 1560  [0x104bf6d88]  ARM64VizGuestMemory.c:4172
+    +         !   :   | + !   : |   1 closure #1 in variable initialization expression of SoftwareARM64Backend.nativeReadPhysicalMemory  (in arm64viz) + 128  [0x104b09edc]  EmulatorBackend.swift:3833
+    +         !   :   | + !   : |     1 VirtualMachine.readPhysical(_:width:)  (in arm64viz) + 440  [0x104bc0a80]  VirtualMachine.swift:1796
+    +         !   :   | + !   : |       1 ???  (in arm64viz)  load address 0x104ac8000 + 0x2d65c  [0x104af565c]
+    +         !   :   | + !   : |         1 swift_bridgeObjectRetain  (in libswiftCore.dylib) + 0  [0x1a2127358]
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 1116  [0x104c04714]  ARM64VizNative.c:12143
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 16792  [0x104c08450]  ARM64VizNative.c:12457
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 19460  [0x104c08ebc]  ARM64VizNative.c:12576
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 18156  [0x104c089a4]  ARM64VizNative.c:13277
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 18168  [0x104c089b0]  ARM64VizNative.c:13279
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 24368  [0x104c0a1e8]  ARM64VizNative.c:13458
+    +         !   :   | + !   : | 1 avz_native_fast_memory_exclusive_read  (in arm64viz) + 1392  [0x104bf319c]  ARM64VizGuestMemory.c:3371
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 33124  [0x104c0c41c]  ARM64VizNative.c:13707
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 23996  [0x104c0a074]  ARM64VizNative.c:13727
+    +         !   :   | + !   : | 1 avz_native_fast_memory_read_pair  (in arm64viz) + 1208  [0x104bf7cac]  ARM64VizGuestMemory.c:0
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 26240  [0x104c0a938]  ARM64VizNative.c:13754
+    +         !   :   | + !   : | 1 avz_native_fast_memory_write_pair  (in arm64viz) + 96  [0x104bf86ec]  ARM64VizGuestMemory.c:4417
+    +         !   :   | + !   : |   1 avz_native_fast_memory_translate_pair  (in arm64viz) + 0  [0x104bf7d30]  ARM64VizGuestMemory.c:4257
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 26500  [0x104c0aa3c]  ARM64VizNative.c:13786
+    +         !   :   | + !   10 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 8072  [0x104c0f76c]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 3 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 29608,19876  [0x104c0b660,0x104c0905c]  ARM64VizNative.c:0
+    +         !   :   | + !   : 2 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 1128  [0x104c04720]  ARM64VizNative.c:12178
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 33232  [0x104c0c488]  ARM64VizNative.c:12118
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 26436  [0x104c0a9fc]  ARM64VizNative.c:13119
+    +         !   :   | + !   : | 1 closure #1 in variable initialization expression of SoftwareARM64Backend.nativeExecuteSystemInstruction  (in arm64viz) + 180  [0x104b0b0e8]  EmulatorBackend.swift:4115
+    +         !   :   | + !   : |   1 SoftwareARM64Backend.NativeMemoryContext.fillRAM(_:byteCount:pattern:patternWidth:)  (in arm64viz) + 2356  [0x104b054d8]  /<compiler-generated>:0
+    +         !   :   | + !   : |     1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 0  [0x1a218ea3c]
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 18140  [0x104c08994]  ARM64VizNative.c:13277
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 34492  [0x104c0c974]  ARM64VizNative.c:13552
+    +         !   :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 26240  [0x104c0a938]  ARM64VizNative.c:13754
+    +         !   :   | + !   :   1 avz_native_fast_memory_write_pair  (in arm64viz) + 252  [0x104bf8788]  ARM64VizGuestMemory.c:4438
+    +         !   :   | + !   10 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 8620,984,...  [0x104c0f990,0x104c0dbbc,...]  ARM64VizNative.c:16512
+    +         !   :   | + !   4 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 7640  [0x104c0f5bc]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 2 ag_run_memory  (in arm64viz) + 528  [0x104c25c34]  gadget.c:324
+    +         !   :   | + !   : | 1 ag_run_memory  (in arm64viz) + 528  [0x104c25c34]  gadget.c:324
+    +         !   :   | + !   : | + 1 ag_csel64  (in arm64viz) + 84  [0x104c30878]
+    +         !   :   | + !   : | 1 ag_wbpairstore64  (in arm64viz) + 716  [0x104c2ff38]
+    +         !   :   | + !   : |   1 ag_memory_slow  (in arm64viz) + 116  [0x104c367a8]  memory.c:88
+    +         !   :   | + !   : 2 ag_run_memory  (in arm64viz) + 100,396  [0x104c25a88,0x104c25bb0]  gadget.c:324
+    +         !   :   | + !   2 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 6548  [0x104c0f178]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 2 @objc closure #1 in variable initialization expression of SoftwareARM64Backend.nativeChainCheckpoint  (in arm64viz) + 56  [0x104b02ef8]  /<compiler-generated>:1213
+    +         !   :   | + !   :   1 SoftwareARM64Backend.NativeChainCheckpointContext.checkpoint(executionSteps:executionBlocks:pstate:)  (in arm64viz) + 124  [0x104b02b34]  EmulatorBackend.swift:1147
+    +         !   :   | + !   :   | 1 SoftwareARM64Backend.NativeMemoryContext.synchronizeSharedTranslations()  (in arm64viz) + 48  [0x104b02e2c]  /<compiler-generated>:0
+    +         !   :   | + !   :   |   1 swift_release  (in libswiftCore.dylib) + 0  [0x1a2128010]
+    +         !   :   | + !   :   1 SoftwareARM64Backend.NativeChainCheckpointContext.checkpoint(executionSteps:executionBlocks:pstate:)  (in arm64viz) + 56  [0x104b02af0]  EmulatorBackend.swift:1182
+    +         !   :   | + !   :     1 DYLD-STUB$$type metadata accessor for DispatchTime  (in arm64viz) + 4  [0x104c7eef0]
+    +         !   :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 1196  [0x104c0dc90]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 1 avz_native_block_cache_code_mutation_epoch  (in arm64viz) + 0  [0x104be7580]  ARM64VizBlockCache.c:2326
+    +         !   :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 2548  [0x104c0e1d8]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 1 avz_find_successor  (in arm64viz) + 224  [0x104be6cd8]  ARM64VizBlockCache.c:2176
+    +         !   :   | + !   :   1 avz_find_successor  (in arm64viz) + 236  [0x104be6ce4]  ARM64VizBlockCache.c:2184
+    +         !   :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 3624  [0x104c0e60c]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 1 avz_native_block_cache_get_or_decode  (in arm64viz) + 2168  [0x104be3b0c]  ARM64VizBlockCache.c:1567
+    +         !   :   | + !   :   1 avz_native_block_cache_get_or_decode  (in arm64viz) + 2168  [0x104be3b0c]  ARM64VizBlockCache.c:1567
+    +         !   :   | + !   :     1 avz_native_decode_instruction  (in arm64viz) + 1596  [0x104bfd588]  ARM64VizNative.c:0
+    +         !   :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 4060  [0x104c0e7c0]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 1 avz_native_decoded_block_serial_token  (in arm64viz) + 8  [0x104be6b58]  ARM64VizBlockCache.c:2146
+    +         !   :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 4076  [0x104c0e7d0]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 1 avz_native_decoded_block_serial  (in arm64viz) + 0  [0x104be6ad0]  ARM64VizBlockCache.c:2138
+    +         !   :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 6972  [0x104c0f320]  ARM64VizNative.c:16512
+    +         !   :   | + !   : 1 avz_native_sample_hot_pc  (in arm64viz) + 8  [0x104c1e734]  ARM64VizNative.c:14335
+    +         !   :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 8840  [0x104c0fa6c]  ARM64VizNative.c:16512
+    +         !   :   | + !     1 @objc closure #1 in variable initialization expression of SoftwareARM64Backend.nativeChainCheckpoint  (in arm64viz) + 56  [0x104b02ef8]  /<compiler-generated>:1213
+    +         !   :   | + !       1 SoftwareARM64Backend.NativeChainCheckpointContext.checkpoint(executionSteps:executionBlocks:pstate:)  (in arm64viz) + 292  [0x104b02bdc]  EmulatorBackend.swift:1165
+    +         !   :   | + 3 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 6688  [0x104b08e20]  EmulatorBackend.swift:0
+    +         !   :   | + ! 3 $defer #1 () in SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 724  [0x104b09724]  EmulatorBackend.swift:3078
+    +         !   :   | + !   3 VirtualMachine.updateGenericTimerInterruptsIfNeeded(force:)  (in arm64viz) + 184  [0x104bc1470]  VirtualMachine.swift:1239
+    +         !   :   | + !     3 protocol witness for InterruptController.clear(line:targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 68  [0x104af4460]  /<compiler-generated>:185
+    +         !   :   | + !       1 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 304  [0x104af2664]  /<compiler-generated>:0
+    +         !   :   | + !       : 1 specialized Dictionary.subscript.modify  (in arm64viz) + 32  [0x104af2794]  /<compiler-generated>:0
+    +         !   :   | + !       :   1 _xzm_free  (in libsystem_malloc.dylib) + 1048  [0x18e87f484]
+    +         !   :   | + !       :     1 mach_absolute_time  (in libsystem_kernel.dylib) + 16  [0x18ea1e0b0]
+    +         !   :   | + !       1 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 156  [0x104af25d0]  Devices.swift:188
+    +         !   :   | + !       : 1 specialized Dictionary.subscript.modify  (in arm64viz) + 48  [0x104af2740]  /<compiler-generated>:0
+    +         !   :   | + !       :   1 swift_coroFrameAlloc  (in libswiftCore.dylib) + 24  [0x1a218c2e0]
+    +         !   :   | + !       :     1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 192  [0x18e87e980]
+    +         !   :   | + !       1 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 292  [0x104af2658]  Devices.swift:188
+    +         !   :   | + !         1 specialized Array.replaceSubrange<A>(_:with:)  (in arm64viz) + 28  [0x104bd9c00]
+    +         !   :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 3468  [0x104b0818c]  /<compiler-generated>:0
+    +         !   :   | + ! 1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 168  [0x1a218eae4]
+    +         !   :   | + !   1 _swift_release_dealloc  (in libswiftCore.dylib) + 64  [0x1a212bcb0]
+    +         !   :   | + !     1 _xzm_free  (in libsystem_malloc.dylib) + 1048  [0x18e87f484]
+    +         !   :   | + !       1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18ea1e10c]
+    +         !   :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 2488  [0x104b07db8]  EmulatorBackend.swift:3113
+    +         !   :   | +   1 type metadata accessor for SoftwareARM64Backend.NativeChainCheckpointContext  (in arm64viz) + 20  [0x104b21d08]  /<compiler-generated>:0
+    +         !   :   | +     1 objc_opt_self  (in libobjc.A.dylib) + 24  [0x18e618bc4]
+    +         !   :   | 1 SoftwareARM64Backend.executeNativeBasicBlockBurst(_:maxSteps:)  (in arm64viz) + 516  [0x104afeda8]  EmulatorBackend.swift:2875
+    +         !   :   | + 1 specialized ContiguousArray._createNewBuffer(bufferIsUnique:minimumCapacity:growForAppend:)  (in arm64viz) + 32  [0x104adfafc]  /<compiler-generated>:0
+    +         !   :   | +   1 specialized _ContiguousArrayBuffer._consumeAndCreateNew(bufferIsUnique:minimumCapacity:growForAppend:)  (in arm64viz) + 120  [0x104ae07c0]
+    +         !   :   | +     1 swift_allocObject  (in libswiftCore.dylib) + 136  [0x1a2125b48]
+    +         !   :   | +       1 swift::swift_slowAllocTyped(unsigned long, unsigned long, unsigned long long)  (in libswiftCore.dylib) + 56  [0x1a218c27c]
+    +         !   :   | +         1 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 524  [0x18e8840e0]
+    +         !   :   | 1 SoftwareARM64Backend.executeNativeBasicBlockBurst(_:maxSteps:)  (in arm64viz) + 1480  [0x104aff16c]  EmulatorBackend.swift:2919
+    +         !   :   | + 1 specialized _ArrayBuffer._consumeAndCreateNew(bufferIsUnique:minimumCapacity:growForAppend:)  (in arm64viz) + 120  [0x104bd0358]
+    +         !   :   | +   1 swift_allocObject  (in libswiftCore.dylib) + 136  [0x1a2125b48]
+    +         !   :   | +     1 swift::swift_slowAllocTyped(unsigned long, unsigned long, unsigned long long)  (in libswiftCore.dylib) + 56  [0x1a218c27c]
+    +         !   :   | +       1 malloc_type_malloc  (in libsystem_malloc.dylib) + 84  [0x18e872038]
+    +         !   :   | 1 SoftwareARM64Backend.executeNativeBasicBlockBurst(_:maxSteps:)  (in arm64viz) + 1632  [0x104aff204]  EmulatorBackend.swift:2937
+    +         !   :   |   1 specialized SoftwareARM64Backend.routePendingIRQIfNeeded(_:)  (in arm64viz) + 84  [0x104b131b8]  EmulatorBackend.swift:6738
+    +         !   :   |     1 protocol witness for InterruptController.peekPending(targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 112  [0x104af45cc]
+    +         !   :   |       1 -[NSRecursiveLock unlock]  (in Foundation) + 48  [0x190318c2c]
+    +         !   :   |         1 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 120  [0x18ea5cb30]
+    +         !   :   6 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 764  [0x104afdf90]  EmulatorBackend.swift:536
+    +         !   :   | 3 specialized SoftwareARM64Backend.routePendingIRQIfNeeded(_:)  (in arm64viz) + 84  [0x104b131b8]  EmulatorBackend.swift:6738
+    +         !   :   | + 3 protocol witness for InterruptController.peekPending(targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 64  [0x104af459c]
+    +         !   :   | +   2 SimpleInterruptController.pendingLine(targetVCPU:)  (in arm64viz) + 76  [0x104af1298]  Devices.swift:319
+    +         !   :   | +   1 SimpleInterruptController.pendingLine(targetVCPU:)  (in arm64viz) + 56  [0x104af1284]  Devices.swift:319
+    +         !   :   | +     1 ???  (in arm64viz)  load address 0x104ac8000 + 0xa94e4  [0x104b714e4]
+    +         !   :   | +       1 specialized __RawDictionaryStorage.find<A>(_:hashValue:)  (in arm64viz) + 96  [0x104b71ff0]
+    +         !   :   | 2 specialized SoftwareARM64Backend.routePendingIRQIfNeeded(_:)  (in arm64viz) + 220  [0x104b13240]  EmulatorBackend.swift:6765
+    +         !   :   | + 2 protocol witness for InterruptController.peekPending(targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 56  [0x104af4594]
+    +         !   :   | +   2 -[NSRecursiveLock lock]  (in Foundation) + 28  [0x190317c9c]
+    +         !   :   | +     1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+    +         !   :   | +     ! 1 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+    +         !   :   | +     !   1 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+    +         !   :   | +     1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 240  [0x18ea5c8f8]
+    +         !   :   | 1 specialized SoftwareARM64Backend.routePendingIRQIfNeeded(_:)  (in arm64viz) + 192  [0x104b13224]  EmulatorBackend.swift:6750
+    +         !   :   |   1 ARM64SystemRegisterBank.setStoredValue(rawKey:value:)  (in arm64viz) + 1364  [0x104b710f0]  SystemRegisters.swift:378
+    +         !   :   |     1 swift_isUniquelyReferenced_nonNull_native  (in libswiftCore.dylib) + 0  [0x1a2128444]
+    +         !   :   4 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 732  [0x104afdf70]  EmulatorBackend.swift:535
+    +         !   :   | 3 SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 116  [0x104af2094]  Devices.swift:182
+    +         !   :   | + 3 partial apply for thunk for @escaping @callee_guaranteed () -> ()  (in arm64viz) + 20  [0x104afa1e8]  /<compiler-generated>:0
+    +         !   :   | +   3 partial apply for closure #1 in closure #1 in ParallelVCPUCluster.init(primary:counterTicksPerHostSecond:activeCounterTicksPerHostSecond:)  (in arm64viz) + 24  [0x104b59230]  /<compiler-generated>:0
+    +         !   :   | +     3 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+    +         !   :   | +       2 ParallelVCPUCluster.signal()  (in arm64viz) + 292  [0x104b560f8]  ParallelVCPUCluster.swift:470
+    +         !   :   | +       ! 2 pthread_cond_broadcast  (in libsystem_pthread.dylib) + 696  [0x18ea5cfbc]
+    +         !   :   | +       !   2 __psynch_cvbroad  (in libsystem_kernel.dylib) + 4,8  [0x18ea21534,0x18ea21538]
+    +         !   :   | +       1 ParallelVCPUCluster.signal()  (in arm64viz) + 308  [0x104b56108]  ParallelVCPUCluster.swift:471
+    +         !   :   | +         1 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x18ea5cb94]
+    +         !   :   | +           1 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x18ea5ef0c]
+    +         !   :   | +             1 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x18ea20ba8]
+    +         !   :   | 1 SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 72  [0x104af2068]  Devices.swift:172
+    +         !   :   |   1 closure #1 in SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 164  [0x104af2190]  Devices.swift:174
+    +         !   :   |     1 ???  (in arm64viz)  load address 0x104ac8000 + 0xa94e4  [0x104b714e4]
+    +         !   :   |       1 specialized __RawDictionaryStorage.find<A>(_:hashValue:)  (in arm64viz) + 44  [0x104b71fbc]
+    +         !   :   2 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 588  [0x104afdee0]  EmulatorBackend.swift:535
+    +         !   :   | 1 protocol witness for InterruptController.clear(line:targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 48  [0x104af444c]  /<compiler-generated>:185
+    +         !   :   | + 1 -[NSRecursiveLock lock]  (in Foundation) + 28  [0x190317c9c]
+    +         !   :   | +   1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+    +         !   :   | +     1 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+    +         !   :   | +       1 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+    +         !   :   | 1 protocol witness for InterruptController.clear(line:targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 68  [0x104af4460]  /<compiler-generated>:185
+    +         !   :   |   1 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 156  [0x104af25d0]  Devices.swift:188
+    +         !   :   |     1 specialized Dictionary.subscript.modify  (in arm64viz) + 48  [0x104af2740]  /<compiler-generated>:0
+    +         !   :   |       1 swift_coroFrameAlloc  (in libswiftCore.dylib) + 0  [0x1a218c2c8]
+    +         !   :   1 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 308  [0x104afddc8]  EmulatorBackend.swift:0
+    +         !   2 VirtualMachine.runExternallyManagedVirtualCPU(maxSteps:)  (in arm64viz) + 108  [0x104bc9e70]  VirtualMachine.swift:765
+    +         !     2 avz_native_counter_clock_read  (in arm64viz) + 40  [0x104bee428]  ARM64VizGuestMemory.c:50
+    +         !       2 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18ea1e10c]
+    +         1123 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 8652  [0x104c3afb8]  ARM64VizCommand.swift:428
+    +         ! 1123 usleep  (in libsystem_c.dylib) + 68  [0x18e8fdbd8]
+    +         !   1123 nanosleep  (in libsystem_c.dylib) + 220  [0x18e8fdcc0]
+    +         !     1123 __semwait_signal  (in libsystem_kernel.dylib) + 8  [0x18ea21308]
+    +         27 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 8660  [0x104c3afc0]  ARM64VizCommand.swift:0
+    +         ! 22 ParallelVCPUCluster.signal()  (in arm64viz) + 292  [0x104b560f8]  ParallelVCPUCluster.swift:470
+    +         ! : 21 pthread_cond_broadcast  (in libsystem_pthread.dylib) + 696  [0x18ea5cfbc]
+    +         ! : | 21 __psynch_cvbroad  (in libsystem_kernel.dylib) + 8  [0x18ea21538]
+    +         ! : 1 __psynch_cvbroad  (in libsystem_kernel.dylib) + 40  [0x18ea21558]
+    +         ! 3 ParallelVCPUCluster.signal()  (in arm64viz) + 100  [0x104b56038]  ParallelVCPUCluster.swift:466
+    +         ! : 3 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+    +         ! :   3 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+    +         ! :     3 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+    +         ! 2 ParallelVCPUCluster.signal()  (in arm64viz) + 308  [0x104b56108]  ParallelVCPUCluster.swift:471
+    +         !   2 pthread_mutex_unlock  (in libsystem_pthread.dylib) + 0  [0x18ea5c944]
+    +         8 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 7712  [0x104c3ac0c]  ARM64VizCommand.swift:393
+    +         ! 3 ParallelVCPUCluster.checkForFailure()  (in arm64viz) + 136  [0x104b574f8]  ParallelVCPUCluster.swift:447
+    +         ! : 3 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+    +         ! :   3 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+    +         ! :     3 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+    +         ! 2 ParallelVCPUCluster.checkForFailure()  (in arm64viz) + 180  [0x104b57524]  /<compiler-generated>:0
+    +         ! : 2 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 264  [0x1a218eb44]
+    +         ! 2 ParallelVCPUCluster.checkForFailure()  (in arm64viz) + 112  [0x104b574e0]  ParallelVCPUCluster.swift:446
+    +         ! : 2 ParallelVCPUCluster.checkForFailure()  (in arm64viz) + 112  [0x104b574e0]  ParallelVCPUCluster.swift:446
+    +         ! :   2 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::incrementSlow(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 136  [0x1a213211c]
+    +         ! 1 ParallelVCPUCluster.checkForFailure()  (in arm64viz) + 192  [0x104b57530]  ParallelVCPUCluster.swift:446
+    +         5 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 7740  [0x104c3ac28]  ARM64VizCommand.swift:394
+    +         ! 3 VirtualVirtIODevice.pumpNetworkReceiveQueue()  (in arm64viz) + 72  [0x104b94650]  VirtIO.swift:2048
+    +         ! : 2 VirtualVirtIODevice.updateInterruptLine()  (in arm64viz) + 108  [0x104b95030]  VirtIO.swift:0
+    +         ! : | 2 SimpleInterruptController.clear(line:)  (in arm64viz) + 48  [0x104af0bfc]  Devices.swift:122
+    +         ! : |   1 -[NSRecursiveLock lock]  (in Foundation) + 28  [0x190317c9c]
+    +         ! : |   + 1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+    +         ! : |   +   1 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+    +         ! : |   +     1 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+    +         ! : |   1 objc_msgSend  (in libobjc.A.dylib) + 0  [0x18e605800]
+    +         ! : 1 VirtualVirtIODevice.updateInterruptLine()  (in arm64viz) + 56  [0x104b94ffc]  VirtIO.swift:0
+    +         ! :   1 swift_getObjectType  (in libswiftCore.dylib) + 0  [0x1a2128980]
+    +         ! 1 VirtualVirtIODevice.pumpNetworkReceiveQueue()  (in arm64viz) + 0  [0x104b94608]  VirtIO.swift:2047
+    +         ! 1 VirtualVirtIODevice.pumpNetworkReceiveQueue()  (in arm64viz) + 40  [0x104b94630]  VirtIO.swift:2048
+    +         !   1 -[NSRecursiveLock lock]  (in Foundation) + 0  [0x190317c80]
+    +         4 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 7540  [0x104c3ab60]  /<compiler-generated>:0
+    +         ! 2 outlined destroy of InstructionTraceEntry?  (in arm64viz) + 48  [0x104c72a78]
+    +         ! : 1 destroy for ClosedRange<>.Index  (in libswiftCore.dylib) + 0  [0x1a2134dbc]
+    +         ! : 1 outlined consume of RunStopReason  (in arm64viz) + 0  [0x104b2225c]  /<compiler-generated>:0
+    +         ! 1 outlined destroy of InstructionTraceEntry?  (in arm64viz) + 28  [0x104c72a64]
+    +         ! : 1 __swift_instantiateConcreteTypeFromMangledNameV2  (in arm64viz) + 56  [0x104acc080]  /<compiler-generated>:0
+    +         ! 1 outlined destroy of InstructionTraceEntry?  (in arm64viz) + 0  [0x104c72a48]
+    +         4 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 8668  [0x104c3afc8]  ARM64VizCommand.swift:0
+    +         ! 3 swift_release  (in libswiftCore.dylib) + 16,4  [0x1a2128020,0x1a2128014]
+    +         ! 1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 264  [0x1a218eb44]
+    +         1 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 8752  [0x104c3b01c]  ARM64VizCommand.swift:0
+    +         ! 1 outlined enum tag store of RunResult?  (in arm64viz) + 0  [0x104c60e0c]  /<compiler-generated>:0
+    +         1 static ARM64VizCommand.runLinuxTrace(arguments:)  (in arm64viz) + 7400  [0x104c3aad4]  ARM64VizCommand.swift:0
+    2369 Thread_105577831: pinecone-vcpu-1
+    + 2369 thread_start  (in libsystem_pthread.dylib) + 8  [0x18ea5cc1c]
+    +   2369 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18ea61c58]
+    +     2369 __NSThread__start__  (in Foundation) + 732  [0x190361a90]
+    +       2369 thunk for @escaping @callee_guaranteed @Sendable () -> ()  (in arm64viz) + 28  [0x104b8c43c]
+    +         2369 partial apply for closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 24  [0x104b59268]  /<compiler-generated>:0
+    +           2369 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+    +             2240 ParallelVCPUCluster.SecondaryWorker.runLoop()  (in arm64viz) + 1004  [0x104b53b68]  ParallelVCPUCluster.swift:255
+    +             ! 2225 -[NSCondition waitUntilDate:]  (in Foundation) + 132  [0x190343e90]
+    +             ! : 2223 _pthread_cond_wait  (in libsystem_pthread.dylib) + 1024  [0x18ea62154]
+    +             ! : | 2223 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18ea2150c]
+    +             ! : 2 _pthread_cond_wait  (in libsystem_pthread.dylib) + 1120  [0x18ea621b4]
+    +             ! :   2 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+    +             ! :     2 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+    +             ! :       2 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+    +             ! 15 -[NSCondition waitUntilDate:]  (in Foundation) + 52  [0x190343e40]
+    +             !   15 -[__NSTaggedDate timeIntervalSinceReferenceDate]  (in CoreFoundation) + 0  [0x18eaebc40]
+    +             127 ParallelVCPUCluster.SecondaryWorker.runLoop()  (in arm64viz) + 1216  [0x104b53c3c]  ParallelVCPUCluster.swift:281
+    +             ! 80 VirtualMachine.runExternallyManagedVirtualCPU(maxSteps:)  (in arm64viz) + 560  [0x104bca034]  VirtualMachine.swift:774
+    +             ! : 80 protocol witness for VirtualMachineBackend.run(vm:maxSteps:) in conformance SoftwareARM64Backend  (in arm64viz) + 28  [0x104b0ec14]  /<compiler-generated>:0
+    +             ! :   77 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 1140  [0x104afe108]  EmulatorBackend.swift:548
+    +             ! :   | 74 SoftwareARM64Backend.executeNativeBasicBlockBurst(_:maxSteps:)  (in arm64viz) + 860  [0x104afef00]  EmulatorBackend.swift:2887
+    +             ! :   | + 60 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 2864  [0x104b07f30]  EmulatorBackend.swift:3113
+    +             ! :   | + ! 60 avz_native_execution_context_run_cached_chain_checkpointed_fast_memory  (in arm64viz) + 112  [0x104c1020c]  ARM64VizNative.c:16597
+    +             ! :   | + !   23 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 6864  [0x104c0f2b4]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 7 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 916,928,...  [0x104c0464c,0x104c04658,...]  ARM64VizNative.c:0
+    +             ! :   | + !   : 3 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 32616  [0x104c0c220]  ARM64VizNative.c:0
+    +             ! :   | + !   : | 2 avz_native_fast_memory_write  (in arm64viz) + 1236  [0x104bf7384]  ARM64VizGuestMemory.c:4214
+    +             ! :   | + !   : | 1 avz_native_fast_memory_write  (in arm64viz) + 1960  [0x104bf7658]  ARM64VizGuestMemory.c:4226
+    +             ! :   | + !   : |   1 closure #1 in variable initialization expression of SoftwareARM64Backend.nativeWritePhysicalMemory  (in arm64viz) + 128  [0x104b0a01c]  EmulatorBackend.swift:3860
+    +             ! :   | + !   : |     1 VirtualMachine.writePhysical(_:width:value:)  (in arm64viz) + 256  [0x104bc16e4]  VirtualMachine.swift:1826
+    +             ! :   | + !   : |       1 MMIOBus.write(address:width:value:targetVCPU:)  (in arm64viz) + 364  [0x104b4aff4]  MMIO.swift:108
+    +             ! :   | + !   : |         1 protocol witness for MMIODevice.write(offset:width:value:) in conformance VirtualGIC  (in arm64viz) + 100  [0x104af5764]  /<compiler-generated>:424
+    +             ! :   | + !   : |           1 VirtualGIC.writeCPUInterface(offset:value:)  (in arm64viz) + 256  [0x104af4c10]  Devices.swift:510
+    +             ! :   | + !   : |             1 SimpleInterruptController.complete(line:targetVCPU:)  (in arm64viz) + 72  [0x104af2ed4]  Devices.swift:229
+    +             ! :   | + !   : |               1 closure #1 in SimpleInterruptController.complete(line:targetVCPU:)  (in arm64viz) + 992  [0x104af3338]  /<compiler-generated>:0
+    +             ! :   | + !   : |                 1 DYLD-STUB$$swift_bridgeObjectRelease  (in arm64viz) + 4  [0x104c7fb14]
+    +             ! :   | + !   : 2 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 19376  [0x104c08e68]  ARM64VizNative.c:12534
+    +             ! :   | + !   : 2 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 26240  [0x104c0a938]  ARM64VizNative.c:13754
+    +             ! :   | + !   : | 1 avz_native_fast_memory_write_pair  (in arm64viz) + 1332  [0x104bf8bc0]  ARM64VizGuestMemory.c:0
+    +             ! :   | + !   : | 1 avz_native_fast_memory_write_pair  (in arm64viz) + 204  [0x104bf8758]  ARM64VizGuestMemory.c:4436
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 33204  [0x104c0c46c]  ARM64VizNative.c:12118
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 892  [0x104c04634]  ARM64VizNative.c:12127
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 1128  [0x104c04720]  ARM64VizNative.c:12178
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 19424  [0x104c08e98]  ARM64VizNative.c:12546
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 29232  [0x104c0b4e8]  ARM64VizNative.c:12569
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 18340  [0x104c08a5c]  ARM64VizNative.c:12702
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 28684  [0x104c0b2c4]  ARM64VizNative.c:13369
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 30504  [0x104c0b9e0]  ARM64VizNative.c:13498
+    +             ! :   | + !   : | 1 avz_native_fast_memory_exclusive_write  (in arm64viz) + 1800  [0x104bf4650]  ARM64VizGuestMemory.c:3507
+    +             ! :   | + !   : |   1 avz_fast_mark_dirty  (in arm64viz) + 272  [0x104bf4804]  ARM64VizGuestMemory.c:1550
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 26468  [0x104c0aa1c]  ARM64VizNative.c:13748
+    +             ! :   | + !   10 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 8072  [0x104c0f76c]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 5 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 19292,29608,...  [0x104c08e14,0x104c0b660,...]  ARM64VizNative.c:0
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 33224  [0x104c0c480]  ARM64VizNative.c:12118
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 904  [0x104c04640]  ARM64VizNative.c:12130
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 16792  [0x104c08450]  ARM64VizNative.c:12457
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 16812  [0x104c08464]  ARM64VizNative.c:12462
+    +             ! :   | + !   : 1 avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz) + 19460  [0x104c08ebc]  ARM64VizNative.c:12576
+    +             ! :   | + !   8 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 1052,1280,...  [0x104c0dc00,0x104c0dce4,...]  ARM64VizNative.c:16512
+    +             ! :   | + !   5 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 7640  [0x104c0f5bc]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 3 ag_run_memory  (in arm64viz) + 528  [0x104c25c34]  gadget.c:324
+    +             ! :   | + !   : | 3 ag_run_memory  (in arm64viz) + 528  [0x104c25c34]  gadget.c:324
+    +             ! :   | + !   : |   1 ag_nop  (in arm64viz) + 116  [0x104c25e5c]
+    +             ! :   | + !   : |   1 ag_orr64  (in arm64viz) + 20  [0x104c27d20]
+    +             ! :   | + !   : |   1 ag_reg64_add  (in arm64viz) + 24  [0x104c26be0]
+    +             ! :   | + !   : 2 ag_run_memory  (in arm64viz) + 100,220  [0x104c25a88,0x104c25b00]  gadget.c:324
+    +             ! :   | + !   3 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 2548  [0x104c0e1d8]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 2 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 2548  [0x104c0e1d8]  ARM64VizNative.c:16512
+    +             ! :   | + !   : | 1 avz_find_successor  (in arm64viz) + 180  [0x104be6cac]  ARM64VizBlockCache.c:0
+    +             ! :   | + !   : | 1 avz_find_successor  (in arm64viz) + 120  [0x104be6c70]  ARM64VizBlockCache.c:2173
+    +             ! :   | + !   : 1 avz_find_successor  (in arm64viz) + 540  [0x104be6e14]  ARM64VizBlockCache.c:2184
+    +             ! :   | + !   :   1 avz_find_successor  (in arm64viz) + 628  [0x104be6e6c]  ARM64VizBlockCache.c:0
+    +             ! :   | + !   3 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 4408  [0x104c0e91c]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 1 avz_assembly_cache_program  (in arm64viz) + 124  [0x104be5c48]  ARM64VizBlockCache.c:1847
+    +             ! :   | + !   : 1 avz_assembly_cache_program  (in arm64viz) + 196  [0x104be5c90]  ARM64VizBlockCache.c:1849
+    +             ! :   | + !   : 1 avz_assembly_cache_program  (in arm64viz) + 236  [0x104be5cb8]  ARM64VizBlockCache.c:1853
+    +             ! :   | + !   2 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 3624  [0x104c0e60c]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 1 avz_native_block_cache_get_or_decode  (in arm64viz) + 188  [0x104be3350]  ARM64VizBlockCache.c:1518
+    +             ! :   | + !   : | 1 avz_block_key_hash  (in arm64viz) + 0  [0x104be4938]  ARM64VizBlockCache.c:0
+    +             ! :   | + !   : 1 avz_native_block_cache_get_or_decode  (in arm64viz) + 216  [0x104be336c]  ARM64VizBlockCache.c:1522
+    +             ! :   | + !   2 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 4060  [0x104c0e7c0]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 2 avz_native_decoded_block_serial_token  (in arm64viz) + 0  [0x104be6b50]  ARM64VizBlockCache.c:2145
+    +             ! :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 24  [0x104c0d7fc]  ARM64VizNative.c:16511
+    +             ! :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 196  [0x104c0d8a8]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 1 avz_native_block_cache_code_mutation_epoch_token  (in arm64viz) + 0  [0x104be75ac]  ARM64VizBlockCache.c:2348
+    +             ! :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 5204  [0x104c0ec38]  ARM64VizNative.c:16512
+    +             ! :   | + !   : 1 avz_find_successor  (in arm64viz) + 224  [0x104be6cd8]  ARM64VizBlockCache.c:2176
+    +             ! :   | + !   :   1 avz_find_successor  (in arm64viz) + 272  [0x104be6d08]  ARM64VizBlockCache.c:2184
+    +             ! :   | + !   1 avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz) + 6548  [0x104c0f178]  ARM64VizNative.c:16512
+    +             ! :   | + !     1 @objc closure #1 in variable initialization expression of SoftwareARM64Backend.nativeChainCheckpoint  (in arm64viz) + 56  [0x104b02ef8]  /<compiler-generated>:1213
+    +             ! :   | + !       1 SoftwareARM64Backend.NativeChainCheckpointContext.checkpoint(executionSteps:executionBlocks:pstate:)  (in arm64viz) + 124  [0x104b02b34]  EmulatorBackend.swift:1147
+    +             ! :   | + !         1 SoftwareARM64Backend.NativeMemoryContext.synchronizeSharedTranslations()  (in arm64viz) + 48  [0x104b02e2c]  /<compiler-generated>:0
+    +             ! :   | + !           1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 264  [0x1a218eb44]
+    +             ! :   | + 4 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 6688  [0x104b08e20]  EmulatorBackend.swift:0
+    +             ! :   | + ! 4 $defer #1 () in SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 724  [0x104b09724]  EmulatorBackend.swift:3078
+    +             ! :   | + !   2 VirtualMachine.updateGenericTimerInterruptsIfNeeded(force:)  (in arm64viz) + 184  [0x104bc1470]  VirtualMachine.swift:1239
+    +             ! :   | + !   : 1 protocol witness for InterruptController.clear(line:targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 48  [0x104af444c]  /<compiler-generated>:185
+    +             ! :   | + !   : | 1 -[NSRecursiveLock lock]  (in Foundation) + 28  [0x190317c9c]
+    +             ! :   | + !   : |   1 pthread_mutex_lock  (in libsystem_pthread.dylib) + 0  [0x18ea5c3fc]
+    +             ! :   | + !   : 1 protocol witness for InterruptController.clear(line:targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 68  [0x104af4460]  /<compiler-generated>:185
+    +             ! :   | + !   :   1 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 304  [0x104af2664]  /<compiler-generated>:0
+    +             ! :   | + !   :     1 specialized Dictionary.subscript.modify  (in arm64viz) + 32  [0x104af2794]  /<compiler-generated>:0
+    +             ! :   | + !   :       1 _xzm_free  (in libsystem_malloc.dylib) + 1048  [0x18e87f484]
+    +             ! :   | + !   :         1 mach_absolute_time  (in libsystem_kernel.dylib) + 112  [0x18ea1e110]
+    +             ! :   | + !   2 VirtualMachine.updateGenericTimerInterruptsIfNeeded(force:)  (in arm64viz) + 300  [0x104bc14e4]  VirtualMachine.swift:1240
+    +             ! :   | + !     2 SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 116  [0x104af2094]  Devices.swift:182
+    +             ! :   | + !       2 partial apply for thunk for @escaping @callee_guaranteed () -> ()  (in arm64viz) + 20  [0x104afa1e8]  /<compiler-generated>:0
+    +             ! :   | + !         2 partial apply for closure #1 in closure #1 in ParallelVCPUCluster.init(primary:counterTicksPerHostSecond:activeCounterTicksPerHostSecond:)  (in arm64viz) + 24  [0x104b59230]  /<compiler-generated>:0
+    +             ! :   | + !           1 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+    +             ! :   | + !           | 1 ParallelVCPUCluster.signal()  (in arm64viz) + 292  [0x104b560f8]  ParallelVCPUCluster.swift:470
+    +             ! :   | + !           |   1 pthread_cond_broadcast  (in libsystem_pthread.dylib) + 696  [0x18ea5cfbc]
+    +             ! :   | + !           |     1 __psynch_cvbroad  (in libsystem_kernel.dylib) + 8  [0x18ea21538]
+    +             ! :   | + !           1 swift_release  (in libswiftCore.dylib) + 32  [0x1a2128030]
+    +             ! :   | + 2 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 1268  [0x104b078f4]  EmulatorBackend.swift:3011
+    +             ! :   | + ! 2 protocol witness for InterruptController.peekPending(targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 64  [0x104af459c]
+    +             ! :   | + !   1 SimpleInterruptController.pendingLine(targetVCPU:)  (in arm64viz) + 256  [0x104af134c]  /<compiler-generated>:0
+    +             ! :   | + !   : 1 swift_retain  (in libswiftCore.dylib) + 4  [0x1a2127f28]
+    +             ! :   | + !   1 SimpleInterruptController.pendingLine(targetVCPU:)  (in arm64viz) + 172  [0x104af12f8]  Devices.swift:319
+    +             ! :   | + !     1 ???  (in arm64viz)  load address 0x104ac8000 + 0xa94d8  [0x104b714d8]
+    +             ! :   | + !       1 DYLD-STUB$$static Hasher._hash(seed:_:)  (in arm64viz) + 4  [0x104c7f760]
+    +             ! :   | + 2 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 2500  [0x104b07dc4]  EmulatorBackend.swift:3113
+    +             ! :   | + ! 2 swift_allocObject  (in libswiftCore.dylib) + 136  [0x1a2125b48]
+    +             ! :   | + !   2 swift::swift_slowAllocTyped(unsigned long, unsigned long, unsigned long long)  (in libswiftCore.dylib) + 56  [0x1a218c27c]
+    +             ! :   | + !     1 _xzm_xzone_malloc_freelist_outlined  (in libsystem_malloc.dylib) + 248  [0x18e885730]
+    +             ! :   | + !     : 1 _xzm_xzone_malloc_from_freelist_chunk  (in libsystem_malloc.dylib) + 260  [0x18e885c1c]
+    +             ! :   | + !     1 malloc_type_malloc  (in libsystem_malloc.dylib) + 0  [0x18e871fe4]
+    +             ! :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 2376  [0x104b07d48]  /<compiler-generated>:0
+    +             ! :   | + ! 1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 8  [0x1a218ea44]
+    +             ! :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 2616  [0x104b07e38]  /<compiler-generated>:0
+    +             ! :   | + ! 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 2616  [0x104b07e38]  /<compiler-generated>:0
+    +             ! :   | + !   1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::incrementSlow(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 136  [0x1a213211c]
+    +             ! :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 276  [0x104b07514]  EmulatorBackend.swift:2974
+    +             ! :   | + ! 1 SoftwareARM64Backend.NativeMemoryContext.synchronizeSharedTranslations()  (in arm64viz) + 48  [0x104b02e2c]  /<compiler-generated>:0
+    +             ! :   | + !   1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 236  [0x1a218eb28]
+    +             ! :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 1616  [0x104b07a50]  EmulatorBackend.swift:3090
+    +             ! :   | + ! 1 avz_native_execution_context_load_with_exclusive_generation  (in arm64viz) + 72  [0x104c03f50]  ARM64VizNative.c:15043
+    +             ! :   | + !   1 copy_registers_to_cpu  (in arm64viz) + 276  [0x104c0345c]  ARM64VizNative.c:11733
+    +             ! :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 124  [0x104b0747c]  EmulatorBackend.swift:3113
+    +             ! :   | + ! 1 ___chkstk_darwin  (in libsystem_pthread.dylib) + 0  [0x18ea5cc20]
+    +             ! :   | + 1 SoftwareARM64Backend.executeNativeBasicBlockBurstLoop(_:maxSteps:registers:vectorLows:vectorHighs:sp:pc:pstate:exclusiveAddress:exclusiveGeneration:exclusiveSize:exclusiveValid:halted:)  (in arm64viz) + 1900  [0x104b07b6c]  EmulatorBackend.swift:3113
+    +             ! :   | +   1 swift_unownedRetainStrong  (in libswiftCore.dylib) + 0  [0x1a2134930]
+    +             ! :   | 2 SoftwareARM64Backend.executeNativeBasicBlockBurst(_:maxSteps:)  (in arm64viz) + 348  [0x104afed00]  EmulatorBackend.swift:2874
+    +             ! :   | + 2 specialized ContiguousArray._createNewBuffer(bufferIsUnique:minimumCapacity:growForAppend:)  (in arm64viz) + 32  [0x104adfafc]  /<compiler-generated>:0
+    +             ! :   | +   2 specialized _ContiguousArrayBuffer._consumeAndCreateNew(bufferIsUnique:minimumCapacity:growForAppend:)  (in arm64viz) + 128  [0x104ae07c8]
+    +             ! :   | +     2 malloc_size  (in libsystem_malloc.dylib) + 16  [0x18e85b044]
+    +             ! :   | 1 SoftwareARM64Backend.executeNativeBasicBlockBurst(_:maxSteps:)  (in arm64viz) + 1480  [0x104aff16c]  EmulatorBackend.swift:2919
+    +             ! :   |   1 specialized _ArrayBuffer._consumeAndCreateNew(bufferIsUnique:minimumCapacity:growForAppend:)  (in arm64viz) + 128  [0x104bd0360]
+    +             ! :   |     1 malloc_size  (in libsystem_malloc.dylib) + 16  [0x18e85b044]
+    +             ! :   2 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 732  [0x104afdf70]  EmulatorBackend.swift:535
+    +             ! :   | 1 SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 72  [0x104af2068]  Devices.swift:172
+    +             ! :   | + 1 closure #1 in SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 716  [0x104af23b8]  /<compiler-generated>:0
+    +             ! :   | +   1 swift_allocObject  (in libswiftCore.dylib) + 136  [0x1a2125b48]
+    +             ! :   | +     1 swift::swift_slowAllocTyped(unsigned long, unsigned long, unsigned long long)  (in libswiftCore.dylib) + 56  [0x1a218c27c]
+    +             ! :   | +       1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 192  [0x18e87e980]
+    +             ! :   | 1 SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 116  [0x104af2094]  Devices.swift:182
+    +             ! :   |   1 partial apply for thunk for @escaping @callee_guaranteed () -> ()  (in arm64viz) + 20  [0x104afa1e8]  /<compiler-generated>:0
+    +             ! :   |     1 partial apply for closure #1 in closure #1 in ParallelVCPUCluster.init(primary:counterTicksPerHostSecond:activeCounterTicksPerHostSecond:)  (in arm64viz) + 24  [0x104b59230]  /<compiler-generated>:0
+    +             ! :   |       1 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+    +             ! :   |         1 ParallelVCPUCluster.signal()  (in arm64viz) + 292  [0x104b560f8]  ParallelVCPUCluster.swift:470
+    +             ! :   |           1 pthread_cond_broadcast  (in libsystem_pthread.dylib) + 696  [0x18ea5cfbc]
+    +             ! :   |             1 __psynch_cvbroad  (in libsystem_kernel.dylib) + 8  [0x18ea21538]
+    +             ! :   1 SoftwareARM64Backend.run(vm:maxSteps:)  (in arm64viz) + 92  [0x104afdcf0]  EmulatorBackend.swift:515
+    +             ! 44 VirtualMachine.runExternallyManagedVirtualCPU(maxSteps:)  (in arm64viz) + 428  [0x104bc9fb0]  VirtualMachine.swift:767
+    +             ! : 37 VirtualMachine.updateGenericTimerInterruptsIfNeeded(force:)  (in arm64viz) + 300  [0x104bc14e4]  VirtualMachine.swift:1240
+    +             ! : | 32 SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 116  [0x104af2094]  Devices.swift:182
+    +             ! : | + 32 partial apply for thunk for @escaping @callee_guaranteed () -> ()  (in arm64viz) + 20  [0x104afa1e8]  /<compiler-generated>:0
+    +             ! : | +   32 partial apply for closure #1 in closure #1 in ParallelVCPUCluster.init(primary:counterTicksPerHostSecond:activeCounterTicksPerHostSecond:)  (in arm64viz) + 24  [0x104b59230]  /<compiler-generated>:0
+    +             ! : | +     30 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+    +             ! : | +     ! 28 ParallelVCPUCluster.signal()  (in arm64viz) + 292  [0x104b560f8]  ParallelVCPUCluster.swift:470
+    +             ! : | +     ! : 28 pthread_cond_broadcast  (in libsystem_pthread.dylib) + 696  [0x18ea5cfbc]
+    +             ! : | +     ! :   28 __psynch_cvbroad  (in libsystem_kernel.dylib) + 8  [0x18ea21538]
+    +             ! : | +     ! 1 ParallelVCPUCluster.signal()  (in arm64viz) + 260  [0x104b560d8]  /<compiler-generated>:0
+    +             ! : | +     ! 1 ParallelVCPUCluster.signal()  (in arm64viz) + 308  [0x104b56108]  ParallelVCPUCluster.swift:471
+    +             ! : | +     !   1 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x18ea5cb94]
+    +             ! : | +     !     1 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x18ea5ef0c]
+    +             ! : | +     !       1 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x18ea20ba8]
+    +             ! : | +     2 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 0  [0x104b56868]
+    +             ! : | 3 SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 72  [0x104af2068]  Devices.swift:172
+    +             ! : | + 1 closure #1 in SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 440  [0x104af22a4]  /<compiler-generated>:0
+    +             ! : | + ! 1 swift_release  (in libswiftCore.dylib) + 4  [0x1a2128014]
+    +             ! : | + 1 closure #1 in SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 584  [0x104af2334]  /<compiler-generated>:0
+    +             ! : | + ! 1 swift_retain  (in libswiftCore.dylib) + 0  [0x1a2127f24]
+    +             ! : | + 1 closure #1 in SimpleInterruptController.raise(line:targetVCPU:)  (in arm64viz) + 716  [0x104af23b8]  /<compiler-generated>:0
+    +             ! : | +   1 swift_allocObject  (in libswiftCore.dylib) + 136  [0x1a2125b48]
+    +             ! : | +     1 swift::swift_slowAllocTyped(unsigned long, unsigned long, unsigned long long)  (in libswiftCore.dylib) + 56  [0x1a218c27c]
+    +             ! : | +       1 _xzm_xzone_malloc  (in libsystem_malloc.dylib) + 192  [0x18e87e980]
+    +             ! : | 1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 168  [0x1a218eae4]
+    +             ! : | + 1 _swift_release_dealloc  (in libswiftCore.dylib) + 64  [0x1a212bcb0]
+    +             ! : | +   1 DYLD-STUB$$free  (in libswiftCore.dylib) + 0  [0x1a25bf490]
+    +             ! : | 1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 52  [0x1a218ea70]
+    +             ! : 5 VirtualMachine.updateGenericTimerInterruptsIfNeeded(force:)  (in arm64viz) + 184  [0x104bc1470]  VirtualMachine.swift:1239
+    +             ! : | 4 protocol witness for InterruptController.clear(line:targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 68  [0x104af4460]  /<compiler-generated>:185
+    +             ! : | + 2 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 156  [0x104af25d0]  Devices.swift:188
+    +             ! : | + ! 2 specialized Dictionary.subscript.modify  (in arm64viz) + 72  [0x104af2758]  /<compiler-generated>:0
+    +             ! : | + !   2 specialized Dictionary._Variant.subscript.modify  (in arm64viz) + 108  [0x104af7f94]  /<compiler-generated>:0
+    +             ! : | + !     1 specialized _NativeDictionary.subscript.modify  (in arm64viz) + 60  [0x104af8028]  /<compiler-generated>:0
+    +             ! : | + !     : 1 swift_coroFrameAlloc  (in libswiftCore.dylib) + 24  [0x1a218c2e0]
+    +             ! : | + !     :   1 _xzm_xzone_malloc_tiny  (in libsystem_malloc.dylib) + 488  [0x18e8840bc]
+    +             ! : | + !     1 specialized _NativeDictionary.subscript.modify  (in arm64viz) + 92  [0x104af8048]  /<compiler-generated>:0
+    +             ! : | + !       1 ???  (in arm64viz)  load address 0x104ac8000 + 0xa94d8  [0x104b714d8]
+    +             ! : | + !         1 Int._rawHashValue(seed:)  (in libswiftCore.dylib) + 0  [0x1a234c6c4]
+    +             ! : | + 1 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 304  [0x104af2664]  /<compiler-generated>:0
+    +             ! : | + ! 1 specialized Dictionary.subscript.modify  (in arm64viz) + 32  [0x104af2794]  /<compiler-generated>:0
+    +             ! : | + !   1 specialized Dictionary._Variant.subscript.modify  (in arm64viz) + 32  [0x104af7fd0]  /<compiler-generated>:0
+    +             ! : | + !     1 _xzm_free  (in libsystem_malloc.dylib) + 172  [0x18e87f118]
+    +             ! : | + 1 closure #1 in SimpleInterruptController.clear(line:targetVCPU:)  (in arm64viz) + 220  [0x104af2610]  Devices.swift:188
+    +             ! : | 1 -[NSRecursiveLock unlock]  (in Foundation) + 48  [0x190318c2c]
+    +             ! : |   1 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x18ea5cb94]
+    +             ! : |     1 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x18ea5ef0c]
+    +             ! : |       1 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x18ea20ba8]
+    +             ! : 1 VirtualMachine.updateGenericTimerInterruptsIfNeeded(force:)  (in arm64viz) + 252  [0x104bc14b4]  VirtualMachine.swift:1240
+    +             ! : | 1 ARM64SystemRegisterBank.rawValue(for:)  (in arm64viz) + 856  [0x104b6ebc0]  SystemRegisters.swift:206
+    +             ! : 1 swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 60  [0x1a218ea78]
+    +             ! 1 VirtualMachine.runExternallyManagedVirtualCPU(maxSteps:)  (in arm64viz) + 84  [0x104bc9e58]  /<compiler-generated>:0
+    +             ! : 1 swift_retain  (in libswiftCore.dylib) + 48  [0x1a2127f54]
+    +             ! 1 VirtualMachine.runExternallyManagedVirtualCPU(maxSteps:)  (in arm64viz) + 100  [0x104bc9e68]  VirtualMachine.swift:765
+    +             ! : 1 objc_msgSend  (in libobjc.A.dylib) + 68  [0x18e605844]
+    +             ! 1 VirtualMachine.runExternallyManagedVirtualCPU(maxSteps:)  (in arm64viz) + 460  [0x104bc9fd0]  VirtualMachine.swift:768
+    +             !   1 protocol witness for InterruptController.peekPending(targetVCPU:) in conformance SimpleInterruptController  (in arm64viz) + 64  [0x104af459c]
+    +             !     1 SimpleInterruptController.pendingLine(targetVCPU:)  (in arm64viz) + 300  [0x104af1378]  Devices.swift:319
+    +             !       1 DYLD-STUB$$static Hasher._hash(seed:bytes:count:)  (in arm64viz) + 0  [0x104c7f750]
+    +             1 ParallelVCPUCluster.SecondaryWorker.runLoop()  (in arm64viz) + 780  [0x104b53a88]  ParallelVCPUCluster.swift:253
+    +             ! 1 avz_native_counter_clock_read  (in arm64viz) + 40  [0x104bee428]  ARM64VizGuestMemory.c:50
+    +             !   1 mach_absolute_time  (in libsystem_kernel.dylib) + 108  [0x18ea1e10c]
+    +             1 ParallelVCPUCluster.SecondaryWorker.runLoop()  (in arm64viz) + 1068  [0x104b53ba8]  ParallelVCPUCluster.swift:276
+    +               1 DispatchTime.uptimeNanoseconds.getter  (in libswiftDispatch.dylib) + 44  [0x1a8cea694]
+    2369 Thread_105577832: pinecone-vcpu-2
+    + 2369 thread_start  (in libsystem_pthread.dylib) + 8  [0x18ea5cc1c]
+    +   2369 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18ea61c58]
+    +     2369 __NSThread__start__  (in Foundation) + 732  [0x190361a90]
+    +       2369 thunk for @escaping @callee_guaranteed @Sendable () -> ()  (in arm64viz) + 28  [0x104b8c43c]
+    +         2369 partial apply for closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 24  [0x104b59268]  /<compiler-generated>:0
+    +           2369 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+    +             2369 ParallelVCPUCluster.SecondaryWorker.runLoop()  (in arm64viz) + 352  [0x104b538dc]  ParallelVCPUCluster.swift:0
+    +               2368 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18ea62128]
+    +               ! 2368 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18ea2150c]
+    +               1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 1120  [0x18ea621b4]
+    +                 1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+    +                   1 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+    +                     1 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+    2369 Thread_105577833: pinecone-vcpu-3
+      2369 thread_start  (in libsystem_pthread.dylib) + 8  [0x18ea5cc1c]
+        2369 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x18ea61c58]
+          2369 __NSThread__start__  (in Foundation) + 732  [0x190361a90]
+            2369 thunk for @escaping @callee_guaranteed @Sendable () -> ()  (in arm64viz) + 28  [0x104b8c43c]
+              2369 partial apply for closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 24  [0x104b59268]  /<compiler-generated>:0
+                2369 closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+                  2369 ParallelVCPUCluster.SecondaryWorker.runLoop()  (in arm64viz) + 352  [0x104b538dc]  ParallelVCPUCluster.swift:0
+                    2366 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18ea62128]
+                    ! 2366 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18ea2150c]
+                    1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 1120  [0x18ea621b4]
+                    ! 1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+                    !   1 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+                    !     1 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x18ea209dc]
+                    1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x18ea62128]
+                    1 pthread_cond_wait  (in libsystem_pthread.dylib) + 0  [0x18ea5e9c0]
+
+Total number in stack (recursive counted multiple, when >=5):
+        9       swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib) + 0  [0x1a218ea3c]
+        8       __psynch_mutexwait  (in libsystem_kernel.dylib) + 0  [0x18ea209d4]
+        8       _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x18ea5c8e0]
+        8       _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x18ea5ee9c]
+        7       closure #1 in ParallelVCPUCluster.SecondaryWorker.start()  (in arm64viz) + 36  [0x104b5688c]
+        6       __psynch_cvbroad  (in libsystem_kernel.dylib) + 0  [0x18ea21530]
+        5       ParallelVCPUCluster.signal()  (in arm64viz) + 292  [0x104b560f8]  ParallelVCPUCluster.swift:470
+        5       mach_absolute_time  (in libsystem_kernel.dylib) + 0  [0x18ea1e0a0]
+        5       pthread_cond_broadcast  (in libsystem_pthread.dylib) + 696  [0x18ea5cfbc]
+        5       swift::swift_slowAllocTyped(unsigned long, unsigned long, unsigned long long)  (in libswiftCore.dylib) + 56  [0x1a218c27c]
+        5       swift_allocObject  (in libswiftCore.dylib) + 136  [0x1a2125b48]
+
+Sort by top of stack, same collapsed (when >= 5):
+        __psynch_cvwait  (in libsystem_kernel.dylib)        6957
+        __semwait_signal  (in libsystem_kernel.dylib)        1123
+        Substring.subscript.getter  (in libswiftCore.dylib)        486
+        Substring.index(_:offsetBy:)  (in libswiftCore.dylib)        169
+        specialized static String._uncheckedFromUTF8(_:isASCII:)  (in libswiftCore.dylib)        102
+        _allASCII(_:)  (in libswiftCore.dylib)        101
+        _stringCompareWithSmolCheck(_:_:expecting:)  (in libswiftCore.dylib)        63
+        __psynch_cvbroad  (in libsystem_kernel.dylib)        54
+        avz_native_run_threaded_decoded_block_cpu_mapped_span  (in arm64viz)        54
+        specialized BidirectionalCollection._range<A>(of:anchored:backwards:)  (in Foundation)        52
+        DYLD-STUB$$Substring.subscript.getter  (in Foundation)        35
+        swift_bridgeObjectRelease  (in libswiftCore.dylib)        29
+        DYLD-STUB$$swift_bridgeObjectRelease  (in Foundation)        25
+        avz_native_run_checkpointed_chain_with_memory_mode  (in arm64viz)        19
+        DYLD-STUB$$_stringCompareWithSmolCheck(_:_:expecting:)  (in Foundation)        17
+        -[__NSTaggedDate timeIntervalSinceReferenceDate]  (in CoreFoundation)        15
+        __psynch_mutexwait  (in libsystem_kernel.dylib)        13
+        DYLD-STUB$$Substring.index(_:offsetBy:)  (in Foundation)        12
+        hasBreakWhenPaired #1 (_:) in _quickHasGraphemeBreakBetween(_:_:)  (in libswiftCore.dylib)        12
+        swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)  (in libswiftCore.dylib)        10
+        mach_absolute_time  (in libsystem_kernel.dylib)        6
+        swift_release  (in libswiftCore.dylib)        6
+        avz_find_successor  (in arm64viz)        5
+
+Binary Images:
+       0x104ac8000 -        0x104cd350f +arm64viz (0) <BD70BC79-B427-3D4F-A24A-F91E31C0D526> /Users/*/Documents/*/arm64viz
+       0x18e5fc000 -        0x18e64eb4b  libobjc.A.dylib (951.7) <FF1D8AE4-ABEF-35F1-A30A-1183B9CB414F> /usr/lib/libobjc.A.dylib
+       0x18e64f000 -        0x18e683d07  libdyld.dylib (1378) <B147D877-D0C2-388F-B38D-D3132E39905F> /usr/lib/system/libdyld.dylib
+       0x18e684000 -        0x18e72a217  dyld (1.0.0 - 1378) <A237EF81-B68B-37BA-A165-92C965529534> /usr/lib/dyld
+       0x18e72b000 -        0x18e72e228  libsystem_blocks.dylib (96) <CC947089-488D-316B-A9C7-46DEC0F73145> /usr/lib/system/libsystem_blocks.dylib
+       0x18e72f000 -        0x18e78355f  libxpc.dylib (3102.120.13) <C40FCAE8-7A17-3D82-87CB-3DA4802ADEF1> /usr/lib/system/libxpc.dylib
+       0x18e784000 -        0x18e7a49ff  libsystem_trace.dylib (1861.120.4) <D0FABAB3-5AE7-3F10-8C62-60CBF5D70850> /usr/lib/system/libsystem_trace.dylib
+       0x18e7a5000 -        0x18e8535f7  libcorecrypto.dylib (1922.121.1) <A01A158D-6FE7-3B1C-A2C4-6BCB90D7314A> /usr/lib/system/libcorecrypto.dylib
+       0x18e854000 -        0x18e8a41d7  libsystem_malloc.dylib (812.100.31) <5FAE4807-4D2B-3A95-A63A-DD96D3DA11B4> /usr/lib/system/libsystem_malloc.dylib
+       0x18e8a5000 -        0x18e8ec23f  libdispatch.dylib (1542.100.32) <F071EFE4-299F-3089-ACC4-0025B8FFB52A> /usr/lib/system/libdispatch.dylib
+       0x18e8ed000 -        0x18e8efffb  libsystem_featureflags.dylib (103) <71FCFFBD-85F8-3365-AFE0-BECEA4369122> /usr/lib/system/libsystem_featureflags.dylib
+       0x18e8f0000 -        0x18e970d9f  libsystem_c.dylib (1752.120.2) <694B7881-1BF3-3D0F-8F19-B50AE4E8EF8A> /usr/lib/system/libsystem_c.dylib
+       0x18e971000 -        0x18ea01ae7  libc++.1.dylib (2100.43) <5013C0F8-84A9-3B56-9FEB-C353816A750F> /usr/lib/libc++.1.dylib
+       0x18ea02000 -        0x18ea1c75f  libc++abi.dylib (2100.43) <E482D257-E5A0-3816-BD97-7B39342958DA> /usr/lib/libc++abi.dylib
+       0x18ea1d000 -        0x18ea5a2af  libsystem_kernel.dylib (12377.121.6) <CC1CF985-BC65-3725-809F-4C1E36B8F4BA> /usr/lib/system/libsystem_kernel.dylib
+       0x18ea5b000 -        0x18ea67b3b  libsystem_pthread.dylib (539.100.4) <4F33683C-18C8-39A1-800B-2E3BD43BCC13> /usr/lib/system/libsystem_pthread.dylib
+       0x18ea68000 -        0x18ea70963  libsystem_platform.dylib (375.120.2) <160FD864-8D15-36FC-9E97-9725388CFAFE> /usr/lib/system/libsystem_platform.dylib
+       0x18ea71000 -        0x18eaa06eb  libsystem_info.dylib (600) <3D62F2D9-F516-31BF-83C7-E203D872300B> /usr/lib/system/libsystem_info.dylib
+       0x18eaa1000 -        0x18efff31f  com.apple.CoreFoundation (6.9 - 5026.5.4) <04E3598B-F226-3250-B3B2-CE938DD4DB7E> /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+       0x18f000000 -        0x18f31abff  com.apple.LaunchServices (1141.1 - 1141.1) <F32798D4-CA63-3935-B694-F45DAFFE5655> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/LaunchServices
+       0x18f31b000 -        0x18f5039bf  com.apple.gpusw.MetalTools (1.0 - 1) <2C2180C9-E027-3712-BED5-73645D651BFD> /System/Library/PrivateFrameworks/MetalTools.framework/Versions/A/MetalTools
+       0x18f504000 -        0x18fcfe4bf  libBLAS.dylib (1551.100.26) <F078C775-D8DC-3C4D-879F-A9BB228DBE06> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+       0x18fcff000 -        0x18fe0e35f  com.apple.Lexicon-framework (1.0 - 195.12) <16E3C45A-3C24-33D7-AD1C-1F6A215E57E7> /System/Library/PrivateFrameworks/Lexicon.framework/Versions/A/Lexicon
+       0x18fe0f000 -        0x18ff7c417  libSparse.dylib (184.80.2) <C479DB8D-CF22-336C-B455-0CF900D96647> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparse.dylib
+       0x18ff7d000 -        0x1900100ff  com.apple.SystemConfiguration (1.21 - 1.21) <3E3C91CD-C9CE-3186-B49F-FBF3E6F1696B> /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration
+       0x190011000 -        0x19004557b  libCRFSuite.dylib (55) <5220F98F-4B63-31DF-B1BA-F507F9441C35> /usr/lib/libCRFSuite.dylib
+       0x19030e000 -        0x1912f041f  com.apple.Foundation (6.9 - 5026.5.4) <49DD529F-1708-3767-997B-1A4639A07536> /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+       0x1914a0000 -        0x1915c0cbf  com.apple.CoreDisplay (291.4 - 291.4) <C5ACFCC5-A8E3-3DA5-BEB8-F3F3B932BD63> /System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay
+       0x1915c1000 -        0x191983c1f  com.apple.audio.AudioToolboxCore (1.0 - 1556.604) <868DF717-7563-39D0-95EB-19AB37629A5A> /System/Library/PrivateFrameworks/AudioToolboxCore.framework/Versions/A/AudioToolboxCore
+       0x191984000 -        0x191bacf1f  com.apple.CoreText (877.4.0.7 - 877.4.0.7) <F7410CD3-EF38-3134-868D-C8633BD5D7F7> /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText
+       0x191bad000 -        0x192342e7f  com.apple.audio.CoreAudio (5.0 - 5.0) <242B3E7E-7A94-33DA-9D5B-C6739557CEB9> /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
+       0x192343000 -        0x192761aff  com.apple.security (7.0 - 61901.120.67) <8FDCF5BF-61B9-3D69-BF9E-D134D220B8D9> /System/Library/Frameworks/Security.framework/Versions/A/Security
+       0x192762000 -        0x192a37d53  libicucore.A.dylib (76142.5.1.200) <EB0C6EA9-E934-3776-9FD1-AF5E473552AA> /usr/lib/libicucore.A.dylib
+       0x192a38000 -        0x192a41e5f  libsystem_darwin.dylib (1752.120.2) <8858F025-745A-388E-9544-080781CC9A69> /usr/lib/system/libsystem_darwin.dylib
+       0x192a42000 -        0x192d39cbf  com.apple.CoreServices.CarbonCore (1333 - 1333) <D5517285-3BB1-37C7-9ECA-B9E6D99DF7CF> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/CarbonCore
+       0x192d3a000 -        0x192d79c1b  com.apple.CoreServicesInternal (505 - 505) <0FBC8F4C-B825-381C-8728-762844E11392> /System/Library/PrivateFrameworks/CoreServicesInternal.framework/Versions/A/CoreServicesInternal
+       0x192d7a000 -        0x192db91bf  com.apple.CSStore (1141.1 - 1141.1) <1E543EF0-6C96-389F-9B2A-9614B625D198> /System/Library/PrivateFrameworks/CoreServicesStore.framework/Versions/A/CoreServicesStore
+       0x192dba000 -        0x192ea225f  com.apple.framework.IOKit (2.0.2 - 100231.120.3) <13C5D661-B23A-3AD8-88BB-2DE56023B840> /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+       0x192ea3000 -        0x192eb51b6  libsystem_notify.dylib (348.120.4) <64D76451-1E0C-369B-A631-54DA3140E083> /usr/lib/system/libsystem_notify.dylib
+       0x1947ef000 -        0x1948053ff  com.apple.UniformTypeIdentifiers (709 - 709) <D24AEC54-C332-3707-A7CC-BB0710F6D193> /System/Library/Frameworks/UniformTypeIdentifiers.framework/Versions/A/UniformTypeIdentifiers
+       0x194ce1000 -        0x194db995f  libboringssl.dylib (532.120.8) <611779E1-4B3F-310E-B070-1062D4707AA4> /usr/lib/libboringssl.dylib
+       0x194dba000 -        0x19516f1df  com.apple.CFNetwork (1.0 - 3860.600.21) <96293549-E281-3713-8ABF-886F0F966951> /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
+       0x195170000 -        0x19518af7b  libsystem_networkextension.dylib (2226.121.1) <0331EE20-A1FB-3C0D-990A-F65939CFF505> /usr/lib/system/libsystem_networkextension.dylib
+       0x19518b000 -        0x19518c067  libenergytrace.dylib (23) <E59503ED-FB38-3FBC-8999-83124D31645B> /usr/lib/libenergytrace.dylib
+       0x19518d000 -        0x19520cf3f  libMobileGestalt.dylib (1484.120.3) <FA923504-DDCB-3138-ACC5-FB1D38183C78> /usr/lib/libMobileGestalt.dylib
+       0x19520d000 -        0x195224fdf  libsystem_asl.dylib (406) <F40838DF-2F15-3F62-970F-DEE25706BF1B> /usr/lib/system/libsystem_asl.dylib
+       0x195225000 -        0x195248797  com.apple.TCC (1.0 - 1) <46AC4453-DB23-3C07-A0EB-A68277A24098> /System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC
+       0x195249000 -        0x1957ffbbf  com.apple.SkyLight (1.600.0 - 922.7) <6F1978A2-1B8A-3A44-903D-532EED7106EB> /System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight
+       0x195800000 -        0x195f5503f  com.apple.CoreGraphics (2.0 - 1965.5.1) <3B96EADF-571C-3690-B5CE-7672B45CE859> /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
+       0x195f56000 -        0x1960fdb8b  com.apple.ColorSync (4.13.0 - 3813.5.1) <24C07C0F-03C6-302B-9E54-5ED3A01B730E> /System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync
+       0x196552000 -        0x19693ff5f  com.apple.CoreData (120 - 1526) <0A6EBD87-B6D8-3CFB-88A9-A091CE155610> /System/Library/Frameworks/CoreData.framework/Versions/A/CoreData
+       0x196940000 -        0x19695bd5f  com.apple.ProtocolBuffer (1 - 310.25.2.9.2) <52A2B4A4-4DB3-3FC3-B3F1-21E64D2F2003> /System/Library/PrivateFrameworks/ProtocolBuffer.framework/Versions/A/ProtocolBuffer
+       0x19695c000 -        0x196b44a2f  libsqlite3.dylib (382) <2197AD4A-E0F8-38FF-924C-D9A97343680F> /usr/lib/libsqlite3.dylib
+       0x196be7000 -        0x196cd849f  com.apple.BaseBoard (732.1.1 - 732.1.1) <03F3FD64-6BF3-326A-8004-C4EE9563571A> /System/Library/PrivateFrameworks/BaseBoard.framework/Versions/A/BaseBoard
+       0x196cd9000 -        0x196d4493f  com.apple.RunningBoardServices (1.0 - 1015.100.16) <0E844E62-6BFB-3446-85DC-61C0A6488511> /System/Library/PrivateFrameworks/RunningBoardServices.framework/Versions/A/RunningBoardServices
+       0x196d45000 -        0x196db8c37  com.apple.AE (944 - 944) <0B347618-0BCF-3104-84B4-C0C0909E9C80> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/AE.framework/Versions/A/AE
+       0x196db9000 -        0x196dcad87  libdns_services.dylib (2881.120.11) <E8717AA2-B706-36BB-A8FF-7EB3E64E58D5> /usr/lib/libdns_services.dylib
+       0x196dcb000 -        0x196dd3387  libsystem_symptoms.dylib (2169.120.7) <F5029F5C-1BF3-31C7-892E-BC8606AC829E> /usr/lib/system/libsystem_symptoms.dylib
+       0x196dd4000 -        0x1985f175f  com.apple.Network (1.0 - 5812.121.1) <C901F589-30E9-3847-B8FD-0DA14F3E8A09> /System/Library/Frameworks/Network.framework/Versions/A/Network
+       0x1985f2000 -        0x198621ddf  com.apple.analyticsd (1.0 - 1) <5F3582B5-C44E-3B5A-8C3D-E4DA63B8C6D8> /System/Library/PrivateFrameworks/CoreAnalytics.framework/Versions/A/CoreAnalytics
+       0x198622000 -        0x1986238bb  libDiagnosticMessagesClient.dylib (113) <0770F750-6155-3991-9FDE-968CB42647DF> /usr/lib/libDiagnosticMessagesClient.dylib
+       0x198624000 -        0x19869033f  com.apple.spotlight.metadata.utilities (1.0 - 2418.5.9.101) <B4AB943C-5D50-3ADF-8175-4B56301C6DC3> /System/Library/PrivateFrameworks/MetadataUtilities.framework/Versions/A/MetadataUtilities
+       0x198691000 -        0x19871cb5f  com.apple.Metadata (26.5 - 2418.5.9.101) <E968E783-21CF-32A8-9C69-6C6870C36CDC> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Metadata
+       0x19871d000 -        0x1987261eb  com.apple.DiskArbitration (2.7 - 2.7) <18127B89-B783-3D13-882D-4F601449EA8A> /System/Library/Frameworks/DiskArbitration.framework/Versions/A/DiskArbitration
+       0x198727000 -        0x198b4b063  com.apple.vImage (8.1 - 632.120.2) <F2338A5A-848F-3745-9C95-92835FED69BC> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vImage.framework/Versions/A/vImage
+       0x198b4c000 -        0x198f61cdf  com.apple.QuartzCore (1195.14.4 - 1195.14.4) <C57B87A6-283C-3588-87EF-145BBEE8E257> /System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore
+       0x198f62000 -        0x198fb34ff  libFontRegistry.dylib (408.4.0.1) <3480BBE1-4AE8-3066-BCB7-EAA15F37C64E> /System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/ATS.framework/Versions/A/Resources/libFontRegistry.dylib
+       0x19927a000 -        0x199287aff  com.apple.OpenDirectory (26.5 - 666.100.1) <96F04359-D02E-3990-B798-4FE4448067BE> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/OpenDirectory
+       0x199288000 -        0x1992b127f  com.apple.CFOpenDirectory (26.5 - 666.100.1) <270997B5-219E-3253-AFDD-619027EFDC6B> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/Frameworks/CFOpenDirectory.framework/Versions/A/CFOpenDirectory
+       0x1992b2000 -        0x1992be91b  com.apple.CoreServices.FSEvents (1413.100.6 - 1413.100.6) <7AA0D80A-3240-37B5-94D2-0C9B14103993> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/FSEvents
+       0x1992bf000 -        0x1992e80df  com.apple.coreservices.SharedFileList (225 - 225) <997A2621-7998-38C3-B92C-7BD5A2A2B066> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SharedFileList.framework/Versions/A/SharedFileList
+       0x1992e9000 -        0x1992ec08f  libapp_launch_measurement.dylib (17) <7760B2FE-B4E6-3244-B941-0A5277879853> /usr/lib/libapp_launch_measurement.dylib
+       0x1992ed000 -        0x1993359bf  com.apple.CoreAutoLayout (1.0 - 34) <A53A5066-0626-325A-BADA-9F438AE63BB2> /System/Library/PrivateFrameworks/CoreAutoLayout.framework/Versions/A/CoreAutoLayout
+       0x199336000 -        0x19941c13b  libxml2.2.dylib (39.10) <F9320B7C-5B95-3777-B991-646318D41D0C> /usr/lib/libxml2.2.dylib
+       0x19941d000 -        0x19949d85f  com.apple.CoreVideo (1.8 - 734.4) <8A36CB95-D65E-3838-8837-22FD9A7E3D9C> /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo
+       0x19949e000 -        0x1994a0f5f  com.apple.loginsupport (3.0 - 264.4.1) <867D855C-0CD1-32D3-9345-83E99EC84CB6> /System/Library/PrivateFrameworks/login.framework/Versions/A/Frameworks/loginsupport.framework/Versions/A/loginsupport
+       0x1994df000 -        0x19950b65f  com.apple.UserManagement (1.0 - 1) <20A5542F-F968-33E9-ABEE-DF2829C727ED> /System/Library/PrivateFrameworks/UserManagement.framework/Versions/A/UserManagement
+       0x19b06f000 -        0x19b0a7257  libsystem_containermanager.dylib (725.120.2) <518BE44D-AA31-31E6-B44B-A37AD5E47040> /usr/lib/system/libsystem_containermanager.dylib
+       0x19b0a8000 -        0x19b0c425f  com.apple.IOSurface (393.5.7 - 393.5.7) <B572C01C-59C9-3A03-9EA2-899DE87F3702> /System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface
+       0x19b0c5000 -        0x19b0cf05f  com.apple.IOAccelerator (487.4.3 - 487.4.3) <1A671DA5-99DE-3CFC-83BF-2563BFA4E32F> /System/Library/PrivateFrameworks/IOAccelerator.framework/Versions/A/IOAccelerator
+       0x19b0d0000 -        0x19b3a9d5f  com.apple.Metal (373.2 - 373.2) <A5124C88-37B2-3F0D-94AC-B9A984420F0C> /System/Library/Frameworks/Metal.framework/Versions/A/Metal
+       0x19b3aa000 -        0x19b3d305f  com.apple.audio.caulk (1.0 - 214.600.10) <47E71130-9608-3D99-ACEB-DF5638BC08DF> /System/Library/PrivateFrameworks/caulk.framework/Versions/A/caulk
+       0x19b3d4000 -        0x19b57529f  com.apple.CoreMedia (1.0 - 3320.8.5.1) <A762A5D3-6049-3849-891B-5805936DAC48> /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia
+       0x19b576000 -        0x19b84525f  libFontParser.dylib (435.4.0.2) <56AE3539-AFDA-3C4B-A32F-D6470E9C877B> /System/Library/PrivateFrameworks/FontServices.framework/libFontParser.dylib
+       0x19bb9b000 -        0x19beda8df  com.apple.ImageIO (3.3.0 - 2784.5.4) <6018F9E4-A50C-31EC-A4D4-3591A6BA11EE> /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO
+       0x19bedb000 -        0x19c3c5f9f  com.apple.CoreImage (19.0.0 - 1592.120.2) <49179CFD-DE4F-3C89-9139-1FFCCABD1AC2> /System/Library/Frameworks/CoreImage.framework/Versions/A/CoreImage
+       0x19c3c6000 -        0x19c47fddf  com.apple.MetalPerformanceShaders.MPSCore (1.0 - 1) <5ECFEA4E-D0ED-3809-AE36-F6A226913EC1> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/MPSCore
+       0x19c480000 -        0x19c4845d7  libsystem_configuration.dylib (1405.120.5) <0F7BBC1C-3D50-3E59-A31F-E4672A80BCEB> /usr/lib/system/libsystem_configuration.dylib
+       0x19c485000 -        0x19c48b8cf  libsystem_sandbox.dylib (2680.120.12) <EC3A75EA-44C0-3A0B-9BF7-71C117B0A9C6> /usr/lib/system/libsystem_sandbox.dylib
+       0x19c48c000 -        0x19c48d17f  com.apple.AggregateDictionary (1.0 - 1) <9526ACB3-9F77-3C63-94E3-1F7FF9FFD848> /System/Library/PrivateFrameworks/AggregateDictionary.framework/Versions/A/AggregateDictionary
+       0x19c48e000 -        0x19c4924d3  com.apple.AppleSystemInfo (3.1.5 - 3.1.5) <1AF0471A-7CA4-363A-A88C-878F918559C3> /System/Library/PrivateFrameworks/AppleSystemInfo.framework/Versions/A/AppleSystemInfo
+       0x19c493000 -        0x19c49446b  liblangid.dylib (140) <150F6708-1CA6-341A-A2A0-46CB1BA1A23C> /usr/lib/liblangid.dylib
+       0x19c495000 -        0x19c5b445f  com.apple.CoreNLP (1.0 - 313) <50C546E9-E6E0-3E9F-9E7A-9473578D7433> /System/Library/PrivateFrameworks/CoreNLP.framework/Versions/A/CoreNLP
+       0x19c5b5000 -        0x19c5bb91f  com.apple.LinguisticData (1.0 - 483.10) <88A7B02D-D5D3-3120-9D38-BCD3B8A1BC08> /System/Library/PrivateFrameworks/LinguisticData.framework/Versions/A/LinguisticData
+       0x19c5bc000 -        0x19d643bcf  libBNNS.dylib (1961.120.8) <27D26BDE-14F4-3EBC-9A1F-195C0F69EFB7> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBNNS.dylib
+       0x19d644000 -        0x19d78146f  libvDSP.dylib (1126.100.7) <81359684-F2CB-3A26-A032-265A85B354EB> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvDSP.dylib
+       0x19d7b6000 -        0x19d7ef267  com.apple.IOMobileFramebuffer (343.0.0 - 343.0.0) <AD6AF1CD-4106-32CB-9512-A51BD8DAC459> /System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Versions/A/IOMobileFramebuffer
+       0x19d9e8000 -        0x19d9ff6df  com.apple.MobileKeyBag (2.0 - 1.0) <DD679B3D-7C31-3A73-AA3F-E38AE71F6082> /System/Library/PrivateFrameworks/MobileKeyBag.framework/Versions/A/MobileKeyBag
+       0x19da00000 -        0x19da0e0ff  com.apple.AssertionServices (1.0 - 1015.100.16) <2AFED4E5-1BEF-3620-A118-13C2487C5E8A> /System/Library/PrivateFrameworks/AssertionServices.framework/Versions/A/AssertionServices
+       0x19da0f000 -        0x19daa1a9f  com.apple.securityfoundation (6.0 - 55293) <B186B3B6-62A5-3680-8FB4-1CC6DFB3D551> /System/Library/Frameworks/SecurityFoundation.framework/Versions/A/SecurityFoundation
+       0x19daa2000 -        0x19dad32ff  com.apple.coreservices.BackgroundTaskManagement (1.0 - 104) <C8C301D5-8180-31EF-ACC6-F754D14E23AC> /System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/Versions/A/BackgroundTaskManagement
+       0x19dadf000 -        0x19dae21fb  libquarantine.dylib (196.120.2) <5849009B-ACA3-3796-94C4-BBDF8D300EBA> /usr/lib/system/libquarantine.dylib
+       0x19dae3000 -        0x19daee2bf  libCheckFix.dylib (33) <60BF3A9B-F3E5-3AF0-ADE5-F86DEBD5CC5C> /usr/lib/libCheckFix.dylib
+       0x19daef000 -        0x19db067ab  libcoretls.dylib (187.100.3) <888DACFD-0135-3166-83EE-4E14D9A4A98B> /usr/lib/libcoretls.dylib
+       0x19db07000 -        0x19db18273  libbsm.0.dylib (90) <D82537E0-FE06-3158-BC46-D1073D1D4384> /usr/lib/libbsm.0.dylib
+       0x19db19000 -        0x19db77c6b  libmecab.dylib (1121.5.1) <B8A7C8DB-0176-3E90-929C-238A56EF45B8> /usr/lib/libmecab.dylib
+       0x19db78000 -        0x19db7a41b  libgermantok.dylib (31) <55193FF8-D101-3B4B-B6FB-01EA87FC3D37> /usr/lib/libgermantok.dylib
+       0x19db7b000 -        0x19db8ee3f  libLinearAlgebra.dylib (1551.100.26) <3849C130-9327-3672-88E1-B0E548F4EB82> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLinearAlgebra.dylib
+       0x19db8f000 -        0x19dde517f  com.apple.MetalPerformanceShaders.MPSNeuralNetwork (1.0 - 1) <A8E8C36C-8F11-3ED5-B9B3-2810EDDD4D77> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNeuralNetwork.framework/Versions/A/MPSNeuralNetwork
+       0x19dde6000 -        0x19de3a19f  com.apple.MetalPerformanceShaders.MPSRayIntersector (1.0 - 1) <FCB4E780-9954-345D-B82F-9D319958448E> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSRayIntersector.framework/Versions/A/MPSRayIntersector
+       0x19dfce000 -        0x19dfff57f  com.apple.MetalPerformanceShaders.MPSMatrix (1.0 - 1) <21591139-CD3C-36AB-8191-28193ACD17A7> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSMatrix.framework/Versions/A/MPSMatrix
+       0x19e000000 -        0x19e1cfcdf  com.apple.MetalPerformanceShaders.MPSNDArray (1.0 - 1) <1CBC037E-8038-32F6-880A-6F3825544713> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/MPSNDArray
+       0x19e1d0000 -        0x19e2641df  com.apple.MetalPerformanceShaders.MPSImage (1.0 - 1) <35130CF5-F99D-3CED-9993-48AEE13ECA36> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/MPSImage
+       0x19e265000 -        0x19e2704b3  com.apple.AppleFSCompression (174.100.2 - 1.0) <1B79BCD7-4B46-302B-8008-86CBD62FEB0A> /System/Library/PrivateFrameworks/AppleFSCompression.framework/Versions/A/AppleFSCompression
+       0x19e271000 -        0x19e27d0a3  libbz2.1.0.dylib (49) <928515D6-6108-3757-97F4-256F9F9CFBC8> /usr/lib/libbz2.1.0.dylib
+       0x19e27e000 -        0x19e284d03  libsystem_coreservices.dylib (191.4.5) <9576143B-C303-35A3-BA63-1FD06EDA2BB1> /usr/lib/system/libsystem_coreservices.dylib
+       0x19e285000 -        0x19e2b6adf  com.apple.CoreServices.OSServices (1141.1 - 1141.1) <F42F7727-9C73-3148-B41C-186607715B54> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/OSServices.framework/Versions/A/OSServices
+       0x19e7fa000 -        0x19e808d97  libz.1.dylib (100.120.1) <863BB312-F115-32B0-889F-D3B42857A7A6> /usr/lib/libz.1.dylib
+       0x19e809000 -        0x19e846a77  libsystem_m.dylib (3312.100.1) <A7E0863C-101A-31A0-922B-ED9B02626151> /usr/lib/system/libsystem_m.dylib
+       0x19e847000 -        0x19e847c9b  libcharset.1.dylib (115.120.2) <338A5252-594A-3AC5-B274-5AB3CE5820C6> /usr/lib/libcharset.1.dylib
+       0x19e848000 -        0x19e84b527  libmacho.dylib (1378) <755441B4-C034-3E3A-8E3C-F424FBB28261> /usr/lib/system/libmacho.dylib
+       0x19e84c000 -        0x19e864dc3  libkxld.dylib (12377.121.6) <AC5F4062-6A0E-36D2-B06E-D6192FC77B7D> /usr/lib/system/libkxld.dylib
+       0x19e865000 -        0x19e8723a7  libcommonCrypto.dylib (600035) <CE357BB1-2D49-37CC-9FFE-D093936B1475> /usr/lib/system/libcommonCrypto.dylib
+       0x19e873000 -        0x19e87cca3  libunwind.dylib (2100.2) <FC8F0C4E-6FB0-3E27-ABEF-B0FA720CD5E4> /usr/lib/system/libunwind.dylib
+       0x19e87d000 -        0x19e884349  liboah.dylib (367.9) <8651ED4F-6506-3788-B56B-32EE414A85CA> /usr/lib/liboah.dylib
+       0x19e885000 -        0x19e88f7ff  libcopyfile.dylib (240) <8ACFAC7A-88E9-3EF4-853F-A9140FF110E5> /usr/lib/system/libcopyfile.dylib
+       0x19e890000 -        0x19e893987  libcompiler_rt.dylib (103.3) <AA79151F-C19D-3C7C-92F8-B10F04D82C1C> /usr/lib/system/libcompiler_rt.dylib
+       0x19e894000 -        0x19e89878b  libsystem_collections.dylib (1752.120.2) <72DB5BE7-EF78-37D0-8AAD-53E37CFE4287> /usr/lib/system/libsystem_collections.dylib
+       0x19e899000 -        0x19e89c4cf  libsystem_secinit.dylib (168.100.7) <E525C566-CDA4-3D99-B12B-1615FD54A1F3> /usr/lib/system/libsystem_secinit.dylib
+       0x19e89d000 -        0x19e89fbf7  libremovefile.dylib (85.100.6) <635E661D-80A7-340D-A165-3F7D318FDFC9> /usr/lib/system/libremovefile.dylib
+       0x19e8a0000 -        0x19e8a0f27  libkeymgr.dylib (31) <8C08891A-DF1C-3DCC-AB64-4742FD6BE9BA> /usr/lib/system/libkeymgr.dylib
+       0x19e8a1000 -        0x19e8a9e37  libsystem_dnssd.dylib (2881.120.11) <6F45DF3F-233B-3BC3-BA8C-B43E7DA884BF> /usr/lib/system/libsystem_dnssd.dylib
+       0x19e8aa000 -        0x19e8af09b  libcache.dylib (95) <189B576E-6176-3F82-8FA4-5914B0BEAEE7> /usr/lib/system/libcache.dylib
+       0x19e8b0000 -        0x19e8b1ce3  libSystem.B.dylib (1356) <D65E4112-C151-3FF8-BEB7-4841436012D6> /usr/lib/libSystem.B.dylib
+       0x19e8b2000 -        0x19e8b3fcf  libfakelink.dylib (5) <C7FBDAB2-BA25-3B1B-924B-6CD5EB501D3D> /usr/lib/libfakelink.dylib
+       0x19e8b4000 -        0x19e8b4a33  com.apple.SoftLinking (1.0 - 71) <B47F8999-CDB3-308F-9129-E690590605D8> /System/Library/PrivateFrameworks/SoftLinking.framework/Versions/A/SoftLinking
+       0x19e8ea000 -        0x19e8f12bb  libiconv.2.dylib (115.120.2) <7C02D8F4-1921-323C-9D3D-A5D9B0ACDD78> /usr/lib/libiconv.2.dylib
+       0x19e905000 -        0x19e9fcedf  libarchive.2.dylib (167.120.3) <98ED60D0-2C5C-31A2-81BA-17C9C2312B7E> /usr/lib/libarchive.2.dylib
+       0x19e9fd000 -        0x19ea6285b  com.apple.SearchKit (1.4.2 - 1.4.2) <B73B7F8E-666B-33EA-AC89-9DE4F7C25835> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SearchKit.framework/Versions/A/SearchKit
+       0x19ea63000 -        0x19ea6b18f  libThaiTokenizer.dylib (28) <43BAB012-1CCE-3DDC-9832-3A93EF0BAD9C> /usr/lib/libThaiTokenizer.dylib
+       0x19ea6c000 -        0x19ea8ff37  com.apple.applesauce (1.0 - 17.7) <9F8F8959-64E3-3B88-BC05-20ACA5436052> /System/Library/PrivateFrameworks/AppleSauce.framework/Versions/A/AppleSauce
+       0x19ea90000 -        0x19eaa84ab  libapple_nghttp2.dylib (37.120.3) <7C8B8B14-EC40-3F5B-8265-8975D4D4E83B> /usr/lib/libapple_nghttp2.dylib
+       0x19eaa9000 -        0x19eacfac3  libSparseBLAS.dylib (1551.100.26) <EF675037-43BA-3616-8BEF-662BA272F3D7> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparseBLAS.dylib
+       0x19ead0000 -        0x19ead163f  com.apple.MetalPerformanceShaders.MetalPerformanceShaders (1.0 - 1) <1FC17E05-127E-3222-B3A2-72912C49821C> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders
+       0x19ead2000 -        0x19ead7ff7  libpam.2.dylib (35) <24C42EB6-FC23-3D66-A260-CAD78EF8637B> /usr/lib/libpam.2.dylib
+       0x19ead8000 -        0x19ebacd97  libcompression.dylib (193.120.2) <F9FEA7C5-8DE1-3EE6-BFD3-E8B5698D73A6> /usr/lib/libcompression.dylib
+       0x19ebad000 -        0x19ebb1267  libQuadrature.dylib (8) <A285FC62-DE15-317B-8451-619953D3660A> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libQuadrature.dylib
+       0x19ebb2000 -        0x19fd8294f  libLAPACK.dylib (1551.100.26) <7275296D-74F2-3020-B2C5-E2EA0E7A6F7A> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLAPACK.dylib
+       0x19fd83000 -        0x19fdd943f  com.apple.DictionaryServices (1.2 - 382) <1C33980B-2B1B-3374-8DFF-C0589BDA8D37> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/DictionaryServices.framework/Versions/A/DictionaryServices
+       0x19fdda000 -        0x19fdf84f7  liblzma.5.dylib (21) <9F5AA0F6-7C29-3699-8AA3-C7B56284D3F4> /usr/lib/liblzma.5.dylib
+       0x19fdf9000 -        0x19fdfa85f  libcoretls_cfhelpers.dylib (187.100.3) <236BD946-7627-367C-8150-FCC9297471E1> /usr/lib/libcoretls_cfhelpers.dylib
+       0x19fdfb000 -        0x19fe6e5c3  com.apple.APFS (2811.120.14 - 2811.120.14) <37C876CB-358E-3900-A8EF-93D70E577B7C> /System/Library/PrivateFrameworks/APFS.framework/Versions/A/APFS
+       0x19fe6f000 -        0x19fe7d693  libxar.1.dylib (503) <689E5ED9-2D46-3B4C-8942-B5A6D7495445> /usr/lib/libxar.1.dylib
+       0x19fe7e000 -        0x19fe8179b  libutil.dylib (73) <93D2F3FE-6001-3A87-BF89-3ECABFF334CE> /usr/lib/libutil.dylib
+       0x19fe82000 -        0x19feaccdf  libxslt.1.dylib (21.13) <EABDBD76-C455-3D16-A1EE-4370F95E8D3E> /usr/lib/libxslt.1.dylib
+       0x19feb5000 -        0x19ff2e587  libvMisc.dylib (1126.100.7) <73154851-2341-34B7-8214-625C9219A676> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvMisc.dylib
+       0x19ff2f000 -        0x19ffbe45f  libate.dylib (3.0.9) <30643AB8-BA08-3222-9AD2-64248E503B89> /usr/lib/libate.dylib
+       0x19ffc8000 -        0x19ffdb1bf  com.apple.CrashReporterSupport (10.13 - 15140) <482F92F1-D855-36EC-8E3D-C084CFA61B27> /System/Library/PrivateFrameworks/CrashReporterSupport.framework/Versions/A/CrashReporterSupport
+       0x1a011f000 -        0x1a015ff9f  com.apple.pluginkit.framework (1.0 - 1) <6A017CC8-84D1-36E5-ADE4-2A2EDC08D67F> /System/Library/PrivateFrameworks/PlugInKit.framework/Versions/A/PlugInKit
+       0x1a01d6000 -        0x1a021e9ff  com.apple.AppleVAFramework (6.2.10 - 6.2.10) <6CFBB631-D1EF-3D92-AE69-6758E7BDE4C5> /System/Library/PrivateFrameworks/AppleVA.framework/Versions/A/AppleVA
+       0x1a021f000 -        0x1a0239ccf  libexpat.1.dylib (47) <B7EE1C84-0D24-3B3F-8A1F-94ADDCFE777C> /usr/lib/libexpat.1.dylib
+       0x1a023a000 -        0x1a0243bd3  libheimdal-asn1.dylib (710.100.4) <AF872616-7404-3D91-BA6B-A723D4269665> /usr/lib/libheimdal-asn1.dylib
+       0x1a0363000 -        0x1a0424edf  com.apple.MediaExperience (1.0 - 1) <507B3FE7-C5C1-30DB-935C-C478FF7B4096> /System/Library/PrivateFrameworks/MediaExperience.framework/Versions/A/MediaExperience
+       0x1a0452000 -        0x1a04617ff  com.apple.GraphVisualizer (1.0 - 307) <6F1E4885-F5B7-3B50-9C33-044B6925A07F> /System/Library/PrivateFrameworks/GraphVisualizer.framework/Versions/A/GraphVisualizer
+       0x1a0462000 -        0x1a04a151f  com.apple.OTSVG (1.0 - 877.4.0.7) <666515E5-7CF8-349D-952E-EDD2210CF63D> /System/Library/PrivateFrameworks/OTSVG.framework/Versions/A/OTSVG
+       0x1a04a2000 -        0x1a04aec7f  com.apple.xpc.AppServerSupport (1.0 - 3102.120.13) <AB36D838-16DB-3974-ABEC-220B5026013E> /System/Library/PrivateFrameworks/AppServerSupport.framework/Versions/A/AppServerSupport
+       0x1a04af000 -        0x1a04b5abf  libspindump.dylib (419.10) <5EAE94A8-4A96-3DBD-8FC6-DA684427813F> /usr/lib/libspindump.dylib
+       0x1a04b6000 -        0x1a0576dff  com.apple.Heimdal (4.0 - 2.0) <29B023E7-2213-362C-80BD-8A463A229936> /System/Library/PrivateFrameworks/Heimdal.framework/Versions/A/Heimdal
+       0x1a0845000 -        0x1a08896ef  com.apple.AppleJPEG (1.0 - 1) <63F815E9-899E-3F5E-8837-43C168F606C6> /System/Library/PrivateFrameworks/AppleJPEG.framework/Versions/A/AppleJPEG
+       0x1a088a000 -        0x1a0a4a92f  libJP2.dylib (2784.5.4) <A3392AA7-53EF-3B19-9A87-505CBACE40C2> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJP2.dylib
+       0x1a0a4b000 -        0x1a0a4ce1f  com.apple.WatchdogClient.framework (1.0 - 333) <05DDF467-0A3F-3F3F-821F-3063D15BDDF6> /System/Library/PrivateFrameworks/WatchdogClient.framework/Versions/A/WatchdogClient
+       0x1a0a4d000 -        0x1a0a92c1f  com.apple.MultitouchSupport.framework (9450.2 - 9450.2) <20C49E65-4FDC-3FA2-ADD2-8BD540F8849B> /System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/A/MultitouchSupport
+       0x1a0a93000 -        0x1a0fe929f  com.apple.VideoToolbox (1.0 - 3320.8.5.1) <0B641B4E-092B-3EC7-A20E-B99157F4DDB7> /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox
+       0x1a0fea000 -        0x1a100f20f  libAudioToolboxUtility.dylib (1556.604) <8679E444-23B4-3B9F-8D0A-18ACEED541C5> /usr/lib/libAudioToolboxUtility.dylib
+       0x1a1010000 -        0x1a103a01f  libPng.dylib (2784.5.4) <42EE7A25-5004-3435-A453-0158C53A6C93> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libPng.dylib
+       0x1a103b000 -        0x1a109ba77  libTIFF.dylib (2784.5.4) <FC3ACF96-0841-360F-B36A-50A3B08AF198> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libTIFF.dylib
+       0x1a109c000 -        0x1a10bb257  com.apple.IOPresentment (67 - 67) <C9C0A630-F275-3ABE-BFE2-86ECE91F83CA> /System/Library/PrivateFrameworks/IOPresentment.framework/Versions/A/IOPresentment
+       0x1a10bc000 -        0x1a10c07d3  com.apple.GPUWrangler (8.1.12 - 8.1.12) <1644240B-3D71-35E7-AC5B-2A69E6B29535> /System/Library/PrivateFrameworks/GPUWrangler.framework/Versions/A/GPUWrangler
+       0x1a10c1000 -        0x1a10c3913  libRadiance.dylib (2784.5.4) <86335ED6-B791-37F5-B57E-B6F9C50652D8> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libRadiance.dylib
+       0x1a10c4000 -        0x1a10c92f3  com.apple.DSExternalDisplay (3.1 - 380) <DDF7A5A5-72F8-3580-9FF6-2A02E4ADE864> /System/Library/PrivateFrameworks/DSExternalDisplay.framework/Versions/A/DSExternalDisplay
+       0x1a10ca000 -        0x1a10f4baf  libJPEG.dylib (2784.5.4) <5B4F384D-EC75-3A03-BA74-A644FDF3F722> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJPEG.dylib
+       0x1a1123000 -        0x1a11289fb  libGIF.dylib (2784.5.4) <D054410B-09D0-3856-B7CB-EEF320362B0B> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libGIF.dylib
+       0x1a1129000 -        0x1a113919f  com.apple.CMCaptureCore (1.0 - 665.120.8) <95190CD1-3456-355B-9369-5604AA49C1F3> /System/Library/PrivateFrameworks/CMCaptureCore.framework/Versions/A/CMCaptureCore
+       0x1a20b1000 -        0x1a211f86f  libusrtcp.dylib (5812.121.1) <54F1B848-D6B1-3DB0-B640-FA6A86262C1D> /usr/lib/libusrtcp.dylib
+       0x1a2120000 -        0x1a26c17bf  libswiftCore.dylib (6.3.2 - 6.3.2.1.3) <7669D858-D332-36C7-9C6C-4564FFBEA8D2> /usr/lib/swift/libswiftCore.dylib
+       0x1a2775000 -        0x1a27ca17f  libSessionUtility.dylib (398.601) <3D82E6A1-1D29-3274-84DD-BDF36B6F7962> /System/Library/PrivateFrameworks/AudioSession.framework/libSessionUtility.dylib
+       0x1a27cb000 -        0x1a299fc3f  com.apple.audio.toolbox.AudioToolbox (1.14 - 1.14) <B0ED86EE-4A99-3D39-AFC1-BC3361F630D8> /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+       0x1a29a0000 -        0x1a2a20b7f  com.apple.audio.AudioSession (1.0 - 398.601) <23137B46-437B-382A-BF06-17C82F58149B> /System/Library/PrivateFrameworks/AudioSession.framework/Versions/A/AudioSession
+       0x1a2a21000 -        0x1a2a3a39f  libAudioStatistics.dylib (262.601) <9AD96BE7-444B-3641-9B75-8F4EE1A686BF> /usr/lib/libAudioStatistics.dylib
+       0x1a2ab1000 -        0x1a2acd19b  libresolv.9.dylib (96) <90D545B0-52B4-335D-A075-4A7B83C01FC8> /usr/lib/libresolv.9.dylib
+       0x1a2ace000 -        0x1a2ae07e7  libsasl2.2.dylib (215) <28BFB13B-08D2-3705-A634-B4E888613489> /usr/lib/libsasl2.2.dylib
+       0x1a2cc9000 -        0x1a2da9337  libSMC.dylib (38) <CD66132B-7D67-36D2-82BC-FFFACBAAF05A> /usr/lib/libSMC.dylib
+       0x1a2e09000 -        0x1a2e15c17  com.apple.NetAuth (6.2 - 6.2) <F039515C-B344-37B5-B705-E58B48AD3C5D> /System/Library/PrivateFrameworks/NetAuth.framework/Versions/A/NetAuth
+       0x1a2e24000 -        0x1a2e31b1f  com.apple.perfdata (1.0 - 130) <63F6F6B4-A2A8-3647-BDEB-50508AE91B8F> /System/Library/PrivateFrameworks/perfdata.framework/Versions/A/perfdata
+       0x1a2e32000 -        0x1a2e3fc9f  libperfcheck.dylib (46) <F900A796-0FF7-3195-85CF-80D62DF5C477> /usr/lib/libperfcheck.dylib
+       0x1a2e40000 -        0x1a2e51187  com.apple.Kerberos (3.0 - 1) <D81F4821-8D01-394B-812B-657C3114A356> /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos
+       0x1a2e52000 -        0x1a2ea3aaf  com.apple.GSS (4.0 - 2.0) <9149B4E1-8502-3A93-9944-61323F4725E1> /System/Library/Frameworks/GSS.framework/Versions/A/GSS
+       0x1a2ea4000 -        0x1a2eb4d6f  com.apple.CommonAuth (4.0 - 2.0) <B703DB83-34E2-3728-89DF-41421EC67747> /System/Library/PrivateFrameworks/CommonAuth.framework/Versions/A/CommonAuth
+       0x1a2eb5000 -        0x1a2f9901f  com.apple.MobileAssets (1.0 - 1837.121.1) <95D9C5B8-40A8-3F25-B1FC-C4468D133923> /System/Library/PrivateFrameworks/MobileAsset.framework/Versions/A/MobileAsset
+       0x1a302c000 -        0x1a303b160  com.apple.CorePhoneNumbers (1.0 - 1) <CF1CBC2C-A525-3C79-B709-D5C23B2CB33A> /System/Library/PrivateFrameworks/CorePhoneNumbers.framework/Versions/A/CorePhoneNumbers
+       0x1a4c17000 -        0x1a4d0aa36  com.apple.combine (1.0 - 3023) <D757C287-429D-3F70-B903-C942A00F2DAA> /System/Library/Frameworks/Combine.framework/Versions/A/Combine
+       0x1a6f58000 -        0x1a6f5886f  com.apple.Accelerate.vecLib (3.11 - vecLib 3.11) <46556F2E-DD6B-3A4A-B2A3-4F844ED123EC> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/vecLib
+       0x1a6f7d000 -        0x1a6f7d98f  com.apple.CoreServices (1226 - 1226) <FF182FDE-8926-3DFB-8D12-C1258443F67F> /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+       0x1a71fc000 -        0x1a71fc417  com.apple.Accelerate (1.11 - Accelerate 1.11) <1DF31AEA-3D8E-382D-9493-D74635AA1CD4> /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate
+       0x1a80f8000 -        0x1a81075df  com.apple.SymptomDiagnosticReporter (1.0 - 411.120.4) <FF9F1A47-EE31-3182-9AA1-4D325D6DA8A0> /System/Library/PrivateFrameworks/SymptomDiagnosticReporter.framework/Versions/A/SymptomDiagnosticReporter
+       0x1a8108000 -        0x1a813625f  com.apple.PowerLog (1.0 - 1) <BE05FF5C-4DE3-3B2C-B20F-BC5D46938816> /System/Library/PrivateFrameworks/PowerLog.framework/Versions/A/PowerLog
+       0x1a8144000 -        0x1a81f56df  com.apple.DiscRecording (9.0.3 - 9030.4.5) <BCE71519-708B-3376-B013-2B691BD174AC> /System/Library/Frameworks/DiscRecording.framework/Versions/A/DiscRecording
+       0x1a81f6000 -        0x1a8227137  com.apple.MediaKit (16 - 938) <A01852D0-D4E4-30EC-A47C-3B0AB6711F2F> /System/Library/PrivateFrameworks/MediaKit.framework/Versions/A/MediaKit
+       0x1a8ce9000 -        0x1a8cff950  libswiftDispatch.dylib (1542.100.32) <460CFC58-0973-3A20-B504-A0A294C1E16D> /usr/lib/swift/libswiftDispatch.dylib
+       0x1a904a000 -        0x1a90d6c3f  com.apple.BoardServices (1.0 - 732.1.1) <B4561AEC-EE52-3447-960B-4D2F2F3EF720> /System/Library/PrivateFrameworks/BoardServices.framework/Versions/A/BoardServices
+       0x1a9117000 -        0x1a912453f  com.apple.GraphicsServices (1.0 - 1.0) <4236E533-C3F8-340F-A462-F15D599395A8> /System/Library/PrivateFrameworks/GraphicsServices.framework/Versions/A/GraphicsServices
+       0x1a9440000 -        0x1a9461e9f  com.apple.DebugSymbols (216 - 217) <13499229-A245-3C95-AC94-1DB8B274CF09> /System/Library/PrivateFrameworks/DebugSymbols.framework/Versions/A/DebugSymbols
+       0x1a9462000 -        0x1a95beddf  com.apple.CoreSymbolication (16.0 - 64575.53.2) <C2CC83D4-7E1C-3E78-AEC8-1ABDE74F9FAD> /System/Library/PrivateFrameworks/CoreSymbolication.framework/Versions/A/CoreSymbolication
+       0x1a95bf000 -        0x1a95c909f  com.apple.CoreTime (334.0.16.3 - 334.0.16.3) <FD342B51-EA5D-388C-9BAB-29F7670FE3FB> /System/Library/PrivateFrameworks/CoreTime.framework/Versions/A/CoreTime
+       0x1aaf17000 -        0x1aaf8959f  com.apple.BackBoardServices (1.0 - 1.0) <DDC32AF8-8864-3DE0-A855-5283510925B9> /System/Library/PrivateFrameworks/BackBoardServices.framework/Versions/A/BackBoardServices
+       0x1aaf8a000 -        0x1aafc54ef  com.apple.LDAPFramework (2.4.28 - 194.5) <53F32E19-D2E6-3256-9206-75B92E519199> /System/Library/Frameworks/LDAP.framework/Versions/A/LDAP
+       0x1aafc6000 -        0x1aafc77b7  com.apple.TrustEvaluationAgent (2.0 - 38) <B2593AAA-A99A-30C1-A0FC-3315ACC16951> /System/Library/PrivateFrameworks/TrustEvaluationAgent.framework/Versions/A/TrustEvaluationAgent
+       0x1ab0f5000 -        0x1ab1ae57f  com.apple.DiskImagesFramework (683.100.3 - 683.100.3) <C8288C8D-4483-3393-B249-E952FFAF1EBE> /System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/DiskImages
+       0x1ab1ef000 -        0x1ab2055bf  com.apple.RemoteServiceDiscovery (1.0 - 219.120.2) <CA4D9399-0E89-3014-92DD-B722678ED9F6> /System/Library/PrivateFrameworks/RemoteServiceDiscovery.framework/Versions/A/RemoteServiceDiscovery
+       0x1ab206000 -        0x1ab21bc3f  com.apple.xpc.RemoteXPC (1.0 - 3102.120.13) <8CA8360A-FE67-33A5-AEE4-097AEE5B945C> /System/Library/PrivateFrameworks/RemoteXPC.framework/Versions/A/RemoteXPC
+       0x1ab2b0000 -        0x1ab330f43  libcurl.4.dylib (166.0.0.0.1) <2F97CC24-F631-37B1-83CA-54632BF597FE> /usr/lib/libcurl.4.dylib
+       0x1ab337000 -        0x1ab37a25f  com.apple.AppSupport (1.0.0 - 29) <7410CCEF-077F-37FF-B0B0-5D65B0D2F66C> /System/Library/PrivateFrameworks/AppSupport.framework/Versions/A/AppSupport
+       0x1ab64b000 -        0x1ab64df3f  com.apple.InternationalTextSearch (1.0 - 1) <F227A966-D677-379F-BAEF-89DC18A81AB7> /System/Library/PrivateFrameworks/InternationalTextSearch.framework/Versions/A/InternationalTextSearch
+       0x1abc1e000 -        0x1abc1e3f7  libHeimdalProxy.dylib (88) <A963CA1C-050B-3E90-B2FF-D7989435DB5D> /System/Library/Frameworks/Kerberos.framework/Versions/A/Libraries/libHeimdalProxy.dylib
+       0x1abc49000 -        0x1abc67b9f  com.apple.StreamingZip (1.0 - 1) <F297C9A4-AEDF-3553-B20E-CD7DFC54CC0B> /System/Library/PrivateFrameworks/StreamingZip.framework/Versions/A/StreamingZip
+       0x1abcc1000 -        0x1abcc46bf  libswiftObjectiveC.dylib (951.7) <32C98979-0F18-3513-AFAB-2F5D2B9ED0B9> /usr/lib/swift/libswiftObjectiveC.dylib
+       0x1abcc5000 -        0x1abce26ff  libswiftos.dylib (1082) <49255E53-3F00-3F06-A64A-76A63C798956> /usr/lib/swift/libswiftos.dylib
+       0x1acc2c000 -        0x1accba85f  com.apple.proactive.support.ProactiveSupport (1.0 - 418.1) <29BBA828-5852-3A0C-94D9-C03990CB86CA> /System/Library/PrivateFrameworks/ProactiveSupport.framework/Versions/A/ProactiveSupport
+       0x1acdb7000 -        0x1acddb29f  com.apple.ASEProcessing (1.55.0 - 1.55.0) <9271A817-7C78-3210-8B0C-91A552667200> /System/Library/PrivateFrameworks/ASEProcessing.framework/Versions/A/ASEProcessing
+       0x1ae03a000 -        0x1ae108c1f  com.apple.audio.midi.CoreMIDI (2.0 - 88) <F649A68B-864A-3F02-959A-69FD9980B29C> /System/Library/Frameworks/CoreMIDI.framework/Versions/A/CoreMIDI
+       0x1aed48000 -        0x1aed4c75f  com.apple.IOSurfaceAccelerator (1.0.0 - 1.0.0) <70103161-0443-3F67-85D7-BD25455F271F> /System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/Versions/A/IOSurfaceAccelerator
+       0x1b3bf0000 -        0x1b3c039ff  com.apple.HID (1.0 - 1) <E5C2582B-2B2A-3B7E-A473-DF40A707C4C8> /System/Library/PrivateFrameworks/HID.framework/Versions/A/HID
+       0x1b86ab000 -        0x1b86ba1ff  com.apple.NetFS (6.0 - 4.0) <EC590F25-F5DD-35D6-A594-4BE577637264> /System/Library/Frameworks/NetFS.framework/Versions/A/NetFS
+       0x1b8c06000 -        0x1b8c08707  libswiftDarwin.dylib (377.120.8) <F2EED553-64EC-398C-98BA-32EFDFAE0FC3> /usr/lib/swift/libswiftDarwin.dylib
+       0x1bac66000 -        0x1bad4f4bf  libquic.dylib (5812.121.1) <18372066-7FBC-34AD-AD6B-A7D31A879F8D> /usr/lib/libquic.dylib
+       0x1bad5b000 -        0x1bad83eff  com.apple.private.SystemPolicy (1.0 - 1) <3B04FCE5-C2EF-3F95-94B5-C2E838F8F8F1> /System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy
+       0x1bbc30000 -        0x1bbcbebff  com.apple.LoggingSupport (1.0 - 1861.120.4) <2619A5F3-D97D-3946-B49A-5FA3164FB197> /System/Library/PrivateFrameworks/LoggingSupport.framework/Versions/A/LoggingSupport
+       0x1bbcbf000 -        0x1bbccbacb  com.apple.MallocStackLogging (1.0 - 65000) <782A39D3-C9FD-3E0B-B8FB-26E5D749BE57> /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+       0x1bbcf1000 -        0x1bbd49b3f  libmis.dylib (463.100.17) <B0F26447-E3DF-33C0-AF33-1109BD0701EA> /usr/lib/libmis.dylib
+       0x1bbd4a000 -        0x1bbd4dc5f  com.apple.gpusw.GPURawCounter (34 - 34) <A0191D2E-4C57-30F7-A206-78FB4188D01E> /System/Library/PrivateFrameworks/GPURawCounter.framework/Versions/A/GPURawCounter
+       0x1bbd4e000 -        0x1bbd6d87f  libswiftCoreAudio.dylib (411.601) <23AF0BE1-B688-3E32-90BB-920D0C00036A> /usr/lib/swift/libswiftCoreAudio.dylib
+       0x1bbd6e000 -        0x1bbd74327  libswiftCoreFoundation.dylib (2411) <4C233FFB-F11A-34AA-9515-74C21E8EE968> /usr/lib/swift/libswiftCoreFoundation.dylib
+       0x1bbd81000 -        0x1bbdcd843  libswiftXPC.dylib (128.120.2) <0AA69D52-271B-38E0-A156-8BD7F73A4C9C> /usr/lib/swift/libswiftXPC.dylib
+       0x1bbdcf000 -        0x1bbdcf8a3  libswiftIOKit.dylib (1) <D47B9CC1-B622-31ED-8957-FA79ED1718CE> /usr/lib/swift/libswiftIOKit.dylib
+       0x1bddfc000 -        0x1bde352c7  libbootpolicy.dylib (289.100.5) <53AF23CF-CBCF-35E7-A3D6-1C4742A617AD> /usr/lib/libbootpolicy.dylib
+       0x1bf8c0000 -        0x1bf8d788b  libswiftsimd.dylib (23) <C949C0B7-988E-3352-9778-3568FC2BC4EA> /usr/lib/swift/libswiftsimd.dylib
+       0x1c0fe5000 -        0x1c0fee37f  com.apple.IOAccelMemoryInfo (1.0 - 1) <3DFF5F1E-C080-3C9D-A8C5-3C56854BD24D> /System/Library/PrivateFrameworks/IOAccelMemoryInfo.framework/Versions/A/IOAccelMemoryInfo
+       0x1c26a8000 -        0x1c26b10be  libswiftCoreMIDI.dylib (6) <68160211-1089-3958-A8A1-3E8B3C389499> /usr/lib/swift/libswiftCoreMIDI.dylib
+       0x1c2e94000 -        0x1c2e9abbf  com.apple.MSUDataAccessor (1.0 - 1) <B73070EE-3FE8-354E-A3BB-84894636D3BA> /System/Library/PrivateFrameworks/MSUDataAccessor.framework/Versions/A/MSUDataAccessor
+       0x1c32bc000 -        0x1c331ea5f  com.apple.SoftwareUpdateCoreSupport (1.0 - 1) <34E714DF-AC10-3E52-862E-7FD8AE96EFA7> /System/Library/PrivateFrameworks/SoftwareUpdateCoreSupport.framework/Versions/A/SoftwareUpdateCoreSupport
+       0x1c6de0000 -        0x1c6e3723f  com.apple.biome.BiomeFoundation (1.0 - 209.18) <6F0943D8-345B-328C-8A5E-8D10B3BC3CC3> /System/Library/PrivateFrameworks/BiomeFoundation.framework/Versions/A/BiomeFoundation
+       0x1c9d0f000 -        0x1c9d1ca1f  libswiftMetal.dylib (373.2) <16B01E1B-6BDD-3C6B-9A8B-495C3B661B9B> /usr/lib/swift/libswiftMetal.dylib
+       0x1c9d1d000 -        0x1c9d23e05  libswiftCompression.dylib (11) <5EA10BB9-2198-33D7-811A-BE5EAE0A2EED> /usr/lib/swift/libswiftCompression.dylib
+       0x1cac4e000 -        0x1cacf8d5f  libFDR.dylib (1499.100.48) <62340EBF-17DB-3393-9653-003A30263E5D> /usr/lib/libFDR.dylib
+       0x1cad7a000 -        0x1cb344e9f  com.apple.biome.BiomeStreams (1.0 - 209.18) <B05E6A84-BC87-3977-B790-2391073FF393> /System/Library/PrivateFrameworks/BiomeStreams.framework/Versions/A/BiomeStreams
+       0x1cb818000 -        0x1cb82c8ff  com.apple.SoftwareUpdateCoreConnect (1.0 - 1) <8B5F0FE6-EFC0-32B3-8414-6E67E97CCD87> /System/Library/PrivateFrameworks/SoftwareUpdateCoreConnect.framework/Versions/A/SoftwareUpdateCoreConnect
+       0x1cdc69000 -        0x1cdcd3c1f  com.apple.osanalytics.OSAnalytics (1.0 - 1) <D3398082-B264-37E9-B546-1BB0DE974E81> /System/Library/PrivateFrameworks/OSAnalytics.framework/Versions/A/OSAnalytics
+       0x1cf103000 -        0x1cf104f9f  libswiftQuartzCore.dylib (5) <481AAE69-579E-3DF4-B1F0-113E54B8EAA9> /usr/lib/swift/libswiftQuartzCore.dylib
+       0x1cf4f6000 -        0x1cf4fb8e7  com.apple.kperf (1.0 - 1) <23264FF1-B323-3B46-893D-42378F45FE8A> /System/Library/PrivateFrameworks/kperf.framework/Versions/A/kperf
+       0x1cf60d000 -        0x1cf61263f  com.apple.MobileSystemServices (1.0 - 1) <05D57959-6BE2-3FFE-A842-09A3FA930624> /System/Library/PrivateFrameworks/MobileSystemServices.framework/Versions/A/MobileSystemServices
+       0x1d0bfe000 -        0x1d0c2029f  libamsupport.dylib (434.120.4) <C01C56CE-81B4-308E-A1BE-07C445941133> /usr/lib/libamsupport.dylib
+       0x1d0ffc000 -        0x1d105c0bf  com.apple.biome.BiomePubSub (1.0 - 209.18) <5BA2374F-9154-3DC4-A761-D3C6E167F148> /System/Library/PrivateFrameworks/BiomePubSub.framework/Versions/A/BiomePubSub
+       0x1d105d000 -        0x1d109ffff  com.apple.biome.BiomeStorage (1.0 - 209.18) <A69679B4-A9DF-39B0-B361-F116246BB7D7> /System/Library/PrivateFrameworks/BiomeStorage.framework/Versions/A/BiomeStorage
+       0x1d3b96000 -        0x1d3ba513f  libswiftUniformTypeIdentifiers.dylib (877.5.1) <BD304D00-8CE3-3528-914A-DBAD4831A95E> /usr/lib/swift/libswiftUniformTypeIdentifiers.dylib
+       0x1d3ba6000 -        0x1d3c6ba9b  libswiftAccelerate.dylib (77.100.2) <4A2ADA9C-22FB-307F-AA1E-1D85F1579BCF> /usr/lib/swift/libswiftAccelerate.dylib
+       0x1d3dc0000 -        0x1d3dd111f  libpartition2_dynamic.dylib (3476.120.8.0.2) <B57303C4-A549-35C8-9857-DEAC6891A79D> /usr/lib/libpartition2_dynamic.dylib
+       0x1d432d000 -        0x1d4337fdf  com.apple.AFKUser (1.0 - 1) <51F853F3-E890-3D4D-A00D-12C7869B9B22> /System/Library/PrivateFrameworks/AFKUser.framework/Versions/A/AFKUser
+       0x1d7d21000 -        0x1d7d8275f  libswiftCoreMedia.dylib (3320.8.5.1) <1FA37857-B3AE-320D-A11A-675B3739BA08> /usr/lib/swift/libswiftCoreMedia.dylib
+       0x1d94d4000 -        0x1d94d5bbf  libswiftOSLog.dylib (10) <964AB4ED-4361-33BF-949F-C7DE591C5EBE> /usr/lib/swift/libswiftOSLog.dylib
+       0x1dd5a3000 -        0x1dd6afd5f  com.apple.Symbolication (16.0 - 64575.70.1) <1BAEF090-27B4-316B-8C9F-E891180781AE> /System/Library/PrivateFrameworks/Symbolication.framework/Versions/A/Symbolication
+       0x1e1be5000 -        0x1e1bf53df  com.apple.OSLog (1.0 - 1861.120.4) <68746C62-44B2-377E-BB29-B0B4A6A92B5F> /System/Library/Frameworks/OSLog.framework/Versions/A/OSLog
+       0x1e1ef7000 -        0x1e200875f  com.apple.InternalSwiftProtobuf (1.0 - 1.26.0) <41595ABE-4110-3482-8DA3-839277732E08> /System/Library/PrivateFrameworks/InternalSwiftProtobuf.framework/Versions/A/InternalSwiftProtobuf
+       0x1e20ce000 -        0x1e20d90bf  com.apple.HIDDisplay (1.0 - 1) <E74DCF87-47C7-326B-A77B-1CBB94583B79> /System/Library/PrivateFrameworks/HIDDisplay.framework/Versions/A/HIDDisplay
+       0x1ea0c0000 -        0x1ea0c0af3  com.apple.FeatureFlags (1.0 - 103) <9F17EE22-3F47-3F98-A9B9-1C46372AEE83> /System/Library/PrivateFrameworks/FeatureFlags.framework/Versions/A/FeatureFlags
+       0x1f37d3000 -        0x1f37d55bf  com.apple.ConfigProfileHelper (18.0 - 1800) <097D7995-F903-3DA6-91D6-31952FBB2D32> /System/Library/PrivateFrameworks/ConfigProfileHelper.framework/Versions/A/ConfigProfileHelper
+       0x233f3a000 -        0x233f412a3  libCoreFSCache.dylib (352.1) <6B2BF8F5-A992-3C28-9BCE-CDC8E4D40E78> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreFSCache.dylib
+       0x233f42000 -        0x233f47947  libCoreVMClient.dylib (352.1) <5E0DFF0A-81BA-36FB-9AD5-E3494D15B2CA> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreVMClient.dylib
+       0x233f48000 -        0x233f582b7  com.apple.opengl (23.1.1 - 23.1.1) <E473AA13-611E-32CB-A676-213173E3AA9E> /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL
+       0x233f59000 -        0x233f5b7bf  libCVMSPluginSupport.dylib (23.1.1) <B2CF6AE8-6BAA-3374-BF7E-311343B0104D> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCVMSPluginSupport.dylib
+       0x233f5c000 -        0x233f644ff  libGFXShared.dylib (23.1.1) <C699C599-0DD8-302A-A96F-3C50B9BD5BC7> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGFXShared.dylib
+       0x233f65000 -        0x233f9854b  libGLImage.dylib (23.1.1) <FC8B70C2-0EAE-303D-AF43-459CA7FB4B15> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLImage.dylib
+       0x233f99000 -        0x233fd25bf  libGLU.dylib (23.1.1) <04FFC1B1-DD4D-3355-8EBD-FEA62D339822> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLU.dylib
+       0x234129000 -        0x234132bc7  libGL.dylib (23.1.1) <110554B2-60B8-39FE-B33B-27CE9F4E5F05> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib
+       0x235fc4000 -        0x236137f1f  com.apple.ExtensionFoundation (97 - 97) <A3567BE3-4AA2-3554-81AE-FE7EF41E535B> /System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/ExtensionFoundation
+       0x2373a8000 -        0x2373eaa1f  com.apple.LightweightCodeRequirements (1.0 - 1) <DB4F053F-0498-30C7-B2B9-697925B9F03B> /System/Library/Frameworks/LightweightCodeRequirements.framework/Versions/A/LightweightCodeRequirements
+       0x23820e000 -        0x23822c1ff  com.apple.MPSBenchmarkLoop (1.0 - 1) <A8171300-A2FE-39A3-8166-5ED347A9CD56> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSBenchmarkLoop.framework/Versions/A/MPSBenchmarkLoop
+       0x23822d000 -        0x238240e7f  com.apple.MPSFunctions (1.0 - 1) <C50883F0-037D-3888-BC83-5DC5EEE82345> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSFunctions.framework/Versions/A/MPSFunctions
+       0x238241000 -        0x23824653f  com.apple.MPSHost (1.0 - 1) <7A6AC05D-88B2-31A8-A0A7-F876BF0451B1> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSHost.framework/Versions/A/MPSHost
+       0x23b4ee000 -        0x23b65a4bf  com.apple.SwiftData (1.0 - 135) <69089200-C33B-348E-8E66-8C5954BCF335> /System/Library/Frameworks/SwiftData.framework/Versions/A/SwiftData
+       0x24213b000 -        0x24214fabf  com.apple.AppleDeviceQuerySupport (1.0 - 408.120.3) <B517FF44-3D3C-333E-BA06-5BF7F91B6D7E> /System/Library/PrivateFrameworks/AppleDeviceQuerySupport.framework/Versions/A/AppleDeviceQuerySupport
+       0x2428cb000 -        0x2429461d6  com.apple.AppleKeyStore (1.0 - 1.0) <0DE316FC-3C90-3738-8C19-A74D6E247698> /System/Library/PrivateFrameworks/AppleKeyStore.framework/Versions/A/AppleKeyStore
+       0x243272000 -        0x24328a9df  com.apple.private.AppleMobileFileIntegrity-fmk (1.0 - 1) <9B11DD7D-75DD-3784-945A-411BAED10953> /System/Library/PrivateFrameworks/AppleMobileFileIntegrity.framework/Versions/A/AppleMobileFileIntegrity
+       0x243784000 -        0x243796799  com.apple.AtomicsInternal (1.1.0 - 5026.5.5) <5BFF8B6A-704D-3822-804F-ED870A72A295> /System/Library/PrivateFrameworks/AtomicsInternal.framework/Versions/A/AtomicsInternal
+       0x243853000 -        0x243875dff  com.apple.imgaudio.AudioAnalytics (1.0 - 1) <8B4F7F16-1296-3152-A4E2-A360ACAE9622> /System/Library/PrivateFrameworks/AudioAnalytics.framework/Versions/A/AudioAnalytics
+       0x243eb7000 -        0x243eff7df  com.apple.BackBoardHIDEventFoundation (1.0 - 1) <0F0C872C-C531-3898-95BF-3BF1817C87FC> /System/Library/PrivateFrameworks/BackBoardHIDEventFoundation.framework/Versions/A/BackBoardHIDEventFoundation
+       0x243f98000 -        0x243fb18df  com.apple.biome.BiomeDSL (1.0 - 209.18) <F43D5A2A-4470-3827-8CCD-3E7AAA76242E> /System/Library/PrivateFrameworks/BiomeDSL.framework/Versions/A/BiomeDSL
+       0x243fb2000 -        0x24486419f  com.apple.BiomeLibrary (274.57) <9C4145CD-3C99-35D4-930E-8F0BA4D34596> /System/Library/PrivateFrameworks/BiomeLibrary.framework/Versions/A/BiomeLibrary
+       0x244865000 -        0x24486ab5f  com.apple.biome.BiomeSync (1.0 - 209.18) <BD7C9096-8861-331A-BBD3-FC18BE64D611> /System/Library/PrivateFrameworks/BiomeSync.framework/Versions/A/BiomeSync
+       0x245e9b000 -        0x245f338bf  com.apple.biome.CascadeSets (1.0 - 209.18) <137A490E-E366-31C3-A126-FDB5550738F7> /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/CascadeSets
+       0x2472eb000 -        0x2474294ee  com.apple.CollectionsInternal (1.2.0 - 5026.5.5) <9691DBE8-E342-36B5-8BC3-65954843303A> /System/Library/PrivateFrameworks/CollectionsInternal.framework/Versions/A/CollectionsInternal
+       0x24e994000 -        0x24e9a749f  com.apple.DeviceRecovery (1.0 - 1) <785D04A0-C0D8-3364-BDA5-560381C6553E> /System/Library/PrivateFrameworks/DeviceRecovery.framework/Versions/A/DeviceRecovery
+       0x250c32000 -        0x250c352ff  com.apple.FontServices (1.0 - 1) <A46AB82E-AF94-37A8-A8D8-48B6689934EB> /System/Library/PrivateFrameworks/FontServices.framework/Versions/A/FontServices
+       0x250c36000 -        0x250d25e2f  libXTFontStaticRegistryData.dylib (335.4.0.6) <9092FEA3-2DFB-32A9-BEFB-01B43E166C48> /System/Library/PrivateFrameworks/FontServices.framework/libXTFontStaticRegistryData.dylib
+       0x250d27000 -        0x250d33c9f  com.apple.FramePacing (1.0 - 1) <0CEB865C-17EB-3C26-B9C0-CE3689942DB2> /System/Library/PrivateFrameworks/FramePacing.framework/Versions/A/FramePacing
+       0x251e55000 -        0x251e5af07  libGPUCompilerUtils.dylib (32023.884) <C4FEB8D0-1E65-3664-8CBE-0FFAB464AABC> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libGPUCompilerUtils.dylib
+       0x2562c8000 -        0x256307797  libllvm-flatbuffers.dylib (32023.884) <DA37B086-97F7-3DC1-AA07-442AECCB1666> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libllvm-flatbuffers.dylib
+       0x25dbe6000 -        0x25dcef2df  com.apple.InstalledContentLibrary (1.0 - 1.0) <AEEEDDBF-FCD1-3251-B0E9-940CE296B1E1> /System/Library/PrivateFrameworks/InstalledContentLibrary.framework/Versions/A/InstalledContentLibrary
+       0x260611000 -        0x260ddfcbf  com.apple.IntelligencePlatformLibrary (274.57) <A1865439-B63E-3211-A2C4-DAE7F7D25698> /System/Library/PrivateFrameworks/IntelligencePlatformLibrary.framework/Versions/A/IntelligencePlatformLibrary
+       0x2626c1000 -        0x262d57923  com.apple.MIL (3520.4 - 3520.4.1) <43AB1D6B-D19B-3115-A2C0-25DF31A5786E> /System/Library/PrivateFrameworks/MIL.framework/Versions/A/MIL
+       0x2678cd000 -        0x26792eabf  com.apple.MessageSecurity (1.0 - 195.121.2) <0BAED8A7-51DE-39EE-9686-893CE0916B1B> /System/Library/PrivateFrameworks/MessageSecurity.framework/Versions/A/MessageSecurity
+       0x26c92e000 -        0x26c957b1f  com.apple.OSEligibility (319.121.1) <5C282C8D-F611-3A3F-B0C2-A9F376FE029F> /System/Library/PrivateFrameworks/OSEligibility.framework/Versions/A/OSEligibility
+       0x26d5ba000 -        0x26d6d285f  com.apple.ParsingInternal (0.0.1 - 5026.5.5) <7FD0C201-E1CC-3F69-AD54-681B3CD37313> /System/Library/PrivateFrameworks/ParsingInternal.framework/Versions/A/ParsingInternal
+       0x270a67000 -        0x270a88e1f  com.apple.accessibility.PhotosensitivityProcessing (1.0 - 1) <EA136E97-3E2F-371B-A65D-A0BD5E1898D8> /System/Library/PrivateFrameworks/PhotosensitivityProcessing.framework/Versions/A/PhotosensitivityProcessing
+       0x270e7b000 -        0x270eb7a3c  com.apple.PoirotSQLite (1.0 - 1) <F6CD54D6-1342-3624-9949-5690E8135D66> /System/Library/PrivateFrameworks/PoirotSQLite.framework/Versions/A/PoirotSQLite
+       0x270eb8000 -        0x270f2525f  com.apple.PoirotSchematizer (1.0 - 1) <31B04A5B-1569-37D6-B5E3-22CA260A9A41> /System/Library/PrivateFrameworks/PoirotSchematizer.framework/Versions/A/PoirotSchematizer
+       0x270f26000 -        0x270f5bbff  com.apple.PoirotUDFs (1.0 - 1) <257AE39F-8DAA-36F7-A806-1A38920A0131> /System/Library/PrivateFrameworks/PoirotUDFs.framework/Versions/A/PoirotUDFs
+       0x2720f4000 -        0x27223011f  com.apple.ProDisplayLibrary (10.4.28 - 10.4.28) <C91E3E87-39F7-3515-8D68-33537486959D> /System/Library/PrivateFrameworks/ProDisplayLibrary.framework/Versions/A/ProDisplayLibrary
+       0x2731ea000 -        0x2731f24df  com.apple.ReflectionInternal (1.0.0 - 5026.5.5) <EA5C8DB0-0187-3AB8-80B0-5AC888E8CDB1> /System/Library/PrivateFrameworks/ReflectionInternal.framework/Versions/A/ReflectionInternal
+       0x27413d000 -        0x2741509d7  com.apple.RuntimeInternal (1.0.0 - 5026.5.5) <04ADBC99-92B0-32EE-98A8-A4D73DCCCE6C> /System/Library/PrivateFrameworks/RuntimeInternal.framework/Versions/A/RuntimeInternal
+       0x27438f000 -        0x2743fcabf  com.apple.SILManager (53.19 - 53.19) <4D5E48C2-F64C-3E12-B831-9D3BAE05317F> /System/Library/PrivateFrameworks/SILManager.framework/Versions/A/SILManager
+       0x27f86a000 -        0x27f8964a1  com.apple.security.SwiftASN1Internal (1.0 - 1) <B9F3D5F5-9880-3CFB-B799-1A2DE78AD70B> /System/Library/PrivateFrameworks/SwiftASN1Internal.framework/Versions/A/SwiftASN1Internal
+       0x282cbd000 -        0x282cf91df  com.apple.tightbeam (1.0 - 483.100.88) <AC90942B-457E-3814-959B-85EFAACBCA58> /System/Library/PrivateFrameworks/Tightbeam.framework/Versions/A/Tightbeam
+       0x28742d000 -        0x28742e2cf  com.apple.VideoToolboxParavirtualizationSupport (64.4.7 - 64.4.7) <C881C3D9-A5B6-36D5-B11A-4EE6D037DD24> /System/Library/PrivateFrameworks/VideoToolboxParavirtualizationSupport.framework/Versions/A/VideoToolboxParavirtualizationSupport
+       0x291694000 -        0x29172e35f  libAppleArchive.dylib (450.100.4) <0FBEE8ED-BE69-3AC5-AC4E-6C28EEC29CF6> /usr/lib/libAppleArchive.dylib
+       0x2917e9000 -        0x2917f345f  libCoreEntitlements.dylib (80.100.6) <C9580199-FB51-35A3-AFCE-D4B3464E6E23> /usr/lib/libCoreEntitlements.dylib
+       0x291adf000 -        0x291ae687f  libReverseProxyDevice.dylib (104.120.1.0.1) <37A5DD0C-9615-3BBD-8A88-0451A406D25F> /usr/lib/libReverseProxyDevice.dylib
+       0x291ae7000 -        0x291aee349  libRosetta.dylib (367.9) <8651ED4F-6506-3788-B56B-32EE414A85CA> /usr/lib/libRosetta.dylib
+       0x291b56000 -        0x291b5f3ff  libTLE.dylib (80.100.6) <207A2987-1BD0-3E47-B72C-E81934A6C74C> /usr/lib/libTLE.dylib
+       0x29235b000 -        0x29246cb17  libcrypto.46.dylib (109.100.2) <F9685724-6622-3592-8336-B3811B583E83> /usr/lib/libcrypto.46.dylib
+       0x2925a7000 -        0x2925c3762  libhvf.dylib (11) <43426C58-BE90-3643-9103-B9EE4A06A18A> /usr/lib/libhvf.dylib
+       0x292efa000 -        0x292f32527  libssl.48.dylib (109.100.2) <83762FDF-B375-3BB1-B568-854F8F11CF89> /usr/lib/libssl.48.dylib
+       0x292f6d000 -        0x292f9b16f  libswiftPrespecialized.dylib (0) <1CC9F48A-BC65-37E0-88A5-260C70D14A8F> /usr/lib/libswiftPrespecialized.dylib
+       0x293237000 -        0x293249043  libswiftDistributed.dylib (6.3.2 - 6.3.2.1.3) <67A11C98-0E0D-3DF8-846F-34276C54ECF3> /usr/lib/swift/libswiftDistributed.dylib
+       0x293260000 -        0x29326febc  libswiftObservation.dylib (6.3.2 - 6.3.2.1.3) <CE9EF53F-E72B-32EC-A1F9-8EBE59A4F1BA> /usr/lib/swift/libswiftObservation.dylib
+       0x29339c000 -        0x2933af8ef  libswiftSynchronization.dylib (6.3.2 - 6.3.2.1.3) <1A965373-0DB6-3B50-BE38-52C30D67A090> /usr/lib/swift/libswiftSynchronization.dylib
+       0x2933b0000 -        0x2933c8e60  libswiftSystem.dylib (75) <A4F80949-97A7-3A1A-A340-45D2D7A5AB89> /usr/lib/swift/libswiftSystem.dylib
+       0x2933ca000 -        0x2933e079f  libswiftVideoToolbox.dylib (3320.8.5.1) <3C381F76-0925-338E-BEDA-2ECB42333EBC> /usr/lib/swift/libswiftVideoToolbox.dylib
+       0x2933e2000 -        0x2933e2669  libswift_Builtin_float.dylib (6.3.2.1.3) <15ED1E36-16BC-327E-8FAA-9130DE11923C> /usr/lib/swift/libswift_Builtin_float.dylib
+       0x2933e3000 -        0x29346e095  libswift_Concurrency.dylib (6.3.2 - 6.3.2.1.3) <E3545AA1-FF13-3698-8657-91BB23002DF9> /usr/lib/swift/libswift_Concurrency.dylib
+       0x29346f000 -        0x293471f83  libswift_DarwinFoundation1.dylib (377.120.8) <2601FA08-2913-3370-89B6-C67DC05AC892> /usr/lib/swift/libswift_DarwinFoundation1.dylib
+       0x293472000 -        0x293472eeb  libswift_DarwinFoundation2.dylib (377.120.8) <38242BFE-54C8-3838-AE88-0083F7328580> /usr/lib/swift/libswift_DarwinFoundation2.dylib
+       0x293473000 -        0x2934737a7  libswift_DarwinFoundation3.dylib (377.120.8) <6CFBAAE9-7293-3A51-83B9-E3988230EAC2> /usr/lib/swift/libswift_DarwinFoundation3.dylib
+       0x293474000 -        0x29351249f  libswift_RegexParser.dylib (6.3.2 - 6.3.2.1.3) <2FED4499-861B-37B8-8C94-5ABC7FD49726> /usr/lib/swift/libswift_RegexParser.dylib
+       0x293513000 -        0x29359f0cd  libswift_StringProcessing.dylib (6.3.2 - 6.3.2.1.3) <13999576-EB4F-3A0D-874F-A95AD5D7F296> /usr/lib/swift/libswift_StringProcessing.dylib
+       0x293704000 -        0x293707a4b  libsystem_darwindirectory.dylib (122) <CF277A2C-C818-3F16-8B3F-3C7B39FCD164> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x293708000 -        0x2937115d3  libsystem_eligibility.dylib (319.121.1) <DDAC0531-0262-3DDC-8EC8-80EB9438847A> /usr/lib/system/libsystem_eligibility.dylib
+       0x293712000 -        0x29371988b  libsystem_sanitizers.dylib (26.1) <44C4234F-8B2D-38D3-A774-B4B3C75AF3A7> /usr/lib/system/libsystem_sanitizers.dylib
+       0x29371a000 -        0x29371abb7  libsystem_trial.dylib (474.2.18.2) <68C583BA-AFF5-3916-86AE-6E38BFEF98D6> /usr/lib/system/libsystem_trial.dylib

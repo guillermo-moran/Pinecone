@@ -18,6 +18,20 @@ DerivedData/
 *.xcresult/
 *.xcarchive/
 *.ipa
+*.app/
+
+# Compiled native/graphics dependencies; keep their source and build scripts
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.framework/
+*.xcframework/
+*.air
+*.metallib
+*.metal-ar
 
 # Personal Xcode user preferences (window layouts, open tabs)
 xcuserdata/
@@ -91,6 +105,38 @@ fastlane/test_output
 *.p8
 *.mobileprovision
 *.provisionprofile
+
+# ====================================================================
+# Guest Images & Local Run Output
+# ====================================================================
+
+# Downloaded, generated, and writable VM disks (including compressed copies)
+*.img
+*.img.*
+*.raw
+*.raw.*
+*.qcow
+*.qcow.*
+*.qcow2
+*.qcow2.*
+*.vmdk
+*.vdi
+*.sparseimage
+*.sparsebundle/
+
+# Allow deliberately maintained small image fixtures in test fixture folders
+!Tests/**/Fixtures/**/*.img
+!Tests/**/Fixtures/**/*.raw
+!Tests/**/Fixtures/**/*.qcow2
+
+# Android build output accidentally directed into the repository root
+/out/
+
+# Ad-hoc captures in the root; curated experiment evidence remains visible
+/pinecone-*.log
+/pinecone-*.json
+/xcodebuild*.log
+/swift-test*.log
 
 # Do not blanket-ignore logs, JSON, PNG, or archives: curated evidence in
 # experiments/ and docs/performance-evidence/ is intentionally versioned.

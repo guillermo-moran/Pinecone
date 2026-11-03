@@ -8,9 +8,6 @@ struct MobileOSHostApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                .task {
-                    await model.boot()
-                }
         }
     }
 }

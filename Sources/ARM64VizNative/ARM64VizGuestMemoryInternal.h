@@ -154,11 +154,26 @@ struct AVZNativeMemoryFastPath {
     uint64_t exclusive_expected_second;
     AVZNativeMemoryFastPathStatistics statistics;
     AVZGuestMemory *guest_memory;
+    /* Owner-private reuse hint for instruction-hot promotion. Every hit still
+     * proves page/context/generation; append to preserve assembly offsets. */
+    uint8_t instruction_hot_last_hit;
 };
 
 int avz_native_fast_revalidate_tlb_entry(
     AVZNativeMemoryFastPath *fast_path, AVZNativeFastTLBEntry *entry
 );
+
+static inline uint8_t avz_native_stage1_uses_ttbr1(
+    const AVZNativeStage1TranslationState *state,
+    uint64_t virtual_address
+) {
+    uint8_t range_from_bit_55 = (uint8_t)((virtual_address >> 55) & 1u);
+    unsigned tbi_bit = range_from_bit_55 ? 38u : 37u;
+    if (((state->tcr_el1 >> tbi_bit) & 1u) != 0) {
+        return range_from_bit_55;
+    }
+    return (uint8_t)(virtual_address >> 63);
+}
 
 static inline int avz_native_fast_tlb_entry_is_current(
     AVZNativeMemoryFastPath *fast_path, AVZNativeFastTLBEntry *entry
@@ -203,7 +218,8 @@ static inline int avz_native_fast_memory_try_read_hot(
 
     const uint64_t virtual_page = virtual_address >> AVZ_FAST_PAGE_SHIFT;
     const uint64_t context_tag = fast_path->native_translation_enabled
-        ? (virtual_address >> 63
+        ? (avz_native_stage1_uses_ttbr1(
+                &fast_path->translation_state, virtual_address)
             ? fast_path->high_translation_context_tag
             : fast_path->low_translation_context_tag)
         : 0;
@@ -355,7 +371,8 @@ static inline int avz_native_fast_memory_try_write_hot(
 
     const uint64_t virtual_page = virtual_address >> AVZ_FAST_PAGE_SHIFT;
     const uint64_t context_tag = fast_path->native_translation_enabled
-        ? (virtual_address >> 63
+        ? (avz_native_stage1_uses_ttbr1(
+                &fast_path->translation_state, virtual_address)
             ? fast_path->high_translation_context_tag
             : fast_path->low_translation_context_tag)
         : 0;

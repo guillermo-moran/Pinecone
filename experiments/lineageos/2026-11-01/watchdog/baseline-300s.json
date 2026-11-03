@@ -1,0 +1,2538 @@
+{
+  "backend" : "software-aarch64-subset",
+  "backendPerformance" : {
+    "decodedBasicBlockExecutions" : 0,
+    "decodedBasicBlockNanoseconds" : 0,
+    "decodedBasicBlockSteps" : 0,
+    "decodedFallbackGadgets" : [
+
+    ],
+    "nativeBasicBlockExecutions" : 96952700,
+    "nativeBasicBlockNanoseconds" : 0,
+    "nativeBasicBlockSteps" : 464125810,
+    "nativeBasicBlockUnsupportedExits" : 0,
+    "nativeBatchPrefetchHits" : 113063,
+    "nativeBatchPrefetchLimit" : 1,
+    "nativeBatchPrefetchLimitChanges" : 8,
+    "nativeBatchPrefetchUnused" : 65152,
+    "nativeBatchPrefetchedBlocks" : 179039,
+    "nativeBlockCacheDecodes" : 781413,
+    "nativeBlockCacheFrontHits" : 5547090,
+    "nativeBlockCacheHits" : 6045436,
+    "nativeBlockCacheMisses" : 781927,
+    "nativeDecodeWindowHits" : 520335,
+    "nativeDecodeWindowMisses" : 261592,
+    "nativeDirectCodeFetches" : 3116840,
+    "nativeDirectLinkHits" : 8379653,
+    "nativeDirectLinkMisses" : 986513,
+    "nativeFastRAMReadHits" : 421,
+    "nativeFastRAMReadMisses" : 60210,
+    "nativeFastRAMWriteHits" : 192,
+    "nativeFastRAMWriteMisses" : 42837,
+    "nativeFillHits" : 0,
+    "nativeFillMisses" : 0,
+    "nativeGenericDispatches" : 21428993,
+    "nativeIneligibleGadgets" : [
+
+    ],
+    "nativeInstructionFetchHits" : 0,
+    "nativeInstructionTLBColdMisses" : 0,
+    "nativeInstructionTLBConflictMisses" : 0,
+    "nativeInstructionTLBHits" : 0,
+    "nativeInstructionTLBHotHits" : 0,
+    "nativeInstructionTLBInvalidationMisses" : 0,
+    "nativeInstructionTLBMisses" : 0,
+    "nativePageTableFaults" : 0,
+    "nativePageTableWalks" : 0,
+    "nativePhysicalDeviceReads" : 60210,
+    "nativePhysicalDeviceWrites" : 42792,
+    "nativeReadTLBHits" : 0,
+    "nativeReadTLBMisses" : 0,
+    "nativeSingleInstructionSteps" : 421,
+    "nativeSuperblockBlocks" : 85464374,
+    "nativeSuperblockDispatches" : 18940320,
+    "nativeSuperblockFrontHits" : 14577444,
+    "nativeSuperblockHits" : 17536709,
+    "nativeTranslationCallbackWalks" : 0,
+    "nativeWriteTLBHits" : 0,
+    "nativeWriteTLBMisses" : 0,
+    "singleInstructionNanoseconds" : 0,
+    "singleInstructionSteps" : 421,
+    "swiftFallbackSingleInstructionSteps" : 0,
+    "unsupportedInstructions" : [
+
+    ]
+  },
+  "bootArguments" : "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 loglevel=6 vt.global_cursor_default=0 androidboot.console=ttyAMA0 androidboot.seriallogging=ttyAMA0 androidboot.seriallogging.logcat_buffer=all androidboot.hardware=virtio androidboot.partition_map=vdb,userdata androidboot.graphics=mesa_swrast androidboot.hwui_renderer=skiagl binder.impl=rust firmware_class.path=\/vendor\/firmware\/ log_buf_len=4M loop.max_part=7 printk.devkmsg=on rw vt.global_cursor_default=0 acpi=nospcr androidboot.verifiedbootstate=orange bootconfig",
+  "breakpoints" : [
+
+  ],
+  "currentEL" : "EL1",
+  "diskByteCount" : 5368709120,
+  "displayDiagnostics" : "gpu=t48\/f48 bytes=94371840\/11796480 direct=0\/0 snap=1 cow=1\/1966080 glock=0.00\/0.01ms dirty=91\/46:0 pages=46\/43:7958528\/86413312 exact=0\/0 pv2d=0\/0:0\/b0\/m0\/n0:0 err=0\/0\/0\/0:none tr=r3:0,0,480x1024@0:c1b2r0:1966080 fl=r3:0,0,480x1024:p1c1s1d1:1966080",
+  "displayFlushSkip" : 0,
+  "displayFrame" : {
+    "bytesPerPixel" : 4,
+    "commitTimestampNanoseconds" : 7273758596990375,
+    "damageRectangleCount" : 1,
+    "damagedByteCount" : 1966080,
+    "generation" : 8,
+    "hasStableStorage" : true,
+    "height" : 1024,
+    "stride" : 1920,
+    "width" : 480
+  },
+  "displayGeneration" : 8,
+  "displayPerformanceCounters" : {
+    "backingCopiedBytes" : 7958528,
+    "cleanBackingSkippedBytes" : 86413312,
+    "commandLockHoldP95Milliseconds" : 0.005416,
+    "commandLockWaitP95Milliseconds" : 8.3e-05,
+    "committedBytes" : 11796480,
+    "dirtyTileChangedBytes" : 0,
+    "dirtyTileScans" : 91,
+    "exactGuestWriteBytes" : 0,
+    "exactGuestWrites" : 0,
+    "flushCommands" : 48,
+    "frameCopyOnWriteBytes" : 1966080,
+    "frameCopyOnWriteCount" : 1,
+    "hostNative.operator.0.commands" : 0,
+    "hostNative.operator.0.destinationBytes" : 0,
+    "hostNative.operator.0.milliseconds" : 0,
+    "hostNative.operator.0.pixels" : 0,
+    "hostNative.operator.1.commands" : 0,
+    "hostNative.operator.1.destinationBytes" : 0,
+    "hostNative.operator.1.milliseconds" : 0,
+    "hostNative.operator.1.pixels" : 0,
+    "hostNative.operator.10.commands" : 0,
+    "hostNative.operator.10.destinationBytes" : 0,
+    "hostNative.operator.10.milliseconds" : 0,
+    "hostNative.operator.10.pixels" : 0,
+    "hostNative.operator.11.commands" : 0,
+    "hostNative.operator.11.destinationBytes" : 0,
+    "hostNative.operator.11.milliseconds" : 0,
+    "hostNative.operator.11.pixels" : 0,
+    "hostNative.operator.12.commands" : 0,
+    "hostNative.operator.12.destinationBytes" : 0,
+    "hostNative.operator.12.milliseconds" : 0,
+    "hostNative.operator.12.pixels" : 0,
+    "hostNative.operator.13.commands" : 0,
+    "hostNative.operator.13.destinationBytes" : 0,
+    "hostNative.operator.13.milliseconds" : 0,
+    "hostNative.operator.13.pixels" : 0,
+    "hostNative.operator.2.commands" : 0,
+    "hostNative.operator.2.destinationBytes" : 0,
+    "hostNative.operator.2.milliseconds" : 0,
+    "hostNative.operator.2.pixels" : 0,
+    "hostNative.operator.3.commands" : 0,
+    "hostNative.operator.3.destinationBytes" : 0,
+    "hostNative.operator.3.milliseconds" : 0,
+    "hostNative.operator.3.pixels" : 0,
+    "hostNative.operator.4.commands" : 0,
+    "hostNative.operator.4.destinationBytes" : 0,
+    "hostNative.operator.4.milliseconds" : 0,
+    "hostNative.operator.4.pixels" : 0,
+    "hostNative.operator.5.commands" : 0,
+    "hostNative.operator.5.destinationBytes" : 0,
+    "hostNative.operator.5.milliseconds" : 0,
+    "hostNative.operator.5.pixels" : 0,
+    "hostNative.operator.6.commands" : 0,
+    "hostNative.operator.6.destinationBytes" : 0,
+    "hostNative.operator.6.milliseconds" : 0,
+    "hostNative.operator.6.pixels" : 0,
+    "hostNative.operator.7.commands" : 0,
+    "hostNative.operator.7.destinationBytes" : 0,
+    "hostNative.operator.7.milliseconds" : 0,
+    "hostNative.operator.7.pixels" : 0,
+    "hostNative.operator.8.commands" : 0,
+    "hostNative.operator.8.destinationBytes" : 0,
+    "hostNative.operator.8.milliseconds" : 0,
+    "hostNative.operator.8.pixels" : 0,
+    "hostNative.operator.9.commands" : 0,
+    "hostNative.operator.9.destinationBytes" : 0,
+    "hostNative.operator.9.milliseconds" : 0,
+    "hostNative.operator.9.pixels" : 0,
+    "hostNative.reason.ineligible.commands" : 0,
+    "hostNative.reason.ineligible.destinationBytes" : 0,
+    "hostNative.reason.ineligible.milliseconds" : 0,
+    "hostNative.reason.ineligible.pixels" : 0,
+    "hostNative.reason.submissionDeclined.commands" : 0,
+    "hostNative.reason.submissionDeclined.destinationBytes" : 0,
+    "hostNative.reason.submissionDeclined.milliseconds" : 0,
+    "hostNative.reason.submissionDeclined.pixels" : 0,
+    "hostNative.reason.unavailable.commands" : 0,
+    "hostNative.reason.unavailable.destinationBytes" : 0,
+    "hostNative.reason.unavailable.milliseconds" : 0,
+    "hostNative.reason.unavailable.pixels" : 0,
+    "hostNative.solidA8Over.commands" : 0,
+    "hostNative.solidA8Over.destinationBytes" : 0,
+    "hostNative.solidA8Over.milliseconds" : 0,
+    "hostNative.solidA8Over.pixels" : 0,
+    "hostPhase.accelerator.calls" : 0,
+    "hostPhase.accelerator.milliseconds" : 0,
+    "hostPhase.finish.calls" : 1,
+    "hostPhase.finish.milliseconds" : 0.000125,
+    "hostPhase.flush.calls" : 48,
+    "hostPhase.flush.milliseconds" : 0.590289,
+    "hostPhase.frameCopy.calls" : 50,
+    "hostPhase.frameCopy.milliseconds" : 0.616335,
+    "hostPhase.native.calls" : 0,
+    "hostPhase.native.milliseconds" : 0,
+    "hostPhase.prepare.calls" : 7,
+    "hostPhase.prepare.milliseconds" : 1.29596,
+    "hostPhase.reset.calls" : 0,
+    "hostPhase.reset.milliseconds" : 0,
+    "hostPhase.synchronize.calls" : 0,
+    "hostPhase.synchronize.milliseconds" : 0,
+    "hostPhase.transfer.calls" : 48,
+    "hostPhase.transfer.milliseconds" : 1.032627,
+    "nativeDirectGuestWriteBytes" : 0,
+    "nativeDirectGuestWrites" : 0,
+    "paravirtualAcceleratedCommands" : 0,
+    "paravirtualBatches" : 0,
+    "paravirtualCommands" : 0,
+    "paravirtualFinishFailures" : 0,
+    "paravirtualNativeFailures" : 0,
+    "paravirtualPixels" : 0,
+    "paravirtualPrepareFailures" : 0,
+    "paravirtualSynchronizationFailures" : 0,
+    "snapshotCopies" : 0,
+    "transferCommands" : 48,
+    "transferredBytes" : 94371840,
+    "unchangedFlushes" : 46
+  },
+  "displayPresented" : true,
+  "displaySnapshotPath" : "\/private\/tmp\/pinecone-watchdog-probe.ppm",
+  "el0FaultCount" : 2823,
+  "el0FaultSkip" : 0,
+  "entryPoint" : "0x40200000",
+  "exceptionCounts" : [
+    {
+      "count" : 44,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 16,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 2,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc08013dd9c",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0x78b29c9d40",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010c80"
+    },
+    {
+      "count" : 1,
+      "exceptionClass" : "unknown",
+      "iss" : "0x0",
+      "returnAddress" : "0xffffffc081367abc",
+      "source" : "irq",
+      "vectorAddress" : "0xffffffc080010a80"
+    }
+  ],
+  "exceptionStormThreshold" : 0,
+  "executedSteps" : 464126231,
+  "executionStateTransitions" : [
+
+  ],
+  "fdtAddress" : "0x7ff00000",
+  "fdtByteCount" : 5832,
+  "globalMMIOAccessCounts" : [
+    {
+      "access" : "read",
+      "count" : 37492,
+      "device" : "intc",
+      "offset" : "0x1000c"
+    },
+    {
+      "access" : "write",
+      "count" : 19868,
+      "device" : "intc",
+      "offset" : "0x10010"
+    },
+    {
+      "access" : "read",
+      "count" : 17834,
+      "device" : "uart0",
+      "offset" : "0x18"
+    },
+    {
+      "access" : "write",
+      "count" : 16281,
+      "device" : "uart0",
+      "offset" : "0x0"
+    },
+    {
+      "access" : "write",
+      "count" : 6114,
+      "device" : "intc",
+      "offset" : "0xf00"
+    },
+    {
+      "access" : "read",
+      "count" : 4611,
+      "device" : "virtio_pci1",
+      "offset" : "0x2000"
+    },
+    {
+      "access" : "write",
+      "count" : 278,
+      "device" : "uart0",
+      "offset" : "0x38"
+    },
+    {
+      "access" : "read",
+      "count" : 233,
+      "device" : "virtio_pci2",
+      "offset" : "0x2000"
+    },
+    {
+      "access" : "write",
+      "count" : 153,
+      "device" : "virtio_pci1",
+      "offset" : "0x1000"
+    },
+    {
+      "access" : "read",
+      "count" : 30,
+      "device" : "virtio_pci5",
+      "offset" : "0x2000"
+    },
+    {
+      "access" : "write",
+      "count" : 29,
+      "device" : "virtio_pci2",
+      "offset" : "0x1000"
+    },
+    {
+      "access" : "write",
+      "count" : 9,
+      "device" : "intc",
+      "offset" : "0x100"
+    },
+    {
+      "access" : "write",
+      "count" : 6,
+      "device" : "uart0",
+      "offset" : "0x30"
+    },
+    {
+      "access" : "read",
+      "count" : 3,
+      "device" : "uart0",
+      "offset" : "0x30"
+    },
+    {
+      "access" : "read",
+      "count" : 2,
+      "device" : "intc",
+      "offset" : "0x800"
+    },
+    {
+      "access" : "read",
+      "count" : 2,
+      "device" : "intc",
+      "offset" : "0xc04"
+    },
+    {
+      "access" : "write",
+      "count" : 2,
+      "device" : "intc",
+      "offset" : "0x0"
+    },
+    {
+      "access" : "read",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x4"
+    },
+    {
+      "access" : "read",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x10000"
+    },
+    {
+      "access" : "read",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x100fc"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x180"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x184"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x188"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x380"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x384"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x388"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x400"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x404"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x408"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x40c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x410"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x414"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x418"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x41c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x420"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x424"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x428"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x42c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x430"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x434"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x438"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x43c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x440"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x444"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x448"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x44c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x450"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x454"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x458"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x45c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x820"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x824"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x828"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x82c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x830"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x834"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x838"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x83c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x840"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x844"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x848"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x84c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x850"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x854"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x858"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x85c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc08"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc0c"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc10"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0xc14"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x10000"
+    },
+    {
+      "access" : "write",
+      "count" : 1,
+      "device" : "intc",
+      "offset" : "0x10004"
+    }
+  ],
+  "guest" : "arm64viz-lineageos",
+  "initrdAddress" : "0x7f95d000",
+  "initrdByteCount" : 5908014,
+  "interruptDiagnostics" : {
+    "acknowledgedCounts" : [
+      {
+        "count" : 6395,
+        "line" : 0
+      },
+      {
+        "count" : 16113,
+        "line" : 1
+      },
+      {
+        "count" : 2,
+        "line" : 5
+      },
+      {
+        "count" : 46954,
+        "line" : 27
+      },
+      {
+        "count" : 4611,
+        "line" : 68
+      },
+      {
+        "count" : 30,
+        "line" : 71
+      },
+      {
+        "count" : 233,
+        "line" : 73
+      }
+    ],
+    "activeLines" : [
+
+    ],
+    "activeRaiseDropCounts" : [
+      {
+        "count" : 164,
+        "line" : 1
+      },
+      {
+        "count" : 2,
+        "line" : 27
+      },
+      {
+        "count" : 40,
+        "line" : 68
+      }
+    ],
+    "clearedCounts" : [
+      {
+        "count" : 10065327,
+        "line" : 27
+      },
+      {
+        "count" : 10184826,
+        "line" : 30
+      },
+      {
+        "count" : 270718,
+        "line" : 33
+      },
+      {
+        "count" : 4612,
+        "line" : 68
+      },
+      {
+        "count" : 70723,
+        "line" : 69
+      },
+      {
+        "count" : 1,
+        "line" : 70
+      },
+      {
+        "count" : 31,
+        "line" : 71
+      },
+      {
+        "count" : 1,
+        "line" : 72
+      },
+      {
+        "count" : 234,
+        "line" : 73
+      }
+    ],
+    "completedCounts" : [
+      {
+        "count" : 6395,
+        "line" : 0
+      },
+      {
+        "count" : 16113,
+        "line" : 1
+      },
+      {
+        "count" : 2,
+        "line" : 5
+      },
+      {
+        "count" : 46954,
+        "line" : 27
+      },
+      {
+        "count" : 4611,
+        "line" : 68
+      },
+      {
+        "count" : 30,
+        "line" : 71
+      },
+      {
+        "count" : 233,
+        "line" : 73
+      }
+    ],
+    "enabledLines" : [
+      27,
+      33,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73
+    ],
+    "pendingLines" : [
+      27
+    ],
+    "raisedCounts" : [
+      {
+        "count" : 6395,
+        "line" : 0
+      },
+      {
+        "count" : 16113,
+        "line" : 1
+      },
+      {
+        "count" : 2,
+        "line" : 5
+      },
+      {
+        "count" : 119499,
+        "line" : 27
+      },
+      {
+        "count" : 5458,
+        "line" : 68
+      },
+      {
+        "count" : 180,
+        "line" : 71
+      },
+      {
+        "count" : 241,
+        "line" : 73
+      }
+    ]
+  },
+  "interruptState" : {
+    "physicalTimerAsserted" : false,
+    "physicalTimerEnabled" : false,
+    "physicalTimerIRQ" : 30,
+    "virtualTimerAsserted" : false,
+    "virtualTimerEnabled" : false,
+    "virtualTimerIRQ" : 27
+  },
+  "lastException" : {
+    "currentEL" : "EL1",
+    "exceptionClass" : "unknown",
+    "irqLine" : 1,
+    "iss" : "0x0",
+    "newPState" : "0x3c5",
+    "previousPState" : "0x40000005",
+    "returnAddress" : "0xffffffc0800fa284",
+    "source" : "irq",
+    "syndrome" : "0x0",
+    "vectorAddress" : "0xffffffc080010a80",
+    "vectorBase" : "0xffffffc080010800",
+    "vectorOffset" : "0x280"
+  },
+  "linkLocalGeneratedFrames" : 0,
+  "linkLocalRecentFrames" : [
+
+  ],
+  "linkLocalTransmittedFrames" : 0,
+  "maxSteps" : 50000000000,
+  "memoryTraceDepth" : 0,
+  "memoryTraceEL0Only" : false,
+  "memoryWriteSkip" : 0,
+  "mmioAccessCounts" : [
+
+  ],
+  "mmioTraceDepth" : 0,
+  "nextBackendWork" : [
+    "Linux-grade IRQ\/FIQ priority, masking, EOI, and nesting behavior",
+    "Broader MMU attributes, shareability, cacheability, and TLB maintenance",
+    "GIC\/timer driver compatibility beyond the current minimal model",
+    "PL011 FIFO depth, baud\/control registers, and interrupt edge cases",
+    "virtio descriptor-ring execution for net\/input\/display"
+  ],
+  "observedMemoryWriteWatchCount" : 0,
+  "parallelVCPUExecution" : true,
+  "pc" : "0xffffffc08135ab48",
+  "pcPhysical" : "0x4155ab48",
+  "primaryAssemblyStatistics" : {
+    "blocks" : 3030303,
+    "boundaries" : 952178,
+    "boundedEnabled" : 0,
+    "boundedRuns" : 0,
+    "boundedSteps" : 0,
+    "boundedVisits" : 0,
+    "chainEnabled" : 0,
+    "chainRuns" : 0,
+    "chainSteps" : 0,
+    "chainVisits" : 0,
+    "enabled" : 1,
+    "faults" : 803,
+    "steps" : 8194821
+  },
+  "primaryHotPCs" : [
+    {
+      "instructions" : [
+        "0x10000011",
+        "0xb8b0790d",
+        "0x8b0d0231",
+        "0x510005cd"
+      ],
+      "linkRegister" : "0x4024f888",
+      "pc" : "0x4024f950",
+      "samples" : 744
+    },
+    {
+      "instructions" : [
+        "0x38401590",
+        "0x7103fe1f",
+        "0x540007a8"
+      ],
+      "linkRegister" : "0x4024f888",
+      "pc" : "0x4024f944",
+      "samples" : 677
+    },
+    {
+      "instructions" : [
+        "0x710001bf",
+        "0x2a0d03ee",
+        "0xaa0c03ef",
+        "0x54fffdec"
+      ],
+      "linkRegister" : "0x4024f898",
+      "pc" : "0x4024f97c",
+      "samples" : 632
+    },
+    {
+      "instructions" : [
+        "0x8b050108",
+        "0xeb050042",
+        "0x54ffffaa"
+      ],
+      "linkRegister" : "0xffffffc082387320",
+      "pc" : "0xffffffc081328f70",
+      "samples" : 300
+    },
+    {
+      "instructions" : [
+        "0x38c0158e",
+        "0x510005ad",
+        "0x37ffffce"
+      ],
+      "linkRegister" : "0x4024f898",
+      "pc" : "0x4024f964",
+      "samples" : 283
+    },
+    {
+      "instructions" : [
+        "0x14000003"
+      ],
+      "linkRegister" : "0x4024f898",
+      "pc" : "0x4024f970",
+      "samples" : 283
+    },
+    {
+      "instructions" : [
+        "0x9240160e",
+        "0x8b0e016b",
+        "0x710001bf",
+        "0x2a0d03ee"
+      ],
+      "linkRegister" : "0x4024f898",
+      "pc" : "0x4024f974",
+      "samples" : 152
+    },
+    {
+      "instructions" : [
+        "0x710022bf",
+        "0x54000063"
+      ],
+      "linkRegister" : "0x7bee93a8e4",
+      "pc" : "0x7ec541c288",
+      "samples" : 152
+    },
+    {
+      "instructions" : [
+        "0xaa1303e0",
+        "0x97fffbc5"
+      ],
+      "linkRegister" : "0xffffffc08078d7a4",
+      "pc" : "0xffffffc08078e854",
+      "samples" : 152
+    },
+    {
+      "instructions" : [
+        "0x54fffe03"
+      ],
+      "linkRegister" : "0x5d9d990e74",
+      "pc" : "0x5d9d9912cc",
+      "samples" : 150
+    },
+    {
+      "instructions" : [
+        "0xd50339bf",
+        "0xb9400828",
+        "0xb9400429",
+        "0x6b09011f"
+      ],
+      "linkRegister" : "0xffffffc08036e098",
+      "pc" : "0xffffffc08036defc",
+      "samples" : 139
+    },
+    {
+      "instructions" : [
+        "0x52800028",
+        "0x14000002"
+      ],
+      "linkRegister" : "0xffffffc0803675a4",
+      "pc" : "0xffffffc080367704",
+      "samples" : 139
+    },
+    {
+      "instructions" : [
+        "0x39400268",
+        "0x910006f7",
+        "0xeb0802ff",
+        "0x54000d82"
+      ],
+      "linkRegister" : "0xffffffc08037e19c",
+      "pc" : "0xffffffc08037daec",
+      "samples" : 138
+    },
+    {
+      "instructions" : [
+        "0xf9468669",
+        "0xb001378a",
+        "0x9118214a",
+        "0xf8687948"
+      ],
+      "linkRegister" : "0xffffffc08015ad34",
+      "pc" : "0xffffffc08015acec",
+      "samples" : 137
+    },
+    {
+      "instructions" : [
+        "0xd65f03c0"
+      ],
+      "linkRegister" : "0xffffffc080dae600",
+      "pc" : "0xffffffc0801cc494",
+      "samples" : 137
+    },
+    {
+      "instructions" : [
+        "0x39411e6c",
+        "0x7100059f",
+        "0x54fffd40"
+      ],
+      "linkRegister" : "0xffffffc080a0bd48",
+      "pc" : "0xffffffc080a0dc14",
+      "samples" : 136
+    },
+    {
+      "instructions" : [
+        "0xf24022bf",
+        "0x540009c0"
+      ],
+      "linkRegister" : "0xffffffc0803a79bc",
+      "pc" : "0xffffffc0803a7878",
+      "samples" : 129
+    },
+    {
+      "instructions" : [
+        "0xf945c308",
+        "0xd37ae6a9",
+        "0x934cfd08",
+        "0xcb081928"
+      ],
+      "linkRegister" : "0xffffffc0803a79bc",
+      "pc" : "0xffffffc0803a7910",
+      "samples" : 129
+    },
+    {
+      "instructions" : [
+        "0xf9400410",
+        "0xb86c7871",
+        "0xd360fd4a",
+        "0xd360fdad"
+      ],
+      "linkRegister" : "0x5d9d990e88",
+      "pc" : "0x5d9d99128c",
+      "samples" : 121
+    },
+    {
+      "instructions" : [
+        "0xd5033fdf"
+      ],
+      "linkRegister" : "0xffffffc08135a0c8",
+      "pc" : "0xffffffc08135a978",
+      "samples" : 114
+    },
+    {
+      "instructions" : [
+        "0x36f8031c"
+      ],
+      "linkRegister" : "0xffffffc08040ede0",
+      "pc" : "0xffffffc080415da4",
+      "samples" : 114
+    },
+    {
+      "instructions" : [
+        "0xd503233f",
+        "0xa9be7bfd",
+        "0xf9000bf3",
+        "0x910003fd"
+      ],
+      "linkRegister" : "0xffffffc080b65344",
+      "pc" : "0xffffffc0813678d0",
+      "samples" : 114
+    },
+    {
+      "instructions" : [
+        "0xa9474ff4",
+        "0xa94657f6",
+        "0xa9455ff8",
+        "0xa94467fa"
+      ],
+      "linkRegister" : "0xffffffc08040ede0",
+      "pc" : "0xffffffc080415da8",
+      "samples" : 114
+    },
+    {
+      "instructions" : [
+        "0xd50b7420"
+      ],
+      "linkRegister" : "0xffffffc0803f5dfc",
+      "pc" : "0xffffffc08132629c",
+      "samples" : 111
+    },
+    {
+      "instructions" : [
+        "0xd5384108",
+        "0xb9458509",
+        "0x11000529",
+        "0xb9058509"
+      ],
+      "linkRegister" : "0xffffffc08078c9fc",
+      "pc" : "0xffffffc0801cc468",
+      "samples" : 111
+    },
+    {
+      "instructions" : [
+        "0x37000148"
+      ],
+      "linkRegister" : "0xffffffc080a0bd48",
+      "pc" : "0xffffffc080a0db8c",
+      "samples" : 110
+    },
+    {
+      "instructions" : [
+        "0xd503203f",
+        "0x88dffe98",
+        "0x3707ffd8"
+      ],
+      "linkRegister" : "0xffffffc08016c178",
+      "pc" : "0xffffffc0801f88d4",
+      "samples" : 109
+    },
+    {
+      "instructions" : [
+        "0xb00138b4",
+        "0x91182294",
+        "0xd001364a",
+        "0x9138814a"
+      ],
+      "linkRegister" : "0xffffffc080136f04",
+      "pc" : "0xffffffc080136ea0",
+      "samples" : 109
+    },
+    {
+      "instructions" : [
+        "0xa9434ff4",
+        "0xa94257f6",
+        "0xa9417bfd",
+        "0x910103ff"
+      ],
+      "linkRegister" : "0xffffffc0801523f8",
+      "pc" : "0xffffffc080149388",
+      "samples" : 109
+    },
+    {
+      "instructions" : [
+        "0xf940040c",
+        "0x927ef58b",
+        "0xeb08017f",
+        "0x540005c1"
+      ],
+      "linkRegister" : "0xffffffc0813637ac",
+      "pc" : "0xffffffc08018a7e4",
+      "samples" : 109
+    },
+    {
+      "instructions" : [
+        "0xb25f7be9",
+        "0x934cfd08",
+        "0x52800038",
+        "0xf2b80009"
+      ],
+      "linkRegister" : "0xffffffc08037dcd8",
+      "pc" : "0xffffffc0803f7f64",
+      "samples" : 108
+    },
+    {
+      "instructions" : [
+        "0xd503233f",
+        "0xa9be7bfd",
+        "0xa9014ff4",
+        "0x910003fd"
+      ],
+      "linkRegister" : "0xffffffc0801488f8",
+      "pc" : "0xffffffc080148ab4",
+      "samples" : 108
+    }
+  ],
+  "profile" : "lineageOS",
+  "pstate" : "0x600000c5",
+  "recentExceptions" : [
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc08013dd9c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL0",
+      "exceptionClass" : "unknown",
+      "irqLine" : 68,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60001000",
+      "returnAddress" : "0x78b29c9d40",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010c80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x480"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc081367abc",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x20000005",
+      "returnAddress" : "0xffffffc08013dd9c",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 27,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x60000005",
+      "returnAddress" : "0xffffffc080155c74",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    },
+    {
+      "currentEL" : "EL1",
+      "exceptionClass" : "unknown",
+      "irqLine" : 1,
+      "iss" : "0x0",
+      "newPState" : "0x3c5",
+      "previousPState" : "0x40000005",
+      "returnAddress" : "0xffffffc0800fa284",
+      "source" : "irq",
+      "syndrome" : "0x0",
+      "vectorAddress" : "0xffffffc080010a80",
+      "vectorBase" : "0xffffffc080010800",
+      "vectorOffset" : "0x280"
+    }
+  ],
+  "recentInstructions" : [
+
+  ],
+  "recentMMIOAccesses" : [
+
+  ],
+  "recentMemoryAccesses" : [
+
+  ],
+  "recentSystemRegisterReads" : [
+
+  ],
+  "recentSystemRegisterWrites" : [
+
+  ],
+  "registers" : [
+    {
+      "name" : "x0",
+      "value" : "0xffffffbfbce6a000"
+    },
+    {
+      "name" : "x1",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x2",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x3",
+      "value" : "0xa4ec"
+    },
+    {
+      "name" : "x4",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x5",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x6",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x7",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x8",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x9",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x10",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x11",
+      "value" : "0xffffff803f690284"
+    },
+    {
+      "name" : "x12",
+      "value" : "0x4"
+    },
+    {
+      "name" : "x13",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x14",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x15",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x16",
+      "value" : "0xc006287d"
+    },
+    {
+      "name" : "x17",
+      "value" : "0xc006287d"
+    },
+    {
+      "name" : "x18",
+      "value" : "0xffffffc08285cb80"
+    },
+    {
+      "name" : "x19",
+      "value" : "0xffffffc08285db80"
+    },
+    {
+      "name" : "x20",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x21",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x22",
+      "value" : "0xffffffc08284a000"
+    },
+    {
+      "name" : "x23",
+      "value" : "0xffffffc08285db80"
+    },
+    {
+      "name" : "x24",
+      "value" : "0x0"
+    },
+    {
+      "name" : "x25",
+      "value" : "0xffffffc08281fc70"
+    },
+    {
+      "name" : "x26",
+      "value" : "0xffffffc08284adf0"
+    },
+    {
+      "name" : "x27",
+      "value" : "0x1"
+    },
+    {
+      "name" : "x28",
+      "value" : "0xffffffc08284a000"
+    },
+    {
+      "name" : "x29",
+      "value" : "0xffffffc082843d80"
+    },
+    {
+      "name" : "x30",
+      "value" : "0xffffffc08135aba0"
+    },
+    {
+      "name" : "sp",
+      "value" : "0xffffffc082843d80"
+    },
+    {
+      "name" : "pc",
+      "value" : "0xffffffc08135ab48"
+    }
+  ],
+  "secondaryAssemblyStatistics" : {
+    "1" : {
+      "blocks" : 23606009,
+      "boundaries" : 11385339,
+      "boundedEnabled" : 0,
+      "boundedRuns" : 0,
+      "boundedSteps" : 0,
+      "boundedVisits" : 0,
+      "chainEnabled" : 0,
+      "chainRuns" : 0,
+      "chainSteps" : 0,
+      "chainVisits" : 0,
+      "enabled" : 1,
+      "faults" : 8846,
+      "steps" : 58780422
+    },
+    "2" : {
+      "blocks" : 34450758,
+      "boundaries" : 15800109,
+      "boundedEnabled" : 0,
+      "boundedRuns" : 0,
+      "boundedSteps" : 0,
+      "boundedVisits" : 0,
+      "chainEnabled" : 0,
+      "chainRuns" : 0,
+      "chainSteps" : 0,
+      "chainVisits" : 0,
+      "enabled" : 1,
+      "faults" : 10760,
+      "steps" : 89302646
+    },
+    "3" : {
+      "blocks" : 29095395,
+      "boundaries" : 14683223,
+      "boundedEnabled" : 0,
+      "boundedRuns" : 0,
+      "boundedSteps" : 0,
+      "boundedVisits" : 0,
+      "chainEnabled" : 0,
+      "chainRuns" : 0,
+      "chainSteps" : 0,
+      "chainVisits" : 0,
+      "enabled" : 1,
+      "faults" : 10617,
+      "steps" : 69770907
+    }
+  },
+  "secondaryExecutedSteps" : 11705970520,
+  "secondaryFallbackSteps" : 0,
+  "secondaryNativeSteps" : 11705970431,
+  "sp" : "0xffffffc082843d80",
+  "stackFrames" : [
+    {
+      "framePointer" : "0xffffffc082843d80",
+      "returnAddress" : "0xffffffc08135aba0"
+    },
+    {
+      "framePointer" : "0xffffffc082843da0",
+      "returnAddress" : "0xffffffc08135abe8"
+    },
+    {
+      "framePointer" : "0xffffffc082843db0",
+      "returnAddress" : "0xffffffc08015601c"
+    },
+    {
+      "framePointer" : "0xffffffc082843de0",
+      "returnAddress" : "0xffffffc080156218"
+    },
+    {
+      "framePointer" : "0xffffffc082843e40",
+      "returnAddress" : "0xffffffc08135b10c"
+    },
+    {
+      "framePointer" : "0xffffffc082843e60",
+      "returnAddress" : "0xffffffc08236080c"
+    },
+    {
+      "framePointer" : "0xffffffc082843e90",
+      "returnAddress" : "0xffffffc08236c374"
+    },
+    {
+      "framePointer" : "0xffffffc082843fe0",
+      "returnAddress" : "0x0"
+    }
+  ],
+  "stopOnDisplay" : false,
+  "stopOnEL0" : false,
+  "stopOnEL0Fault" : false,
+  "stopOnUART" : false,
+  "stopReason" : "total-wall-clock-budget",
+  "streamUART" : true,
+  "suppliedDeviceTree" : false,
+  "sysregTraceDepth" : 0,
+  "systemRegisters" : [
+    {
+      "name" : "CurrentEL",
+      "value" : "0x4"
+    },
+    {
+      "name" : "DAIF",
+      "value" : "0xc0"
+    },
+    {
+      "name" : "SCTLR_EL1",
+      "value" : "0x200002034f4591d"
+    },
+    {
+      "name" : "TCR_EL1",
+      "value" : "0x4500070b5593519"
+    },
+    {
+      "name" : "TTBR0_EL1",
+      "value" : "0x42550000"
+    },
+    {
+      "name" : "TTBR1_EL1",
+      "value" : "0x42551000"
+    },
+    {
+      "name" : "VBAR_EL1",
+      "value" : "0xffffffc080010800"
+    },
+    {
+      "name" : "MAIR_EL1",
+      "value" : "0x40044ffff"
+    },
+    {
+      "name" : "SP_EL0",
+      "value" : "0xffffffc08285db80"
+    },
+    {
+      "name" : "ESR_EL1",
+      "value" : "0x0"
+    },
+    {
+      "name" : "FAR_EL1",
+      "value" : "0x761cafbe30"
+    },
+    {
+      "name" : "ELR_EL1",
+      "value" : "0xffffffc080155c74"
+    },
+    {
+      "name" : "SPSR_EL1",
+      "value" : "0x60000005"
+    },
+    {
+      "name" : "CONTEXTIDR_EL1",
+      "value" : "0x0"
+    },
+    {
+      "name" : "TPIDR_EL1",
+      "value" : "0xffffffbfbce6a000"
+    },
+    {
+      "name" : "TPIDR_EL0",
+      "value" : "0x0"
+    },
+    {
+      "name" : "TPIDRRO_EL0",
+      "value" : "0x0"
+    },
+    {
+      "name" : "DCZID_EL0",
+      "value" : "0x4"
+    },
+    {
+      "name" : "CNTFRQ_EL0",
+      "value" : "0x16e3600"
+    },
+    {
+      "name" : "CNTP_CTL_EL0",
+      "value" : "0x4"
+    },
+    {
+      "name" : "CNTP_TVAL_EL0",
+      "value" : "0x9573b4d4"
+    },
+    {
+      "name" : "CNTP_CVAL_EL0",
+      "value" : "0x0"
+    },
+    {
+      "name" : "CNTV_CTL_EL0",
+      "value" : "0x1"
+    },
+    {
+      "name" : "CNTV_TVAL_EL0",
+      "value" : "0x10621"
+    },
+    {
+      "name" : "CNTV_CVAL_EL0",
+      "value" : "0x6a8d514d"
+    },
+    {
+      "name" : "CNTPCT_EL0",
+      "value" : "0x6a8c4b2c"
+    },
+    {
+      "name" : "CNTVCT_EL0",
+      "value" : "0x6a8c4b2c"
+    }
+  ],
+  "timerFastForwardCount" : 0,
+  "timerFastForwardCycles" : 0,
+  "timerMode" : "host-monotonic",
+  "timerScale" : 1,
+  "totalWallClockBudgetMilliseconds" : 300000,
+  "translationCacheHits" : 171,
+  "translationCacheMisses" : 353,
+  "uartInputByteCount" : 0,
+  "uartInputInjected" : false,
+  "uartOutputByteCount" : 265407,
+  "uartOutputTail" : "461 W drmhwc  : Test-only seamless=1 ret=-34 errno=34 strerror=Math result not representable\r\n01-01 00:01:12.920   461   461 W drmhwc  : Test-only seamless=1 ret=-34 errno=34 strerror=Math result not representable\r\n01-01 00:01:12.922   461   461 W drmhwc  : Test-only seamless=1 ret=-34 errno=34 strerror=Math result not representable\r\n01-01 00:01:12.923   461   461 W drmhwc  : Test-only seamless=1 ret=-34 errno=34 strerror=Math result not representable\r\n01-01 00:01:12.925   461   461 W drmhwc  : Test-only seamless=1 ret=-34 errno=34 strerror=Math result not representable\r\n01-01 00:01:12.927   461   461 W drmhwc  : Test-only seamless=1 ret=-34 errno=34 strerror=Math result not representable\r\n01-01 00:01:12.932   461   461 W drmhwc  : No Content protection Property available\r\n01-01 00:01:12.932   461   461 E drmhwc  : Client requested HDCP, but HDCP properties not available on that display\r\n01-01 00:01:12.933   461   461 I drmhwc  : NotifyHdcpTermination, StopHdcp() failed for display: 0\r\n01-01 00:01:12.943   497   497 W libc    : Access denied finding property \"vendor.display.vds_allow_hwc\"\r\n01-01 00:01:12.967   497   497 E SurfaceFlinger: getDisplayIdentificationData failed Status(-8, EX_SERVICE_SPECIFIC): '8: '\r\n01-01 00:01:12.968   497   497 I SurfaceFlinger: Switching to legacy multi-display mode\r\n01-01 00:01:12.974   461   461 E drmhwc  : Failed to get display bounds for d=0\r\n01-01 00:01:12.983   497   497 I SurfaceFlinger: Connecting display 0(HAL ID 0)\r\n01-01 00:01:12.986   497   497 E SurfaceFlinger: getMaxLayerPictureProfiles failed Status(-8, EX_SERVICE_SPECIFIC): '8: '\r\n01-01 00:01:12.986   497   497 E SurfaceFlinger: getMaxLayerPictureProfiles: getMaxLayerPictureProfiles failed for display 0: UNSUPPORTED (8)\r\n01-01 00:01:13.044   461   461 W drmhwc  : No panel orientation property available.\r\n01-01 00:01:13.051   497   497 E SurfaceFlinger: getPerFrameMetadataKeys failed Status(-8, EX_SERVICE_SPECIFIC): '8: '\r\n01-01 00:01:13.159   559   572 I DMABUFHEAPS: Using DMA-BUF heap named: system\r\n01-01 00:01:13.227   497   497 D SurfaceFlinger: processDisplayAdded: Optimizing thread scheduling: optimizeForPower\r\n01-01 00:01:13.234   497   497 I SurfaceFlinger: Display 0 is the pacesetter\r\n01-01 00:01:13.242   497   628 W SurfaceFlinger: Ignoring VSYNC request while display is disconnected\r\n01-01 00:01:13.251   497   629 W SurfaceFlinger: Ignoring VSYNC request while display is disconnected\r\n01-01 00:01:13.266   497   497 D SurfaceFlinger: setDesiredMode 0 {mode={fps=59.95 Hz, modePtr={id=0, vsyncRate=59.95 Hz, peakRefreshRate=59.95 Hz}}, emitEvent=true, force=false}\r\n01-01 00:01:13.273   497   632 W SurfaceFlinger: Failed to set thread name on dispatch thread\r\n01-01 00:01:13.291   497   497 I HidlServiceManagement: Trying to get transport of android.frameworks.displayservice@1.0::IDisplayService\/default without hwservicemanager\r\n01-01 00:01:13.293   497   497 E HidlServiceManagement: Service android.frameworks.displayservice@1.0::IDisplayService\/default must be in VINTF manifest in order to register\/get.\r\n01-01 00:01:13.294   497   497 E SurfaceFlinger: Did not register (deprecated) IDisplayService service.\r\n01-01 00:01:13.298   497   497 D SurfaceFlinger: Setting power mode 0 on physical display 0\r\n01-01 00:01:13.299   497   497 D SurfaceFlinger: Setting power mode 2 on physical display 0\r\n01-01 00:01:13.299   497   497 D SurfaceFlinger: setPhysicalDisplayPowerMode: Optimizing thread scheduling: optimizeForPerformance\r\n01-01 00:01:13.304   497   497 D SurfaceFlinger: Finished setting power mode 2 on physical display 0\r\n01-01 00:01:13.509   486   486 W libbinder.ServiceManagerCppClient: Waited one second for activity (is service started? Number of threads started in the threadpool: 16. Are binder threads started and available?)\r\n[   73.608397][    T1] init: Control message: Could not find 'aidl\/activity' for ctl.interface_start from pid: 231 (\/system\/bin\/servicemanager)\r\n01-01 00:01:13.569   231   635 W libc    : Unable to set property \"ctl.interface_start\" to \"aidl\/activity\": PROP_ERROR_HANDLE_CONTROL_MESSAGE (0x20)\r\n",
+  "uartProgressCompleted" : false,
+  "uartProgressMilestones" : [
+
+  ],
+  "uartProgressMilestonesReached" : [
+
+  ],
+  "virtioBlockRecentRequests" : [
+
+  ],
+  "virtioBlockRequestTypes" : [
+    {
+      "count" : 21878,
+      "name" : "read",
+      "requestType" : 0
+    },
+    {
+      "count" : 71,
+      "name" : "write",
+      "requestType" : 1
+    },
+    {
+      "count" : 39,
+      "name" : "flush",
+      "requestType" : 4
+    },
+    {
+      "count" : 2,
+      "name" : "discard",
+      "requestType" : 11
+    }
+  ],
+  "virtioBlockRequests" : 21990,
+  "virtioNetworkReceives" : 0,
+  "virtioNetworkTransmits" : 0,
+  "virtualCPUCount" : 4,
+  "waitForEventCount" : 90304,
+  "waitForInterruptCount" : 4729,
+  "wallClockElapsedMilliseconds" : 300021
+}

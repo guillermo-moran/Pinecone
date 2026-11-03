@@ -1,0 +1,8 @@
+cc_library_static {
+    name: "libpinecone_android_graphics_transport",
+    vendor: true,
+    srcs: ["pinecone_drm_transport.c"],
+    export_include_dirs: ["."],
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    stl: "none",
+}

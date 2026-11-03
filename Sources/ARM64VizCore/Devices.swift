@@ -139,7 +139,7 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func isEnabled(line: UInt32) -> Bool {
-        withLock { line < 16 || enabled.contains(line) }
+        withLock { isEnabledLocked(line: line) }
     }
 
     public func peekPending() -> UInt32? {
@@ -204,11 +204,7 @@ public final class SimpleInterruptController: InterruptController {
     }
 
     public func isEnabled(line: UInt32, targetVCPU: Int) -> Bool {
-        withLock {
-            line < 16 ||
-                targetedEnabled[targetVCPU, default: []].contains(line) ||
-                enabled.contains(line)
-        }
+        withLock { isEnabledLocked(line: line, targetVCPU: targetVCPU) }
     }
 
     public func peekPending(targetVCPU: Int) -> UInt32? {
@@ -315,9 +311,21 @@ public final class SimpleInterruptController: InterruptController {
         }
     }
 
+    // Call only while holding the interrupt-controller lock. Pending scans
+    // already own it and must not reacquire it for every candidate line.
+    private func isEnabledLocked(line: UInt32) -> Bool {
+        line < 16 || enabled.contains(line)
+    }
+
+    private func isEnabledLocked(line: UInt32, targetVCPU: Int) -> Bool {
+        line < 16 ||
+            targetedEnabled[targetVCPU, default: []].contains(line) ||
+            enabled.contains(line)
+    }
+
     private func pendingLine(targetVCPU: Int) -> UInt32? {
         targetedPending[targetVCPU]?.first {
-            isEnabled(line: $0, targetVCPU: targetVCPU) &&
+            isEnabledLocked(line: $0, targetVCPU: targetVCPU) &&
                 !(targetedActive[targetVCPU]?.contains($0) ?? false)
         }
     }
@@ -325,7 +333,7 @@ public final class SimpleInterruptController: InterruptController {
     private func globalPendingLine(targetVCPU: Int) -> UInt32? {
         let targetBit = Self.targetBit(for: targetVCPU)
         return pending.first {
-            isEnabled(line: $0) &&
+            isEnabledLocked(line: $0) &&
                 !active.contains($0) &&
                 (targetMask(line: $0) & targetBit) != 0
         }
@@ -670,6 +678,26 @@ public final class VirtualUART: MMIODevice {
 
     public var outputString: String {
         withLock { String(decoding: output, as: UTF8.self) }
+    }
+
+    /// Scan only new output plus the overlap needed for a split UTF-8 marker.
+    /// The output buffer stays under its lock, avoiding a copy per UART byte.
+    func containsOutput(_ marker: [UInt8], scannedCount: inout Int) -> Bool {
+        withLock {
+            let previousCount = scannedCount <= output.count ? scannedCount : 0
+            let start = max(0, previousCount - max(0, marker.count - 1))
+            scannedCount = output.count
+            guard !marker.isEmpty else { return true }
+            guard output.count >= marker.count else { return false }
+            let lastStart = output.count - marker.count
+            guard start <= lastStart else { return false }
+            for index in start...lastStart where output[index] == marker[0] {
+                if output[index..<(index + marker.count)].elementsEqual(marker) {
+                    return true
+                }
+            }
+            return false
+        }
     }
 
     public var receiveFIFOAvailableCapacity: Int {

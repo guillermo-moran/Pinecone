@@ -1,6 +1,28 @@
 import ARM64VizNative
 import Foundation
 
+public struct VirtualGPUResourceDiagnosticsSnapshot: Codable, Sendable, Equatable {
+    public let activeScanoutResourceID: UInt32?
+    public let committedScanoutResourceID: UInt32?
+    public let resources: [VirtualGPUResourceDiagnostic]
+}
+
+public struct VirtualGPUResourceDiagnostic: Codable, Sendable, Equatable {
+    public let resourceID: UInt32
+    public let width: Int
+    public let height: Int
+    public let format: UInt32
+    public let isActiveScanout: Bool
+    public let isCommittedScanout: Bool
+    public let hasCompleteHostContents: Bool
+    public let pendingTransferRectangleCount: Int
+    public let pendingExactTransferRectangleCount: Int
+    public let pendingGuestWriteRectangleCount: Int
+    public let hostNonBlackRGBPixelCount: Int
+    public let backingNonBlackRGBPixelCount: Int?
+    public let backingReadError: String?
+}
+
 /// A virtio-gpu 2D scanout implementation. Guest writes remain private to a
 /// resource until RESOURCE_FLUSH publishes an immutable display snapshot.
 final class VirtIOGPUDevice {
@@ -16,6 +38,15 @@ final class VirtIOGPUDevice {
         case transferToHost2D = 0x0105
         case resourceAttachBacking = 0x0106
         case resourceDetachBacking = 0x0107
+        case getCapsetInfo = 0x0108
+        case getCapset = 0x0109
+        case contextCreate = 0x0200
+        case contextDestroy = 0x0201
+        case contextAttachResource = 0x0202
+        case contextDetachResource = 0x0203
+        case resourceCreate3D = 0x0204
+        case transferToHost3D = 0x0205
+        case transferFromHost3D = 0x0206
         case submit3D = 0x0207
         case updateCursor = 0x0300
         case moveCursor = 0x0301
@@ -24,10 +55,13 @@ final class VirtIOGPUDevice {
     private enum Response: UInt32 {
         case okNoData = 0x1100
         case okDisplayInfo = 0x1101
+        case okCapsetInfo = 0x1102
+        case okCapset = 0x1103
         case errorUnspecified = 0x1200
         case errorOutOfMemory = 0x1201
         case errorInvalidScanoutID = 0x1202
         case errorInvalidResourceID = 0x1203
+        case errorInvalidContextID = 0x1204
         case errorInvalidParameter = 0x1205
     }
 
@@ -301,8 +335,31 @@ final class VirtIOGPUDevice {
 
     private final class PublishedFrameSlot {
         let pixels: NativeFramebufferStorage
-        var leaseCount = 0
+        // Metal may release the last frame owner on its completion thread while
+        // a guest command holds the device lock waiting for GPU completion.
+        // Lease release must therefore never acquire the device lock.
+        private let leaseLock = NSLock()
+        private var leaseCount = 0
         var generation: UInt64?
+
+        var isLeased: Bool {
+            leaseLock.lock()
+            defer { leaseLock.unlock() }
+            return leaseCount > 0
+        }
+
+        func retainLease() {
+            leaseLock.lock()
+            leaseCount += 1
+            leaseLock.unlock()
+        }
+
+        func releaseLease() {
+            leaseLock.lock()
+            precondition(leaseCount > 0)
+            leaseCount -= 1
+            leaseLock.unlock()
+        }
 
         init(byteCount: Int) {
             pixels = NativeFramebufferStorage(byteCount: byteCount)
@@ -311,6 +368,10 @@ final class VirtIOGPUDevice {
 
     let width: Int
     let height: Int
+    private let virgl: VirGLGPUState?
+    private var virgl3DResources: Set<UInt32> = []
+    var virglCapsetCount: UInt32 { UInt32(virgl?.renderer.capsets.count ?? 0) }
+    var supportsVirGL: Bool { virglCapsetCount > 0 }
 
     /// CPU command phases are serialized independently of display metadata.
     /// Deferred work reserves its resources until the CPU-visible completion;
@@ -489,11 +550,12 @@ final class VirtIOGPUDevice {
         return value
     }
 
-    init(width: Int, height: Int,
+    init(width: Int, height: Int, virglRenderer: VirGLRenderer? = nil,
          pixelWorkObserver: (@Sendable (PixelWorkPhase) -> Void)? = nil) {
         precondition(width > 0 && height > 0)
         self.width = width
         self.height = height
+        self.virgl = virglRenderer.flatMap { $0.capsets.isEmpty ? nil : VirGLGPUState(renderer: $0) }
         self.pixelWorkObserver = pixelWorkObserver
         let frameSlots = [PublishedFrameSlot(byteCount: width * height * 4)]
         self.frameSlots = frameSlots
@@ -514,6 +576,8 @@ final class VirtIOGPUDevice {
         executionGate.begin(access: .global)
         lockCommandMetadata()
         resetEpoch &+= 1
+        try? virgl?.reset()
+        virgl3DResources.removeAll()
         resources.removeAll(keepingCapacity: true)
         let accelerator = graphicsAccelerator
         withPixelWork(.reset) { accelerator?.reset() }
@@ -608,6 +672,11 @@ final class VirtIOGPUDevice {
         lock.lock()
         defer { lock.unlock() }
         var counters: [String: Double] = [
+            "virglEnabled": supportsVirGL ? 1 : 0,
+            "virglContexts": Double(virgl?.contexts.count ?? 0),
+            "virglResources": Double(virgl?.resources.count ?? 0),
+            "virglSubmissions": Double(virgl?.submitCount ?? 0),
+            "virglReadbacks": Double(virgl?.readbackCount ?? 0),
             "transferCommands": Double(transferCommandCount),
             "flushCommands": Double(flushCommandCount),
             "transferredBytes": Double(transferredByteCount),
@@ -689,26 +758,20 @@ final class VirtIOGPUDevice {
         directFrameReadByteCount &+= UInt64(metadata.damagedByteCount)
         if cursor == nil {
             let slot = committedFrame
-            slot.leaseCount += 1
+            slot.retainLease()
             let lease = VirtualFramebufferFrameLease(
                 metadata: metadata,
                 storageOwner: slot.pixels,
                 baseAddress: slot.pixels.unsafeBaseAddress,
                 byteCount: slot.pixels.allocationByteCount,
-                releaseHandler: { [weak self, weak slot] in
-                    guard let self, let slot else { return }
-                    self.lock.lock()
-                    precondition(slot.leaseCount > 0)
-                    slot.leaseCount -= 1
-                    self.lock.unlock()
-                }
+                releaseHandler: { [weak slot] in slot?.releaseLease() }
             )
             lock.unlock()
             return lease
         }
 
         let slot = prepareCursorFrame()
-        slot.leaseCount += 1
+        slot.retainLease()
         let leasedMetadata = VirtualFramebufferFrameMetadata(
             width: metadata.width,
             height: metadata.height,
@@ -726,13 +789,7 @@ final class VirtIOGPUDevice {
             storageOwner: slot.pixels,
             baseAddress: slot.pixels.unsafeBaseAddress,
             byteCount: slot.pixels.allocationByteCount,
-            releaseHandler: { [weak self, weak slot] in
-                guard let self, let slot else { return }
-                self.lock.lock()
-                precondition(slot.leaseCount > 0)
-                slot.leaseCount -= 1
-                self.lock.unlock()
-            }
+            releaseHandler: { [weak slot] in slot?.releaseLease() }
         )
         lock.unlock()
         return lease
@@ -849,7 +906,7 @@ final class VirtIOGPUDevice {
     private func unpublishedFrame(copyContents: Bool) -> PublishedFrameSlot {
         let nextFrame: PublishedFrameSlot
         if let available = frameSlots.first(where: {
-            $0 !== committedFrame && $0.leaseCount == 0
+            $0 !== committedFrame && !$0.isLeased
         }) {
             nextFrame = available
         } else {
@@ -904,7 +961,7 @@ final class VirtIOGPUDevice {
         let fullFrame = Rectangle(x: 0, y: 0, width: width, height: height)
         let previousFrame = cursorFrame
         let frame: PublishedFrameSlot
-        if let previousFrame, previousFrame.leaseCount == 0 {
+        if let previousFrame, !previousFrame.isLeased {
             frame = previousFrame
         } else {
             frame = PublishedFrameSlot(byteCount: width * height * 4)
@@ -1123,6 +1180,94 @@ final class VirtIOGPUDevice {
         }
     }
 
+    func resourceDiagnostics(memory: PhysicalMemory) -> VirtualGPUResourceDiagnosticsSnapshot {
+        executionGate.begin(access: .global)
+        lockCommandMetadata()
+        defer {
+            unlockCommandMetadata()
+            executionGate.end()
+        }
+
+        let activeResourceID = scanout?.resourceID
+        let committedResourceID = committedScanout?.resourceID
+        let diagnostics = resources.keys.sorted().compactMap { resourceID -> VirtualGPUResourceDiagnostic? in
+            guard let resource = resources[resourceID] else { return nil }
+            let hostNonBlack = Self.nonBlackRGBPixelCount(
+                resource.pixels,
+                byteCount: resource.byteCount
+            )
+            var backingNonBlack: Int?
+            var backingReadError: String?
+            if resource.backing.isEmpty {
+                backingReadError = "notAttached"
+            } else {
+                let storage = NativeFramebufferStorage(byteCount: resource.byteCount)
+                do {
+                    try copyBackingBytes(
+                        resource.backing,
+                        logicalOffset: 0,
+                        count: resource.byteCount,
+                        memory: memory,
+                        destination: storage,
+                        destinationOffset: 0
+                    )
+                    normalizePixels(
+                        in: storage,
+                        rectangle: Rectangle(
+                            x: 0, y: 0,
+                            width: resource.width, height: resource.height
+                        ),
+                        stride: resource.stride,
+                        format: resource.format
+                    )
+                    backingNonBlack = Self.nonBlackRGBPixelCount(
+                        storage,
+                        byteCount: resource.byteCount
+                    )
+                } catch {
+                    backingReadError = "readFailed"
+                }
+            }
+            return VirtualGPUResourceDiagnostic(
+                resourceID: resourceID,
+                width: resource.width,
+                height: resource.height,
+                format: resource.format.rawValue,
+                isActiveScanout: resourceID == activeResourceID,
+                isCommittedScanout: resourceID == committedResourceID,
+                hasCompleteHostContents: resource.hasCompleteHostContents,
+                pendingTransferRectangleCount: resource.pendingTransfers.count,
+                pendingExactTransferRectangleCount: resource.pendingExactTransfers.count,
+                pendingGuestWriteRectangleCount: resource.pendingGuestWrites.count,
+                hostNonBlackRGBPixelCount: hostNonBlack,
+                backingNonBlackRGBPixelCount: backingNonBlack,
+                backingReadError: backingReadError
+            )
+        }
+        return VirtualGPUResourceDiagnosticsSnapshot(
+            activeScanoutResourceID: activeResourceID,
+            committedScanoutResourceID: committedResourceID,
+            resources: diagnostics
+        )
+    }
+
+    private static func nonBlackRGBPixelCount(
+        _ storage: NativeFramebufferStorage,
+        byteCount: Int
+    ) -> Int {
+        storage.withUnsafeBytes { bytes in
+            var count = 0
+            var offset = 0
+            while offset < byteCount {
+                if bytes[offset] != 0 || bytes[offset + 1] != 0 || bytes[offset + 2] != 0 {
+                    count += 1
+                }
+                offset += 4
+            }
+            return count
+        }
+    }
+
     func process(request: [UInt8], memory: PhysicalMemory) -> [UInt8] {
         guard request.count >= Header.byteCount else {
             return responseHeader(.errorInvalidParameter, requestHeader: nil)
@@ -1144,6 +1289,13 @@ final class VirtIOGPUDevice {
             executionGate.end()
         }
         do {
+            if let virgl {
+                let response = try processVirGL(command, request: request, header: header, memory: memory, state: virgl)
+                // Fences also cover transfers and resource operations, not just
+                // command-buffer submissions. Ack only after actual completion.
+                if header.flags & Header.fenceFlag != 0 { try virgl.renderer.finish() }
+                return response
+            }
             switch command {
             case .getDisplayInfo:
                 return displayInfoResponse(requestHeader: header)
@@ -1167,7 +1319,18 @@ final class VirtIOGPUDevice {
                 return try updateCursor(request, header: header)
             case .moveCursor:
                 return try moveCursor(request, header: header)
+            default:
+                return responseHeader(.errorUnspecified, requestHeader: header)
             }
+        } catch let error as VirGLGPUError {
+            let response: Response
+            switch error {
+            case .invalidContext: response = .errorInvalidContextID
+            case .invalidResource: response = .errorInvalidResourceID
+            case .invalidParameter: response = .errorInvalidParameter
+            case .rendererFailure: response = .errorUnspecified
+            }
+            return responseHeader(response, requestHeader: header)
         } catch let error as GPUError {
             return responseHeader(error.response, requestHeader: header)
         } catch {
@@ -1214,6 +1377,7 @@ final class VirtIOGPUDevice {
                 }
             }
             return resources
+        default: return nil
         }
         guard request.count >= offset + 4 else { return nil }
         return [readLE32(request, at: offset)]
@@ -1235,7 +1399,8 @@ final class VirtIOGPUDevice {
         memory: PhysicalMemory,
         completion: @escaping @Sendable ([UInt8]) -> Void
     ) -> DispatchResult {
-        guard request.count >= Header.byteCount,
+        guard request.count >= 40,
+              Self.readLE32(request, at: 32) == PineconeGraphicsProtocol.magic,
               Command(rawValue: Self.readLE32(request, at: 0)) == .submit3D else {
             return .unhandled
         }
@@ -1356,6 +1521,145 @@ final class VirtIOGPUDevice {
             )
             return .completed(response)
         }
+    }
+
+    /// Standard VirGL and the private Alpine 2D stream share the device queue,
+    /// reset gate, response headers, scanout and immutable display snapshots.
+    private func processVirGL(_ command: Command, request: [UInt8], header: Header,
+                              memory: PhysicalMemory, state: VirGLGPUState) throws -> [UInt8] {
+        switch command {
+        case .getDisplayInfo: return displayInfoResponse(requestHeader: header)
+        case .getCapsetInfo:
+            try require(request, count: 32)
+            let index = Int(Self.readLE32(request, at: 24))
+            guard index < state.renderer.capsets.count else { throw VirGLGPUError.invalidParameter }
+            let cap = state.renderer.capsets[index]
+            var response = responseHeader(.okCapsetInfo, requestHeader: header) + [UInt8](repeating: 0, count: 16)
+            Self.writeLE32(cap.id, into: &response, at: 24)
+            Self.writeLE32(cap.version, into: &response, at: 28)
+            Self.writeLE32(cap.size, into: &response, at: 32)
+            return response
+        case .getCapset:
+            try require(request, count: 32)
+            let bytes = try state.renderer.caps(id: Self.readLE32(request, at: 24), version: Self.readLE32(request, at: 28))
+            return responseHeader(.okCapset, requestHeader: header) + bytes
+        case .contextCreate:
+            try require(request, count: 96)
+            let length = Int(Self.readLE32(request, at: 24))
+            // CONTEXT_INIT / multiple timeline rings are not advertised yet.
+            guard length <= 64, Self.readLE32(request, at: 28) == 0 else { throw VirGLGPUError.invalidParameter }
+            try state.createContext(id: header.contextID, name: Array(request[32..<(32 + length)]))
+        case .contextDestroy:
+            try state.destroyContext(id: header.contextID)
+        case .contextAttachResource, .contextDetachResource:
+            try require(request, count: 32)
+            try state.contextResource(context: header.contextID, resource: Self.readLE32(request, at: 24), attach: command == .contextAttachResource)
+        case .resourceCreate2D:
+            try require(request, count: 40)
+            let descriptor = AVZVirGLResource(handle: Self.readLE32(request, at: 24), target: 2,
+                format: Self.readLE32(request, at: 28), bind: (1 << 18) | 2 | 8,
+                width: Self.readLE32(request, at: 32), height: Self.readLE32(request, at: 36),
+                depth: 1, array_size: 1, last_level: 0, nr_samples: 0, flags: 1)
+            let allocated = resources.values.reduce(0) { $0 + $1.byteCount }
+            guard PixelFormat(rawValue: descriptor.format) != nil,
+                  descriptor.width > 0, descriptor.height > 0,
+                  descriptor.width <= 16384, descriptor.height <= 16384,
+                  UInt64(descriptor.width) * UInt64(descriptor.height) * 4 <= UInt64(256 * 1024 * 1024 - allocated)
+            else { throw VirGLGPUError.invalidParameter }
+            try state.createResource(descriptor)
+            do { return try createResource(request, header: header) }
+            catch { try? state.unrefResource(id: descriptor.handle); throw error }
+        case .resourceCreate3D:
+            try require(request, count: 72)
+            let d = AVZVirGLResource(handle: Self.readLE32(request, at: 24), target: Self.readLE32(request, at: 28),
+                format: Self.readLE32(request, at: 32), bind: Self.readLE32(request, at: 36),
+                width: Self.readLE32(request, at: 40), height: Self.readLE32(request, at: 44),
+                depth: Self.readLE32(request, at: 48), array_size: Self.readLE32(request, at: 52),
+                last_level: Self.readLE32(request, at: 56), nr_samples: Self.readLE32(request, at: 60), flags: Self.readLE32(request, at: 64))
+            // Only scanout-compatible formats need the existing CPU display mirror.
+            let format = PixelFormat(rawValue: d.format)
+            let mirrorsScanout = d.target == 2 && d.depth == 1 && d.array_size == 1 && format != nil
+            if mirrorsScanout {
+                let allocated = resources.values.reduce(0) { $0 + $1.byteCount }
+                guard d.width <= 16384, d.height <= 16384,
+                      UInt64(d.width) * UInt64(d.height) * 4 <= UInt64(256 * 1024 * 1024 - allocated) else {
+                    throw GPUError.response(.errorOutOfMemory)
+                }
+            }
+            try state.createResource(d)
+            virgl3DResources.insert(d.handle)
+            if mirrorsScanout, let format { resources[d.handle] = Resource(format: format, width: Int(d.width), height: Int(d.height)) }
+        case .resourceUnref:
+            try require(request, count: 32)
+            let id = Self.readLE32(request, at: 24)
+            try state.unrefResource(id: id)
+            virgl3DResources.remove(id)
+            if resources[id] != nil { return try unrefResource(request, header: header) }
+        case .resourceAttachBacking:
+            try require(request, count: 32)
+            let id = Self.readLE32(request, at: 24), count = Int(Self.readLE32(request, at: 28))
+            guard count > 0, count <= 16384, request.count >= 32 + count * 16 else { throw VirGLGPUError.invalidParameter }
+            let entries = (0..<count).map { index in
+                VirGLGPUState.Backing(address: Self.readLE64(request, at: 32 + index * 16), count: Int(Self.readLE32(request, at: 40 + index * 16)))
+            }
+            try state.attachBacking(resource: id, entries: entries, memory: memory)
+            if !virgl3DResources.contains(id) {
+                do { return try attachBacking(request, header: header, memory: memory) }
+                catch { try? state.detachBacking(resource: id); throw error }
+            }
+        case .resourceDetachBacking:
+            try require(request, count: 32)
+            let id = Self.readLE32(request, at: 24)
+            try state.detachBacking(resource: id)
+            if resources[id] != nil { return try detachBacking(request, header: header) }
+        case .transferToHost2D:
+            try require(request, count: 56)
+            let rectangle = try Self.rectangle(request, at: 24), id = Self.readLE32(request, at: 48)
+            let transfer = AVZVirGLTransfer(handle: id, context: 0, level: 0, stride: 0, layer_stride: 0,
+                x: UInt32(rectangle.x), y: UInt32(rectangle.y), z: 0, width: UInt32(rectangle.width),
+                height: UInt32(rectangle.height), depth: 1, offset: Self.readLE64(request, at: 40))
+            try state.transfer(transfer, memory: memory, toHost: true)
+            if !virgl3DResources.contains(id) { return try transferToHost(request, header: header, memory: memory) }
+        case .transferToHost3D, .transferFromHost3D:
+            try require(request, count: 72)
+            let transfer = AVZVirGLTransfer(handle: Self.readLE32(request, at: 56), context: header.contextID,
+                level: Self.readLE32(request, at: 60), stride: Self.readLE32(request, at: 64),
+                layer_stride: Self.readLE32(request, at: 68), x: Self.readLE32(request, at: 24),
+                y: Self.readLE32(request, at: 28), z: Self.readLE32(request, at: 32),
+                width: Self.readLE32(request, at: 36), height: Self.readLE32(request, at: 40),
+                depth: Self.readLE32(request, at: 44), offset: Self.readLE64(request, at: 48))
+            try state.transfer(transfer, memory: memory, toHost: command == .transferToHost3D)
+        case .submit3D:
+            try require(request, count: 32)
+            if request.count >= 40, Self.readLE32(request, at: 32) == PineconeGraphicsProtocol.magic {
+                return try submitParavirtual2D(request, header: header, memory: memory)
+            }
+            let size = Int(Self.readLE32(request, at: 24))
+            guard size > 0, size & 3 == 0, size <= 1_048_576, request.count == 32 + size else { throw VirGLGPUError.invalidParameter }
+            try state.submit(context: header.contextID, words: stride(from: 32, to: request.count, by: 4).map { Self.readLE32(request, at: $0) }, memory: memory)
+        case .setScanout: return try setScanout(request, header: header)
+        case .resourceFlush:
+            try require(request, count: 48)
+            let id = Self.readLE32(request, at: 40)
+            guard let descriptor = state.resources[id] else { throw VirGLGPUError.invalidResource }
+            let rectangle = try Self.rectangle(request, at: 24)
+            guard !rectangle.isEmpty, rectangle.isWithin(width: Int(descriptor.width), height: Int(descriptor.height))
+            else { throw VirGLGPUError.invalidParameter }
+            guard scanout?.resourceID == id else { return responseHeader(.okNoData, requestHeader: header) }
+            if !state.contexts.isEmpty || virgl3DResources.contains(id) {
+                guard let resource = resources[id] else { throw VirGLGPUError.invalidResource }
+                let pixels = try state.readPixels(resource: id)
+                resource.pixels.withUnsafeMutableBytes { destination in
+                    pixels.withUnsafeBytes { source in destination.copyMemory(from: source) }
+                }
+                resource.hasCompleteHostContents = true
+                resource.pendingTransfers = [Rectangle(x: 0, y: 0, width: resource.width, height: resource.height)]
+            }
+            return try flushResource(request, header: header)
+        case .updateCursor: return try updateCursor(request, header: header)
+        case .moveCursor: return try moveCursor(request, header: header)
+        }
+        return responseHeader(.okNoData, requestHeader: header)
     }
 
     private enum GPUError: Error {
@@ -2838,7 +3142,7 @@ final class VirtIOGPUDevice {
             throw GPUError.response(.errorInvalidParameter)
         }
         guard let scanout, scanout.resourceID == resourceID,
-              let visible = flushRectangle.intersection(scanout.rectangle) else {
+              flushRectangle.intersection(scanout.rectangle) != nil else {
             lastFlushSummary = Self.rectangleSummary(
                 resourceID: resourceID,
                 rectangle: flushRectangle,
@@ -2849,7 +3153,7 @@ final class VirtIOGPUDevice {
 
         let pendingTransferCount = resource.pendingTransfers.count
         let wasComplete = resource.hasCompleteHostContents
-        let geometryChanged = committedScanout?.rectangle != scanout.rectangle
+        let geometryChanged = committedScanout != scanout
         let transferredVisible = Self.compactDamageRectangles(
             resource.pendingTransfers.compactMap {
                 $0.intersection(flushRectangle)?.intersection(scanout.rectangle)
@@ -2870,7 +3174,7 @@ final class VirtIOGPUDevice {
             if needsFullFrame {
                 frame.pixels.clear()
                 copyResourceRectangle(
-                    visible,
+                    scanout.rectangle,
                     from: resource,
                     scanout: scanout,
                     into: frame.pixels

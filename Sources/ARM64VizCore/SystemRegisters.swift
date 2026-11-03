@@ -446,7 +446,9 @@ public struct ARM64SystemRegisterBank: Codable, Equatable {
         ARM64SystemRegister.idAA64PFR0EL1.rawValue: 0x0000_0000_0000_0011,
         ARM64SystemRegister.idAA64PFR1EL1.rawValue: 0,
         ARM64SystemRegister.idAA64DFR0EL1.rawValue: 0,
-        ARM64SystemRegister.idAA64ISAR0EL1.rawValue: 0,
+        // SHA256H/H2/SU0/SU1 and all CRC32/CRC32C widths have native
+        // handlers plus portable fallbacks. AES, SHA1 and SHA512 stay absent.
+        ARM64SystemRegister.idAA64ISAR0EL1.rawValue: 0x0001_1000,
         ARM64SystemRegister.idAA64ISAR1EL1.rawValue: 0,
         ARM64SystemRegister.idAA64MMFR0EL1.rawValue: 0,
         // HAFDBS is not advertised until hardware Access Flag updates have

@@ -18,7 +18,8 @@ public enum FlattenedDeviceTree {
 
     public static func encode(
         configuration: BootConfiguration,
-        initrd: DeviceTreeInitrd? = nil
+        initrd: DeviceTreeInitrd? = nil,
+        includeAndroidFstab: Bool = false
     ) throws -> [UInt8] {
         let writer = FDTStructWriter()
 
@@ -63,6 +64,10 @@ public enum FlattenedDeviceTree {
             writer.property("compatible", strings: ["arm,psci-1.0", "arm,psci-0.2"])
             writer.property("method", string: psciMethod)
             writer.endNode()
+        }
+
+        if includeAndroidFstab {
+            writeAndroidFirmware(writer)
         }
 
         writer.beginNode("aliases")
@@ -133,6 +138,87 @@ public enum FlattenedDeviceTree {
         output.append(contentsOf: structBlock)
         output.append(contentsOf: stringsBlock)
         return output
+    }
+
+    private static func writeAndroidFirmware(_ writer: FDTStructWriter) {
+        writer.beginNode("firmware")
+        writer.beginNode("android")
+        writer.property("compatible", strings: ["android,firmware"])
+        writer.property("boot_devices", string: "any")
+        writer.beginNode("fstab")
+        writer.property("compatible", strings: ["android,fstab"])
+
+        writeAndroidFstabEntry(
+            writer,
+            node: "metadata",
+            device: "/dev/block/by-name/metadata",
+            mountPoint: "/metadata",
+            type: "ext4",
+            mountFlags: "nodev,noatime,nosuid,discard,data=journal,commit=1",
+            fsManagerFlags: "check,formattable,first_stage_mount,metadata_csum"
+        )
+        for partition in ["odm", "product", "system", "system_ext", "vendor"] {
+            writeAndroidFstabEntry(
+                writer,
+                node: "\(partition)-ext4",
+                device: partition,
+                mountPoint: "/\(partition)",
+                type: "ext4",
+                mountFlags: "noatime,ro",
+                fsManagerFlags: "logical,first_stage_mount"
+            )
+            writeAndroidFstabEntry(
+                writer,
+                node: "\(partition)-erofs",
+                device: partition,
+                mountPoint: "/\(partition)",
+                type: "erofs",
+                mountFlags: "noatime,ro",
+                fsManagerFlags: "logical,first_stage_mount"
+            )
+        }
+        for partition in ["system_dlkm", "vendor_dlkm"] {
+            writeAndroidFstabEntry(
+                writer,
+                node: "\(partition)-ext4",
+                device: partition,
+                mountPoint: "/\(partition)",
+                type: "ext4",
+                mountFlags: "noatime,ro,errors=panic",
+                fsManagerFlags: "logical,first_stage_mount"
+            )
+            writeAndroidFstabEntry(
+                writer,
+                node: "\(partition)-erofs",
+                device: partition,
+                mountPoint: "/\(partition)",
+                type: "erofs",
+                mountFlags: "ro",
+                fsManagerFlags: "logical,first_stage_mount"
+            )
+        }
+
+        writer.endNode()
+        writer.endNode()
+        writer.endNode()
+    }
+
+    private static func writeAndroidFstabEntry(
+        _ writer: FDTStructWriter,
+        node: String,
+        device: String,
+        mountPoint: String,
+        type: String,
+        mountFlags: String,
+        fsManagerFlags: String
+    ) {
+        writer.beginNode(node)
+        writer.property("dev", string: device)
+        writer.property("mnt_point", string: mountPoint)
+        writer.property("type", string: type)
+        writer.property("mnt_flags", string: mountFlags)
+        writer.property("fsmgr_flags", string: fsManagerFlags)
+        writer.endNode()
     }
 
     private static func parseStringList(_ rawValue: String) -> [String]? {

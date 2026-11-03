@@ -4,6 +4,7 @@ public enum BootUseCase: String, Codable, CaseIterable {
     case toyUART
     case linuxDirect
     case aosp
+    case lineageOS
     case bsd
     case rtos
     case rawARM64Binary
@@ -28,6 +29,9 @@ public enum BootArtifactKind: String, Codable, CaseIterable {
     case androidVendorImage
     case androidProductImage
     case androidSuperImage
+    case androidBootImage
+    case androidInitBootImage
+    case androidVendorBootImage
     case rawARM64Binary
     case metadataManifest
     case restrictedPackage
@@ -147,6 +151,18 @@ public enum BootArtifactClassifier {
             return .androidSuperImage
         }
 
+        if lastPathComponent == "boot.img" {
+            return .androidBootImage
+        }
+
+        if lastPathComponent == "init_boot.img" {
+            return .androidInitBootImage
+        }
+
+        if lastPathComponent == "vendor_boot.img" {
+            return .androidVendorBootImage
+        }
+
         if lastPathComponent.hasSuffix(".json") {
             return .metadataManifest
         }
@@ -172,6 +188,7 @@ public enum BootAdapterRegistry {
         RTOSPlanningAdapter(),
         LinuxDirectBootPlanningAdapter(),
         AOSPBootPlanningAdapter(),
+        LineageOSBootPlanningAdapter(),
         BSDDirectBootPlanningAdapter(),
         ProprietaryBoundaryPlanningAdapter()
     ]
@@ -306,6 +323,67 @@ public struct AOSPBootPlanningAdapter: BootPlanningAdapter {
             preferences: preferences,
             nextSteps: ["Boot open Linux first.", "Add Android ramdisk and partition metadata.", "Model virtio block/net/input/display.", "Keep proprietary Google or vendor components out of scope."]
         )
+    }
+}
+
+public struct LineageOSBootPlanningAdapter: BootPlanningAdapter {
+    public let descriptor = BootAdapterDescriptor(
+        identifier: "lineageos",
+        displayName: "LineageOS (VirtIO ARM64)",
+        useCase: .lineageOS,
+        status: .loadable,
+        requiredArtifactKinds: [],
+        optionalArtifactKinds: [
+            .androidBootImage,
+            .androidInitBootImage,
+            .androidVendorBootImage,
+            .arm64KernelImage,
+            .initrd,
+            .androidSystemImage,
+            .androidVendorImage,
+            .androidProductImage,
+            .androidSuperImage,
+            .diskImage
+        ],
+        notes: [
+            "Targets LineageOS virtio_arm64 builds on the emulator's generic VirtIO platform.",
+            "The launcher accepts Android v3/v4 boot.img or an unpacked ARM64 Image plus ramdisk.",
+            "Device-specific phone OTA packages, vendor_boot merging, AVB, and dynamic-partition assembly are not launchable yet."
+        ]
+    )
+
+    public init() {}
+
+    public func plan(for artifacts: [BootArtifactDescriptor], preferences: ARM64VizPreferences) -> BootPlan {
+        var plan = standardPlan(
+            descriptor: descriptor,
+            artifacts: artifacts,
+            preferences: preferences,
+            nextSteps: [
+                "Use a LineageOS virtio_arm64 build rather than a phone-specific OTA.",
+                "Run prepare-linux boot.img --lineageos, or supply Image --lineageos --initrd ramdisk.",
+                "Add vendor_boot/init_boot composition and Android partition mapping.",
+                "Complete DRM/HWC, Android input, networking, and required HAL compatibility."
+            ]
+        )
+
+        let kinds = Set(artifacts.map(\.kind))
+        let hasPackedBoot = kinds.contains(.androidBootImage)
+        let hasUnpackedBoot = kinds.contains(.arm64KernelImage) && kinds.contains(.initrd)
+        var findings = plan.findings
+        if !hasPackedBoot && !hasUnpackedBoot {
+            findings.append("LineageOS requires boot.img or both an unpacked ARM64 kernel Image and ramdisk")
+        }
+
+        plan = BootPlan(
+            adapter: descriptor,
+            matchesArtifacts: (hasPackedBoot || hasUnpackedBoot) && findings.isEmpty,
+            canLaunchNow: false,
+            findings: findings,
+            warnings: plan.warnings,
+            nextSteps: plan.nextSteps
+        )
+        return plan
     }
 }
 

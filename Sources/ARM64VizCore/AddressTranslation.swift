@@ -75,8 +75,8 @@ public enum ARM64Stage1Translator {
             return virtualAddress
         }
 
-        let usesTTBR1 = (virtualAddress >> 63) == 1
         let tcr = vm.systemRegisters.rawValue(for: ARM64SystemRegister.tcrEL1)
+        let usesTTBR1 = usesTTBR1(virtualAddress: virtualAddress, tcr: tcr)
         let sizeOffset = usesTTBR1 ? 16 : 0
         let tsz = Int((tcr >> UInt64(sizeOffset)) & 0x3f)
         let inputAddressSize = 64 - tsz
@@ -108,6 +108,7 @@ public enum ARM64Stage1Translator {
             originalVirtualAddress: virtualAddress,
             access: access,
             tableBase: tableBase,
+            inputAddressSize: inputAddressSize,
             vm: vm
         )
     }
@@ -117,11 +118,13 @@ public enum ARM64Stage1Translator {
         originalVirtualAddress: GuestAddress,
         access: GuestMemoryAccessKind,
         tableBase: GuestAddress,
+        inputAddressSize: Int,
         vm: VirtualMachine
     ) throws -> GuestAddress {
         var currentTable = tableBase
+        let startLevel = initial4KBLookupLevel(inputAddressSize: inputAddressSize)
 
-        for level in 0...3 {
+        for level in startLevel...3 {
             let shift = 39 - (level * 9)
             let index = (virtualAddress >> UInt64(shift)) & 0x1ff
             let descriptorAddress = currentTable + index * 8
@@ -197,6 +200,25 @@ public enum ARM64Stage1Translator {
             level: 3,
             statusCode: .translation(level: 3)
         )
+    }
+
+    public static func usesTTBR1(virtualAddress: GuestAddress, tcr: UInt64) -> Bool {
+        // With Top Byte Ignore enabled, bits 63:56 are a logical tag and bit
+        // 55 identifies the lower (TTBR0) or upper (TTBR1) address range.
+        // Android's allocator uses tagged lower-range pointers whose bit 63
+        // may therefore be one.
+        let rangeFromBit55 = ((virtualAddress >> 55) & 1) != 0
+        let tbiBit: UInt64 = rangeFromBit55 ? 38 : 37
+        if ((tcr >> tbiBit) & 1) != 0 {
+            return rangeFromBit55
+        }
+        return (virtualAddress >> 63) != 0
+    }
+
+    static func initial4KBLookupLevel(inputAddressSize: Int) -> Int {
+        let indexedBits = max(0, inputAddressSize - 12)
+        let lookupLevels = max(1, (indexedBits + 8) / 9)
+        return max(0, 4 - lookupLevels)
     }
 
     private static func validateLeafAccess(

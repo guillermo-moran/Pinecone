@@ -6,6 +6,15 @@ options:
 packages:
   ARM64Viz:
     path: ../../..
+schemes:
+  MobileOSHost:
+    build:
+      targets:
+        MobileOSHost: all
+    run:
+      config: Release
+    profile:
+      config: Release
 targets:
   MobileOSHost:
     type: application
@@ -28,14 +37,24 @@ targets:
     dependencies:
       - package: ARM64Viz
         product: ARM64VizCore
+    postBuildScripts:
+      - name: Embed optional VirGL graphics frameworks
+        script: 'sh "$SRCROOT/../../../scripts/graphics/embed-renderer-frameworks.sh"'
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - "$(SRCROOT)/../../../.build"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)"
     info:
       path: Sources/Info.plist
       properties:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSRequiresIPhoneOS: true
+        LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSupportsIndirectInputEvents: true
         UIRequiresFullScreen: true
+        UIFileSharingEnabled: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

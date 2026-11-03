@@ -1824,7 +1824,7 @@ static uint64_t avz_fast_translation_context_tag(
     if (!fast_path->native_translation_enabled) {
         return 0;
     }
-    return virtual_address >> 63
+    return avz_native_stage1_uses_ttbr1(&fast_path->translation_state, virtual_address)
         ? fast_path->high_translation_context_tag
         : fast_path->low_translation_context_tag;
 }
@@ -1836,7 +1836,7 @@ static uint64_t avz_fast_translation_context_hash(
     if (!fast_path->native_translation_enabled) {
         return 0;
     }
-    return virtual_address >> 63
+    return avz_native_stage1_uses_ttbr1(&fast_path->translation_state, virtual_address)
         ? fast_path->high_translation_context_hash
         : fast_path->low_translation_context_hash;
 }
@@ -1953,7 +1953,10 @@ static int avz_stage1_translate(
     }
 
     AVZ_MEMORY_STAT_INCREMENT(fast_path, native_page_table_walks);
-    uint8_t uses_ttbr1 = (uint8_t)(virtual_address >> 63);
+    uint8_t uses_ttbr1 = avz_native_stage1_uses_ttbr1(
+        &fast_path->translation_state,
+        virtual_address
+    );
     unsigned size_offset = uses_ttbr1 ? 16u : 0u;
     unsigned tsz = (unsigned)(
         (fast_path->translation_state.tcr_el1 >> size_offset) & 0x3fu
@@ -1985,7 +1988,15 @@ static int avz_stage1_translate(
 
     uint64_t effective_address = virtual_address &
         ((1ULL << input_address_size) - 1u);
-    for (uint8_t level = 0; level <= 3; level++) {
+    unsigned indexed_bits = input_address_size > 12u
+        ? input_address_size - 12u
+        : 0u;
+    unsigned lookup_levels = (indexed_bits + 8u) / 9u;
+    if (lookup_levels == 0u) {
+        lookup_levels = 1u;
+    }
+    uint8_t start_level = (uint8_t)(4u - lookup_levels);
+    for (uint8_t level = start_level; level <= 3; level++) {
         unsigned shift = 39u - ((unsigned)level * 9u);
         uint64_t index = (effective_address >> shift) & 0x1ffu;
         if (current_table > UINT64_MAX - index * sizeof(uint64_t)) {
@@ -2404,6 +2415,19 @@ static uint64_t avz_fast_load(
     return value;
 }
 
+#ifndef AVZ_INSTRUCTION_TLB_MRU
+#define AVZ_INSTRUCTION_TLB_MRU 1
+#endif
+static inline int avz_instruction_hot_matches(
+    const AVZNativeMemoryFastPath *fast_path, const AVZNativeFastTLBEntry *entry,
+    uint64_t virtual_page, uint64_t context_tag, uint64_t page_offset
+) {
+    return entry->valid &&
+        entry->generation == fast_path->hot_translation_generation &&
+        entry->contiguous_span >= page_offset + sizeof(uint32_t) &&
+        entry->virtual_page == virtual_page && entry->context_tag == context_tag;
+}
+
 static int avz_fast_translate_instruction(
     AVZNativeMemoryFastPath *fast_path,
     uint64_t virtual_address,
@@ -2431,20 +2455,31 @@ static int avz_fast_translate_instruction(
     uint64_t physical_page = 0;
     uint8_t *host_page = NULL;
     AVZNativeFastTLBEntry *entry = NULL;
-
     for (size_t index = 0; index < AVZ_FAST_INSTRUCTION_HOT_COUNT; index++) {
         AVZNativeFastTLBEntry *candidate =
             &fast_path->instruction_hot[index];
-        if (candidate->valid &&
-            candidate->generation == fast_path->hot_translation_generation &&
-            candidate->contiguous_span >= page_offset + sizeof(uint32_t) &&
-            candidate->virtual_page == virtual_page &&
-            candidate->context_tag == context_tag) {
+        if (avz_instruction_hot_matches(fast_path, candidate, virtual_page, context_tag, page_offset)) {
             entry = candidate;
-            AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_hits);
-            AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_hot_hits);
+#if AVZ_INSTRUCTION_TLB_MRU
+            /* Repeated instruction-page certification should hit fixed slot
+             * zero, without adding a dependent hint lookup to every access.
+             * Promote only after reuse, avoiding swaps for cyclic scans. */
+            if (index != 0) {
+                if (fast_path->instruction_hot_last_hit == index) {
+                    AVZNativeFastTLBEntry temporary = fast_path->instruction_hot[0];
+                    fast_path->instruction_hot[0] = *candidate;
+                    *candidate = temporary;
+                    entry = &fast_path->instruction_hot[0];
+                    fast_path->instruction_hot_last_hit = 0;
+                } else fast_path->instruction_hot_last_hit = (uint8_t)index;
+            }
+#endif
             break;
         }
+    }
+    if (entry != NULL) {
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_hits);
+        AVZ_MEMORY_STAT_INCREMENT(fast_path, instruction_tlb_hot_hits);
     }
     if (entry == NULL) {
         uint64_t page_hash = virtual_page ^ (virtual_page >> 11) ^
@@ -2545,6 +2580,9 @@ static int avz_fast_translate_instruction(
         );
         fast_path->instruction_hot[hot_slot] = *entry;
         fast_path->instruction_hot[hot_slot].generation = fast_path->hot_translation_generation;
+#if AVZ_INSTRUCTION_TLB_MRU
+        fast_path->instruction_hot_last_hit = 0;
+#endif
     }
 
     physical_page = entry->physical_page;
@@ -3499,6 +3537,169 @@ int avz_native_fast_memory_exclusive_write(
         fast_path, physical_address, width, contains_code);
     atomic_fetch_add_explicit(
         &memory->exclusive_write_successes, 1, memory_order_relaxed);
+    avz_guest_memory_unlock_range_internal(memory, memory_offset, width);
+    return 1;
+}
+
+/* Keep the LSE update indivisible from naturally aligned ordinary guest
+ * stores.  The page lock serializes observed/exclusive and other LSE paths,
+ * but a store that passed the observation check immediately before the first
+ * LSE access can still be in flight.  A host compare-exchange supplies the
+ * required single-copy atomic linearization for that registration race. */
+static int avz_fast_atomic_compare_exchange(
+    uint8_t *host_address,
+    uint8_t width,
+    uint64_t *expected,
+    uint64_t desired
+) {
+    switch (width) {
+    case 1: {
+        uint8_t typed_expected = (uint8_t)*expected;
+        const int exchanged = __atomic_compare_exchange_n(
+            host_address, &typed_expected, (uint8_t)desired, 0,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        *expected = typed_expected;
+        return exchanged;
+    }
+    case 2: {
+        uint16_t typed_expected = (uint16_t)*expected;
+        const int exchanged = __atomic_compare_exchange_n(
+            (uint16_t *)host_address, &typed_expected, (uint16_t)desired, 0,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        *expected = typed_expected;
+        return exchanged;
+    }
+    case 4: {
+        uint32_t typed_expected = (uint32_t)*expected;
+        const int exchanged = __atomic_compare_exchange_n(
+            (uint32_t *)host_address, &typed_expected, (uint32_t)desired, 0,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        *expected = typed_expected;
+        return exchanged;
+    }
+    case 8: {
+        uint64_t typed_expected = *expected;
+        const int exchanged = __atomic_compare_exchange_n(
+            (uint64_t *)host_address, &typed_expected, desired, 0,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        *expected = typed_expected;
+        return exchanged;
+    }
+    default:
+        return 0;
+    }
+}
+
+int avz_native_fast_memory_atomic_rmw(
+    void *context,
+    uint64_t virtual_address,
+    uint8_t width,
+    uint8_t operation,
+    uint64_t operand,
+    uint64_t replacement,
+    uint64_t *old_value
+) {
+    AVZNativeMemoryFastPath *fast_path = context;
+    uint64_t physical_address = 0;
+    uint8_t *host_address = NULL;
+    if (fast_path == NULL || fast_path->guest_memory == NULL ||
+        old_value == NULL ||
+        !(width == 1 || width == 2 || width == 4 || width == 8) ||
+        (virtual_address & (uint64_t)(width - 1u)) != 0 ||
+        operation > AVZ_NATIVE_LSE_UNSIGNED_MIN ||
+        avz_fast_translate(
+            fast_path,
+            virtual_address,
+            width,
+            1,
+            &physical_address,
+            &host_address
+        ) != AVZ_FAST_TRANSLATION_RAM) {
+        return 0;
+    }
+
+    AVZGuestMemory *memory = fast_path->guest_memory;
+    size_t memory_offset = (size_t)(physical_address - fast_path->ram_base);
+    const uint64_t mask = width == 8
+        ? UINT64_MAX
+        : ((UINT64_C(1) << (width * 8u)) - 1u);
+    avz_guest_memory_lock_range_internal(memory, memory_offset, width);
+    avz_guest_memory_note_exclusive_observation(memory, memory_offset, width);
+    uint64_t old = operation == AVZ_NATIVE_LSE_COMPARE_EXCHANGE
+        ? operand & mask
+        : avz_fast_load(host_address, width) & mask;
+    uint64_t updated = old;
+    int should_write = 0;
+    do {
+        switch (operation) {
+        case AVZ_NATIVE_LSE_COMPARE_EXCHANGE:
+            updated = replacement & mask;
+            break;
+        case AVZ_NATIVE_LSE_ADD:
+            updated = (old + operand) & mask;
+            break;
+        case AVZ_NATIVE_LSE_CLEAR:
+            updated = old & ~(operand & mask) & mask;
+            break;
+        case AVZ_NATIVE_LSE_SWAP:
+            updated = operand & mask;
+            break;
+        case AVZ_NATIVE_LSE_XOR:
+            updated = old ^ (operand & mask);
+            break;
+        case AVZ_NATIVE_LSE_SET:
+            updated = old | (operand & mask);
+            break;
+        case AVZ_NATIVE_LSE_SIGNED_MAX:
+        case AVZ_NATIVE_LSE_SIGNED_MIN: {
+            const uint64_t candidate = operand & mask;
+            const uint64_t sign_bit = UINT64_C(1) << (width * 8u - 1u);
+            const int old_negative = (old & sign_bit) != 0;
+            const int candidate_negative = (candidate & sign_bit) != 0;
+            const int old_greater = old_negative == candidate_negative
+                ? old > candidate
+                : !old_negative;
+            if (operation == AVZ_NATIVE_LSE_SIGNED_MAX) {
+                updated = old_greater ? old : candidate;
+            } else {
+                updated = old_greater ? candidate : old;
+            }
+            break;
+        }
+        case AVZ_NATIVE_LSE_UNSIGNED_MAX: {
+            const uint64_t candidate = operand & mask;
+            updated = old > candidate ? old : candidate;
+            break;
+        }
+        case AVZ_NATIVE_LSE_UNSIGNED_MIN: {
+            const uint64_t candidate = operand & mask;
+            updated = old < candidate ? old : candidate;
+            break;
+        }
+        default:
+            avz_guest_memory_unlock_range_internal(
+                memory, memory_offset, width);
+            return 0;
+        }
+
+        uint64_t expected = old;
+        should_write = avz_fast_atomic_compare_exchange(
+            host_address, width, &expected, updated);
+        old = expected & mask;
+        /* Guest CAS is one comparison, not a retry loop.  Other LSE RMWs
+         * retry after a racing ordinary store and recompute from its value. */
+        if (operation == AVZ_NATIVE_LSE_COMPARE_EXCHANGE) {
+            break;
+        }
+    } while (!should_write);
+    fast_path->exclusive_expected_valid = 0;
+    if (should_write) {
+        int contains_code = avz_fast_mark_dirty(
+            fast_path, physical_address, width);
+        avz_fast_invalidate_code_after_write(
+            fast_path, physical_address, width, contains_code);
+    }
+    *old_value = old;
     avz_guest_memory_unlock_range_internal(memory, memory_offset, width);
     return 1;
 }

@@ -121,6 +121,23 @@ static int prepare_bounded(AGServiceChain *c) {
         c->bounded_proofs[i] = (AGBoundedProof){b->serial, b->expected_serial,
             b->local_generation, b->expected_local_generation,
             b->shared_generation, b->expected_shared_generation};
+        /* Several decoded blocks can share one physical page. Keep every
+         * serial proof, but read each identical page certificate once per
+         * edge. Compare pointer AND captured value, separately for owner-local
+         * and atomic shared tokens; these roles must never be conflated.
+         * The first certificate retains its live load (acquire for shared).
+         * This does not cache a generation value or skip an edge check. */
+#if !defined(AG_SERVICE_DEDUP_PAGE_PROOFS) || AG_SERVICE_DEDUP_PAGE_PROOFS
+        for (size_t prior = 0; prior < i; prior++) {
+            const AGServiceBlock *p = &c->members[prior].proof;
+            if (b->local_generation && b->local_generation == p->local_generation &&
+                b->expected_local_generation == p->expected_local_generation)
+                c->bounded_proofs[i].local_generation = NULL;
+            if (b->shared_generation && b->shared_generation == p->shared_generation &&
+                b->expected_shared_generation == p->expected_shared_generation)
+                c->bounded_proofs[i].shared_generation = NULL;
+        }
+#endif
         for (size_t j = 0; j < b->count; j++) {
             m->bounded_gates[j] = (AGOperation){.handler = ag_bounded_boundary,
                 .next_pc = b->base + j * 4, .immediate = i, .taken = &copies[i]->operations[j]};

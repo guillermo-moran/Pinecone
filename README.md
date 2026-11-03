@@ -18,7 +18,7 @@ The former JavaScript MobileOS prototype has been removed.
 ## Current Capabilities
 
 - Direct ARM64 Linux boot with a generated device tree, GIC, timers, and PL011 console.
-- Two parallel vCPUs in the iOS host.
+- Two parallel vCPUs for Alpine and four for LineageOS in the iOS host.
 - Persistent ext4 storage through virtio-block.
 - BusyBox/Alpine shell utilities, `apk`, and a graphical **Packages** application.
 - Phosh with a Home grid, favorites dock, Recent Apps, and All Apps.
@@ -28,9 +28,14 @@ The former JavaScript MobileOS prototype has been removed.
 - Touch and keyboard forwarding, plus a separate serial terminal.
 - Paravirtual 2D graphics with eligible Pixman operations executed by Metal.
 
-The guest is a project-built Linux kernel and customized Alpine userspace, not
-an official postmarketOS image. Android, Waydroid, LineageOS, and iOS guests are
-not supported boot targets.
+The default guest is a project-built Linux kernel and customized Alpine
+userspace, not an official postmarketOS image. The host also offers an
+experimental **Android (LineageOS)** boot option for the generic
+`virtio_arm64only` target. It now boots through Android's dynamic partitions,
+APEX activation, zygote, and second-stage service startup. The VirtIO GPU
+produces live boot-console frames and Android later clears the display, but the
+Lineage launcher has not appeared yet. Waydroid, device-specific phone images,
+and iOS remain unsupported boot targets.
 
 ## Architecture
 
@@ -177,6 +182,34 @@ The toy guest exercises the emulator and UART; it is not the Alpine desktop.
 swift run -c release arm64viz --help
 swift run -c release arm64viz adapters
 ```
+
+The LineageOS path accepts a `virtio_arm64only` Android v3/v4 `boot.img`, its
+`vendor_boot.img`, and separate system/userdata disks:
+
+```sh
+scripts/fetch-lineageos-arm64only.sh
+LINEAGE_LPUNPACK=/path/to/lpunpack scripts/patch-lineageos-vendor-dlkm.sh
+swift run -c release arm64viz run-lineageos-trace \
+  artifacts/lineageos-virtio-arm64only-v2026.10.18/boot.img \
+  --vendor-boot artifacts/lineageos-virtio-arm64only-v2026.10.18/vendor_boot.img \
+  --disk artifacts/lineageos-virtio-arm64only-v2026.10.18/vda-arm64viz.raw \
+  --secondary-disk artifacts/lineageos-virtio-arm64only-v2026.10.18/vdb.raw \
+  --memory-mib 1024 --vcpus 4 --max-steps 50000000000 --stop-on-display
+```
+
+This boots well beyond `/init`: the guest discovers both VirtIO PCI disks,
+mounts its dynamic partitions, activates APEX packages, and starts Android
+services. The separate patch step produces a recoverable copy of the system
+disk without the optional `virt_wifi` module that currently faults under
+Pinecone; the downloaded `vda.raw` remains untouched. GPU presentation is
+working, but the guest currently leaves a black screen after clearing the boot
+console rather than reaching the launcher. Android 13+ images with a separate
+generic ramdisk can add `--init-boot path/to/init_boot.img`. See
+[LineageOS boot bring-up](docs/lineageos-boot.md) for the supported artifact
+contract and current blockers. For a smaller Android target that still keeps
+the launcher and display stack, see the [lean LineageOS build
+profile](docs/lean-lineageos-build.md). The downloaded image can also be
+audited with the guarded [image inspection workflow](docs/lineageos-lean-image.md).
 
 The CLI also supports Linux handoff preparation, bounded execution traces,
 instruction auditing, differential execution, FDT inspection, policy validation,
@@ -431,7 +464,7 @@ Useful Xcode launch environment variables:
 | Variable | Purpose |
 | --- | --- |
 | `PINECONE_VERBOSE_BOOT=1` | Detailed kernel output and early console |
-| `PINECONE_ASSEMBLY_EXECUTOR=0` | Compare against the established C executor |
+| `PINECONE_ASSEMBLY_EXECUTOR=0` | Use the C executor instead of the iOS assembly default; the CLI stays C by default and accepts `=1` to enable assembly |
 | `PINECONE_GUEST_MEMORY_MB` | Guest RAM override, clamped to 128-1024 MiB |
 | `PINECONE_SIMULATOR_AUTORUN_COMMAND` | Replace Phosh autostart in Simulator; use `true` for shell-only work |
 | `PINECONE_SIMULATOR_DUMP_UART=1` | Capture guest UART diagnostics |

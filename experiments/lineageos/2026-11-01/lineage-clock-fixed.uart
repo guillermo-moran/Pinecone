@@ -1,0 +1,133 @@
+[    0.000000][    T0] Booting Linux on physical CPU 0x0000000000 [0x410fd034]
+[    0.000000][    T0] Linux version 6.12.81-4k-g4f6bf47200d9 (root@1b9aea7f9186) (Android (14054515, +pgo, +bolt, +lto, +mlgo, based on r563880c) clang version 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 5e96669f06077099aa41290cdb4c5e6fa0f59349), LLD 21.0.0 (/mnt/disks/build-disk/src/googleplex-android/llvm-r563880-release/out/llvm-project/llvm 5e96669f06077099aa41290cdb4c5e6fa0f59349)) #1 SMP PREEMPT Mon Oct 19 11:58:28 UTC 2026
+[    0.000000][    T0] KASLR disabled due to lack of seed
+[    0.000000][    T0] Machine model: arm64viz-lineageos
+[    0.000000][    T0] KVM is not available. Ignoring kvm-arm.mode
+[    0.000000][    T0] earlycon: pl11 at MMIO32 0x0000000009000000 (options '')
+[    0.000000][    T0] printk: legacy bootconsole [pl11] enabled
+[    0.000000][    T0] Kernel command line: console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 loglevel=6 vt.global_cursor_default=0 androidboot.console=ttyAMA0 androidboot.hardware=virtio androidboot.partition_map=vdb,userdata androidboot.graphics=mesa_swrast androidboot.hwui_renderer=skiagl binder.impl=rust firmware_class.path=/vendor/firmware/ log_buf_len=4M loop.max_part=7 printk.devkmsg=on rw vt.global_cursor_default=0 acpi=nospcr androidboot.verifiedbootstate=orange bootconfig
+[   27.172871][    C0] watchdog: BUG: soft lockup - CPU#0 stuck for 25s! [swapper/0:0]
+[   27.173292][    C0] CPU#0 Utilization every 4s during lockup:
+[   27.173408][    C0] 	#1:   0% system,	129% softirq,	  8% hardirq,	  0% idle
+[   27.173607][    C0] 	#2:   0% system,	128% softirq,	  8% hardirq,	  0% idle
+[   27.173747][    C0] 	#3:   0% system,	128% softirq,	  8% hardirq,	  0% idle
+[   27.173882][    C0] 	#4:   0% system,	129% softirq,	  9% hardirq,	  0% idle
+[   27.174019][    C0] 	#5:   0% system,	128% softirq,	  8% hardirq,	  0% idle
+[   27.174170][    C0] Modules linked in:
+[   27.174532][    C0] CPU: 0 UID: 0 PID: 0 Comm: swapper/0 Not tainted 6.12.81-4k-g4f6bf47200d9 #1 2c59ee96603941226c4d5bd9084ba1c548185b7b
+[   27.174905][    C0] Hardware name: arm64viz-lineageos (DT)
+[   27.175054][    C0] pstate: 40400005 (nZcv daif +PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+[   27.175267][    C0] pc : handle_softirqs+0xc0/0x3f0
+[   27.175735][    C0] lr : handle_softirqs+0x88/0x3f0
+[   27.175945][    C0] sp : ffffffc082b7bf60
+[   27.176020][    C0] x29: ffffffc082b7bf80 x28: ffffffc08285db80 x27: 0000000000000001
+[   27.176372][    C0] x26: 0000000000000200 x25: ffffffc08281fc70 x24: ffffffc082800cd0
+[   27.176628][    C0] x23: ffffffc082800990 x22: ffffffc082825540 x21: 0000000000000000
+[   27.176879][    C0] x20: ffffffc0828460c0 x19: ffffffc08285db80 x18: ffffffc082b71000
+[   27.177133][    C0] x17: 00000000c006287d x16: 00000000c006287d x15: 0000000000000004
+[   27.177377][    C0] x14: 0000000000000004 x13: 0000000000000004 x12: 000000000005dc06
+[   27.177621][    C0] x11: 000000000000000a x10: 0000000005355555 x9 : 0000000000fdc1e9
+[   27.177876][    C0] x8 : ffffffbfbce6a000 x7 : 0000000000000000 x6 : 0000000000000001
+[   27.178114][    C0] x5 : 0000000000000001 x4 : 0000000000000001 x3 : 00000000000025ec
+[   27.178347][    C0] x2 : ffffffc082bc000c x1 : 0000000000000100 x0 : 0000000000fde7d5
+[   27.178615][    C0] Call trace:
+[   27.178684][    C0]  handle_softirqs+0xc0/0x3f0
+[   27.178915][    C0]  __do_softirq+0x14/0x20
+[   27.179090][    C0]  ____do_softirq+0x10/0x20
+[   27.179272][    C0]  call_on_irq_stack+0x48/0x68
+[   27.179451][    C0]  do_softirq_own_stack+0x1c/0x2c
+[   27.179635][    C0]  irq_exit_rcu+0x54/0xa8
+[   27.179824][    C0]  el1_interrupt+0x48/0x90
+[   27.179992][    C0]  el1h_64_irq_handler+0x18/0x24
+[   27.180160][    C0]  el1h_64_irq+0x7c/0x80
+[   27.180318][    C0]  arch_local_irq_enable+0x8/0x20
+[   27.180508][    C0]  do_idle+0x1b0/0x378
+[   27.180748][    C0]  cpu_startup_entry+0x34/0x3c
+[   27.180995][    C0]  rest_init+0xdc/0xe0
+[   27.181194][    C0]  start_kernel+0x35c/0x440
+[   27.181387][    C0]  __primary_switched+0x88/0x94
+[   28.582151][    C0] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
+[   28.584613][    C0] rcu: 	(detected by 0, t=5252 jiffies, g=-1191, q=13 ncpus=2)
+[   28.585897][    C0] rcu: All QSes seen, last rcu_preempt kthread activity 5252 (4294897551-4294892299), jiffies_till_next_fqs=1, root ->qsmask 0x0
+[   28.587973][    C0] rcu: rcu_preempt kthread starved for 5252 jiffies! g-1191 f0x2 RCU_GP_WAIT_FQS(5) ->state=0x0 ->cpu=0
+[   28.589439][    C0] rcu: 	Unless rcu_preempt kthread gets sufficient CPU time, OOM is now expected behavior.
+[   28.590399][    C0] rcu: RCU grace-period kthread stack dump:
+[   28.602298][    C0] rcu: Stack dump where RCU GP kthread last ran:
+[   28.603098][    C0] CPU: 0 UID: 0 PID: 18 Comm: rcu_preempt Tainted: G             L     6.12.81-4k-g4f6bf47200d9 #1 2c59ee96603941226c4d5bd9084ba1c548185b7b
+[   28.604770][    C0] Tainted: [L]=SOFTLOCKUP
+[   28.605264][    C0] Hardware name: arm64viz-lineageos (DT)
+[   28.606097][    C0] pstate: 40400005 (nZcv daif +PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+[   28.606756][    C0] pc : handle_softirqs+0xc0/0x3f0
+[   28.607316][    C0] lr : handle_softirqs+0x88/0x3f0
+[   28.607856][    C0] sp : ffffffc082b7bf60
+[   28.608231][    C0] x29: ffffffc082b7bf80 x28: ffffff80032e9440 x27: ffffff80032e9440
+[   28.609094][    C0] x26: 0000000000000002 x25: 0000000000000000 x24: ffffffc082800cd0
+[   28.609981][    C0] x23: ffffffc082800990 x22: ffffffc082825540 x21: 0000000000000000
+[   28.610889][    C0] x20: ffffffc0828460c0 x19: ffffff80032e9440 x18: ffffffc082b71000
+[   28.611758][    C0] x17: 00000000c006287d x16: 00000000c006287d x15: 000000000000ba7e
+[   28.612632][    C0] x14: 0000000000000fe8 x13: 0000000000000004 x12: 0000000027f3678e
+[   28.613601][    C0] x11: 000000000000000a x10: 0000000005355555 x9 : 0000000680a738cc
+[   28.614526][    C0] x8 : ffffffbfbce6a000 x7 : 0000000000008080 x6 : 8080000000000000
+[   28.615404][    C0] x5 : 0000000000000001 x4 : 0000000000000001 x3 : 000000000000646c
+[   28.616192][    C0] x2 : ffffffc082bc000c x1 : 0000000000000100 x0 : 0000000680a79d38
+[   28.616946][    C0] Call trace:
+[   28.617232][    C0]  handle_softirqs+0xc0/0x3f0
+[   28.617720][    C0]  __do_softirq+0x14/0x20
+[   28.618153][    C0]  ____do_softirq+0x10/0x20
+[   28.618610][    C0]  call_on_irq_stack+0x48/0x68
+[   28.619077][    C0]  do_softirq_own_stack+0x1c/0x2c
+[   28.619555][    C0]  irq_exit_rcu+0x54/0xa8
+[   28.620009][    C0]  el1_interrupt+0x48/0x90
+[   28.620450][    C0]  el1h_64_irq_handler+0x18/0x24
+[   28.620914][    C0]  el1h_64_irq+0x7c/0x80
+[   28.621342][    C0]  finish_task_switch+0x94/0x28c
+[   28.621831][    C0]  __schedule+0x9a8/0xf84
+[   28.622330][    C0]  schedule+0x74/0x10c
+[   28.622788][    C0]  schedule_timeout+0x90/0x1ac
+[   28.623231][    C0]  rcu_gp_fqs_loop+0x1e4/0x8f4
+[   28.623671][    C0]  rcu_gp_kthread+0x64/0x208
+[   28.624098][    C0]  kthread+0x11c/0x1c8
+[   28.624500][    C0]  ret_from_fork+0x10/0x20
+[   54.494440][    C0] watchdog: BUG: soft lockup - CPU#0 stuck for 25s! [kthreadd:2]
+[   54.494953][    C0] CPU#0 Utilization every 4s during lockup:
+[   54.495146][    C0] 	#1:  13% system,	112% softirq,	 11% hardirq,	  0% idle
+[   54.495441][    C0] 	#2:   0% system,	128% softirq,	  9% hardirq,	  0% idle
+[   54.495679][    C0] 	#3:   0% system,	127% softirq,	  8% hardirq,	  0% idle
+[   54.496171][    C0] 	#4:   0% system,	128% softirq,	 10% hardirq,	  0% idle
+[   54.496717][    C0] 	#5:   0% system,	128% softirq,	 10% hardirq,	  0% idle
+[   54.497092][    C0] Modules linked in:
+[   54.497381][    C0] CPU: 0 UID: 0 PID: 2 Comm: kthreadd Tainted: G             L     6.12.81-4k-g4f6bf47200d9 #1 2c59ee96603941226c4d5bd9084ba1c548185b7b
+[   54.497807][    C0] Tainted: [L]=SOFTLOCKUP
+[   54.497910][    C0] Hardware name: arm64viz-lineageos (DT)
+[   54.498048][    C0] pstate: 40400005 (nZcv daif +PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+[   54.498351][    C0] pc : handle_softirqs+0xc0/0x3f0
+[   54.498806][    C0] lr : handle_softirqs+0x88/0x3f0
+[   54.499127][    C0] sp : ffffffc082b7bf60
+[   54.499241][    C0] x29: ffffffc082b7bf80 x28: ffffff80031cbcc0 x27: ffffffc082a17b00
+[   54.499730][    C0] x26: 0000000000000002 x25: 0000000000000002 x24: ffffffc082800cd0
+[   54.500150][    C0] x23: ffffffc082800990 x22: ffffffc082825540 x21: 0000000000000000
+[   54.500560][    C0] x20: ffffffc0828460c0 x19: ffffff80031cbcc0 x18: ffffffc082b71000
+[   54.500977][    C0] x17: 00000000c006287d x16: 00000000c006287d x15: 0000000000000259
+[   54.501381][    C0] x14: 0000000000000000 x13: 0000000000000004 x12: 0000000028f7d198
+[   54.501781][    C0] x11: 000000000000000a x10: 0000000005355555 x9 : 00000006ab0a0f3d
+[   54.502181][    C0] x8 : ffffffbfbce6a000 x7 : 0000000000000000 x6 : 0000000000000000
+[   54.502572][    C0] x5 : ffffff803f6b2e20 x4 : 0000000000000001 x3 : 0000000000002599
+[   54.502962][    C0] x2 : ffffffc082bc000c x1 : 0000000000000100 x0 : 00000006ab0a34d6
+[   54.503371][    C0] Call trace:
+[   54.503472][    C0]  handle_softirqs+0xc0/0x3f0
+[   54.503830][    C0]  __do_softirq+0x14/0x20
+[   54.504108][    C0]  ____do_softirq+0x10/0x20
+[   54.504379][    C0]  call_on_irq_stack+0x48/0x68
+[   54.504630][    C0]  do_softirq_own_stack+0x1c/0x2c
+[   54.504879][    C0]  irq_exit_rcu+0x54/0xa8
+[   54.505134][    C0]  el1_interrupt+0x48/0x90
+[   54.505362][    C0]  el1h_64_irq_handler+0x18/0x24
+[   54.505594][    C0]  el1h_64_irq+0x7c/0x80
+[   54.505806][    C0]  ___rmqueue_pcplist+0x0/0x117c
+[   54.506048][    C0]  __vmalloc_node_range_noprof+0x37c/0x7c0
+[   54.506300][    C0]  dup_task_struct+0x1b0/0x54c
+[   54.506578][    C0]  copy_process+0x128/0xc74
+[   54.506943][    C0]  kernel_clone+0xb0/0x47c
+[   54.507247][    C0]  kernel_thread+0x78/0xa4
+[   54.507481][    C0]  kthreadd+0x1a4/0x1f0
+[   54.507727][    C0]  ret_from_fork+0x10/0x20

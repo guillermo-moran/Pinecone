@@ -213,7 +213,7 @@ public enum ARM64InstructionClassifier {
                 return "data-processing-1src"
             }
         }
-        if (instruction & 0x7fe0_c000) == 0x1ac0_0000 {
+        if (instruction & 0x7fe0_0000) == 0x1ac0_0000 {
             switch (instruction >> 10) & 0x3f {
             case 0x02:
                 return "udiv"
@@ -227,6 +227,14 @@ public enum ARM64InstructionClassifier {
                 return "asrv"
             case 0x0b:
                 return "rorv"
+            case 0x10: return "crc32b"
+            case 0x11: return "crc32h"
+            case 0x12: return "crc32w"
+            case 0x13: return "crc32x"
+            case 0x14: return "crc32cb"
+            case 0x15: return "crc32ch"
+            case 0x16: return "crc32cw"
+            case 0x17: return "crc32cx"
             default:
                 return "data-processing-2src"
             }
@@ -360,8 +368,8 @@ public enum ARM64InstructionClassifier {
         if (instruction & 0xbfe0_fc00) == 0x2e20_1c00 {
             return "eor-vector"
         }
-        if (instruction & 0xbf20_fc00) == 0x2e20_a400, ((instruction >> 22) & 3) != 3 {
-            return "umaxp-vector"
+        if (instruction & 0xbf20_f400) == 0x2e20_a400, ((instruction >> 22) & 3) != 3 {
+            return ((instruction >> 11) & 1) == 1 ? "uminp-vector" : "umaxp-vector"
         }
         if (instruction & 0xffff_fc00) == 0x5ef1_b800 {
             return "addp-scalar-2d"

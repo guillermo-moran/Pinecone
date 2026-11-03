@@ -1,6 +1,9 @@
+import Foundation
+
 public enum LinuxGuestProfile: String, Codable, Equatable {
     case generic
     case postmarketOS
+    case lineageOS
 
     public var defaultBootArguments: String {
         switch self {
@@ -8,7 +11,78 @@ public enum LinuxGuestProfile: String, Codable, Equatable {
             return "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 root=/dev/vda rw rootwait"
         case .postmarketOS:
             return "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 root=/dev/vda rw rootwait loglevel=7"
+        case .lineageOS:
+            // Keep early progress on the serial console. Binding the kernel's
+            // framebuffer console to tty0 can deadlock console flushing once
+            // SurfaceFlinger and llvmpipe begin presenting Android frames.
+            let graphics = ProcessInfo.processInfo.environment["PINECONE_VIRGL"] == "1" ? "mesa" : "mesa_swrast"
+            return "console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 loglevel=6 vt.global_cursor_default=0 androidboot.console=ttyAMA0 androidboot.seriallogging=ttyAMA0 androidboot.seriallogging.logcat_buffer=all androidboot.hardware=virtio androidboot.partition_map=vdb,userdata androidboot.graphics=\(graphics) androidboot.hwui_renderer=skiagl"
         }
+    }
+
+    public var machineName: String {
+        switch self {
+        case .generic:
+            return "arm64viz-linux-direct"
+        case .postmarketOS:
+            return "arm64viz-postmarketos"
+        case .lineageOS:
+            return "arm64viz-lineageos"
+        }
+    }
+
+    /// Vendor boot images may re-enable the framebuffer console. Keep the
+    /// Android monitor for guest graphics and send boot logs to PL011.
+    public func mergedBootArguments(_ fragments: [String]) -> String {
+        fragments.joined(separator: " ").split(whereSeparator: { $0.isWhitespace })
+            .filter { self != .lineageOS || $0 != "console=tty0" }
+            .joined(separator: " ")
+    }
+
+    /// Interactive guests should use the existing parallel-vCPU execution
+    /// path. Android's framework startup is especially sensitive to having
+    /// enough runnable CPUs; a single software vCPU turns service timeouts
+    /// into billions of avoidable guest instructions.
+    public var recommendedVirtualCPUCount: Int {
+        switch self {
+        case .generic, .postmarketOS:
+            return 2
+        case .lineageOS:
+            return 4
+        }
+    }
+
+    /// Host-monotonic counter rate used while several software vCPUs execute.
+    /// Android's debug-oriented kernel performs enough work per timer tick that
+    /// a real-time 24 MHz counter can remain perpetually overdue on this
+    /// interpreter. Keep the architectural CNTFRQ at 24 MHz, but dilate host
+    /// time for LineageOS so timer work cannot starve boot progress.
+    public var recommendedCounterTicksPerHostSecond: UInt32 {
+        switch self {
+        case .generic, .postmarketOS:
+            return 24_000_000
+        case .lineageOS:
+            return 1_000_000
+        }
+    }
+
+    /// Counter rate after Linux has brought a secondary CPU online. At that
+    /// point the guest has enough aggregate execution capacity for a faster
+    /// clock, while a modest dilation still prevents timer catch-up storms.
+    public var recommendedSMPActiveCounterTicksPerHostSecond: UInt32 {
+        switch self {
+        case .generic, .postmarketOS:
+            return 24_000_000
+        case .lineageOS:
+            return 6_000_000
+        }
+    }
+
+    /// Once the interactive workload is displayed, reduce Android's boot-time
+    /// dilation without forcing the interpreter to meet full real-time timer
+    /// deadlines. Keep Alpine's existing real-time behavior.
+    public var recommendedInteractiveCounterTicksPerHostSecond: UInt32 {
+        self == .lineageOS ? 12_000_000 : 24_000_000
     }
 }
 
@@ -100,12 +174,17 @@ public struct LinuxDirectBootAdapter: GuestBootAdapter {
         guard !artifacts.kernelImage.isEmpty else {
             throw VMError.unsupportedGuest("Linux direct boot requires a non-empty ARM64 kernel Image")
         }
+        if profile == .lineageOS, artifacts.initrd?.isEmpty != false {
+            throw VMError.unsupportedGuest(
+                "LineageOS direct boot requires a non-empty Android ramdisk from boot.img or init_boot.img"
+            )
+        }
         guard fdtReserveSize >= 4096 else {
             throw VMError.deviceError("FDT reserve must be at least 4096 bytes")
         }
 
         let configuration = BootConfiguration(
-            machineName: profile == .postmarketOS ? "arm64viz-postmarketos" : "arm64viz-linux-direct",
+            machineName: profile.machineName,
             cpuCount: vm.virtualCPUCount,
             cpuEnableMethod: vm.virtualCPUCount > 1 ? "psci" : nil,
             psciMethod: vm.virtualCPUCount > 1 ? "hvc" : nil,
@@ -140,7 +219,8 @@ public struct LinuxDirectBootAdapter: GuestBootAdapter {
 
         let fdt = try artifacts.deviceTreeBlob ?? FlattenedDeviceTree.encode(
             configuration: configuration,
-            initrd: initrdRange
+            initrd: initrdRange,
+            includeAndroidFstab: profile == .lineageOS
         )
         guard UInt64(fdt.count) <= fdtReserveSize else {
             throw VMError.deviceError("generated FDT size \(fdt.count) exceeds reserve \(fdtReserveSize)")
@@ -232,5 +312,39 @@ public struct LinuxDirectBootAdapter: GuestBootAdapter {
         guard !lhs.overlaps(rhs) else {
             throw VMError.deviceError("\(names.0) overlaps \(names.1)")
         }
+    }
+}
+
+public struct LineageOSBootAdapter: GuestBootAdapter {
+    public let identifier = "lineageos"
+    public let artifacts: LinuxBootArtifacts
+    public let kernelLoadAddress: GuestAddress
+    public let fdtReserveSize: UInt64
+    public let bootArguments: String
+
+    public init(
+        artifacts: LinuxBootArtifacts,
+        kernelLoadAddress: GuestAddress = ARM64VizMachineLayout.ramBase + 0x0020_0000,
+        fdtReserveSize: UInt64 = 1024 * 1024,
+        bootArguments: String? = nil
+    ) {
+        self.artifacts = artifacts
+        self.kernelLoadAddress = kernelLoadAddress
+        self.fdtReserveSize = fdtReserveSize
+        self.bootArguments = bootArguments ?? LinuxGuestProfile.lineageOS.defaultBootArguments
+    }
+
+    public func load(into vm: VirtualMachine) throws -> BootConfiguration {
+        try loadWithResult(into: vm).configuration
+    }
+
+    public func loadWithResult(into vm: VirtualMachine) throws -> LinuxBootLoadResult {
+        try LinuxDirectBootAdapter(
+            artifacts: artifacts,
+            profile: .lineageOS,
+            kernelLoadAddress: kernelLoadAddress,
+            fdtReserveSize: fdtReserveSize,
+            bootArguments: bootArguments
+        ).loadWithResult(into: vm)
     }
 }

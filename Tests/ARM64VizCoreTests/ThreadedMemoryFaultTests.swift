@@ -82,6 +82,9 @@ final class ThreadedMemoryFaultTests: XCTestCase {
         let backend = SoftwareARM64Backend()
         backend.enableBasicBlockExecution = true
         backend.fallbackInterpreterPolicy = .nativeOnly
+        // This suite targets the separate threaded-memory prototype, even
+        // when assembly is the application default or explicitly enabled.
+        backend.setNativeAssemblyExecutorEnabled(false)
         backend.setNativeThreadedPrototypeEnabled(true)
         backend.setNativeThreadedMemoryEnabled(true)
         let vm = VirtualMachine(memory: memory, mmio: bus, backend: backend)

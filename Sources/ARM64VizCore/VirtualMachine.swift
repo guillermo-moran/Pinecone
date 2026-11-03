@@ -433,7 +433,14 @@ public final class VirtualMachine {
     public var stopOnEL0Fault: Bool
     public var el0FaultStopSkipCount: Int
     public var stopOnUARTOutput: Bool
-    public var stopOnUARTOutputContaining: String?
+    public var stopOnUARTOutputContaining: String? {
+        didSet {
+            uartStopMarker = stopOnUARTOutputContaining.map { Array($0.utf8) } ?? []
+            uartStopScannedCount = 0
+        }
+    }
+    private var uartStopMarker: [UInt8] = []
+    private var uartStopScannedCount = 0
     public var stopOnGuestMemoryWriteVirtualAddress: GuestAddress?
     public var stopOnGuestMemoryWritePhysicalAddress: GuestAddress?
     public var guestMemoryWriteStopSkipCount: Int
@@ -565,6 +572,7 @@ public final class VirtualMachine {
     }
 
     public func reset(entryPoint: GuestAddress) {
+        uartStopScannedCount = 0
         resetVirtualCPUs(entryPoint: entryPoint)
         mmio.reset()
         interruptController.reset()
@@ -1086,8 +1094,11 @@ public final class VirtualMachine {
 
         let pageOffset = virtualAddress & 0xfff
         let virtualPage = virtualAddress & ~UInt64(0xfff)
-        let usesTTBR1 = (virtualAddress >> 63) == 1
         let tcr = cachedTCR_EL1
+        let usesTTBR1 = ARM64Stage1Translator.usesTTBR1(
+            virtualAddress: virtualAddress,
+            tcr: tcr
+        )
         let ttbr = usesTTBR1 ? cachedTTBR1_EL1 : cachedTTBR0_EL1
         let key = ARM64TranslationCacheKey(
             virtualPage: virtualPage,
@@ -1837,7 +1848,8 @@ public final class VirtualMachine {
         if let uart = device as? VirtualUART, offset == 0 {
             if stopOnUARTOutput {
                 requestStop(.uartOutput(UInt8(value & 0xff)))
-            } else if let marker = stopOnUARTOutputContaining, uart.outputString.contains(marker) {
+            } else if let marker = stopOnUARTOutputContaining,
+                      uart.containsOutput(uartStopMarker, scannedCount: &uartStopScannedCount) {
                 requestStop(.uartOutputContains(marker))
             }
         }

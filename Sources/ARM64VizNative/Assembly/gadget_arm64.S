@@ -192,6 +192,9 @@ HANDLER move
     ldr x10, [x20, #O_IMM]
     WRITE
     NEXT
+#include "fp_moves.inc"
+#include "simd_logic.inc"
+
 HANDLER movk
     READ O_SRC, x10
     ldr x11, [x20, #O_AUX]
@@ -233,6 +236,54 @@ Lready_\name:
 .endm
 FAMILY imm, 32, 0
 FAMILY imm, 64, 0
+// SUBS/CMP + B.cond: publish all arithmetic state and retain its retirement/
+// guard boundary, then enter the known branch handler directly.
+.macro CMPBRANCH width, name=cmpbranch, register=0, write=0
+HANDLER \name\width
+    READ O_SRC, x10
+.if \register
+    READ O_AUX, x11
+.else
+    ldr x11, [x20, #O_IMM]
+.endif
+Lready_\name\width:
+.if \width == 32
+.if \write
+    subs w10, w10, w11
+.else
+    cmp w10, w11
+.endif
+.else
+.if \write
+    subs x10, x10, x11
+.else
+    cmp x10, x11
+.endif
+.endif
+    FLAGS
+.if \write
+    WRITE
+.endif
+    ldr x9, [x20, #O_PC]
+    str x9, [x19, #C_PC]
+    add x20, x20, #O_SIZE
+    add x22, x22, #1
+    sub x21, x21, #1
+    VALIDATE
+    cbz x21, Lbudget
+    // FLAGS left the guest NZCV nibble in x12; VALIDATE only uses x9-x11.
+    // Avoid reloading/extracting it from CPU memory in the branch handler.
+    mov x10, x12
+    b Lbcond_flags
+.endm
+CMPBRANCH 32
+CMPBRANCH 64
+CMPBRANCH 32, subbranchimm, 0, 1
+CMPBRANCH 64, subbranchimm, 0, 1
+CMPBRANCH 32, subbranchreg, 1, 1
+CMPBRANCH 64, subbranchreg, 1, 1
+CMPBRANCH 32, cmpbranchreg, 1
+CMPBRANCH 64, cmpbranchreg, 1
 FAMILY reg, 32, 1
 FAMILY reg, 64, 1
 .macro CARRY width
@@ -306,6 +357,16 @@ HANDLER \name
 .endm
 SHIFTS 32
 SHIFTS 64
+.macro SHIFT_SUBBRANCH shift, width
+    SHIFTED subbranch\shift\width, subbranchreg\width, \shift, \width
+    SHIFTED cmpbranch\shift\width, cmpbranchreg\width, \shift, \width
+.endm
+SHIFT_SUBBRANCH lsl, 32
+SHIFT_SUBBRANCH lsl, 64
+SHIFT_SUBBRANCH lsr, 32
+SHIFT_SUBBRANCH lsr, 64
+SHIFT_SUBBRANCH asr, 32
+SHIFT_SUBBRANCH asr, 64
 
 .macro SELECT name, instruction, width
 HANDLER \name
@@ -379,6 +440,7 @@ HANDLER link
 HANDLER bcond
     ldr x10, [x19, #C_FLAGS]
     ubfx x10, x10, #28, #4
+Lbcond_flags:
     ldr x9, [x20, #O_AUX]
     lsr x9, x9, x10
     tbz w9, #0, Lbcond_fall

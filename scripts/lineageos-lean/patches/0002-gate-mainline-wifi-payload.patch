@@ -1,0 +1,23 @@
+diff --git a/mainline_common.mk b/mainline_common.mk
+index 1111111..2222222 100644
+--- a/mainline_common.mk
++++ b/mainline_common.mk
+@@ -129,7 +129,8 @@
+ # USB
+ PRODUCT_PACKAGES += \
+     android.hardware.usb.host.prebuilt.xml
+ 
++ifeq ($(TARGET_ENABLE_VIRT_WIFI),true)
+ # Wi-Fi
+ PRODUCT_PACKAGES += \
+     android.hardware.wifi.prebuilt.xml
+@@ -137,8 +138,9 @@
+ $(call soong_config_set,hostapd,platform_version,$(PLATFORM_VERSION))
+ $(call soong_config_set,wpa_supplicant,platform_version,$(PLATFORM_VERSION))
+ 
+ # Wi-Fi firmware
+ PRODUCT_PACKAGES += \
+     wireless-regdb
++endif
+ 
+ endif # !MAINLINE_COMMON_DISABLE_COMMON_PRODUCT_DEFS

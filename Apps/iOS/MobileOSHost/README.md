@@ -48,8 +48,11 @@ errors stay outside the console stream.
   launches from the Home Screen without Xcode environment variables. Instructions
   outside the assembly subset continue through the native C executor, not Swift
   fallback.
-- Two parallel vCPUs; 384 MiB guest RAM on physical devices and 1024 MiB in the
-  Simulator. Host memory use is higher than guest RAM alone.
+- Alpine uses two parallel vCPUs and 384 MiB guest RAM on physical devices
+  (1024 MiB in the Simulator). LineageOS uses four parallel vCPUs and 2048 MiB
+  guest RAM in the Simulator (1024 MiB on physical devices). The full Android
+  image showed severe memory pressure at 1024 MiB; the larger simulator default
+  is being validated for UI boot. Host memory use is higher than guest RAM alone.
 - Assembly service/bounded chaining and the older threaded experiments remain
   off by default. Profiling is also off by default.
 - The bundled rootfs uses musl `1.2.6-r10` and removes Phosh's decorative launch
@@ -59,9 +62,11 @@ errors stay outside the console stream.
 
 Use the **MobileOSHost** scheme in **Release**, select your development team and
 iPhone, then Run. The app's identifier remains `me.gmoran.pinecone`. No special
-launch environment is required. Set `PINECONE_ASSEMBLY_EXECUTOR=0` in the scheme
-only when comparing against the established C executor; remove stale prototype
-or chaining environment overrides when testing the current defaults.
+launch environment is required. Assembly is the default on both simulator and
+physical-device launches; set `PINECONE_ASSEMBLY_EXECUTOR=0` in the scheme to
+compare the C executor. Unsupported assembly blocks use the native C executor.
+Remove stale prototype or chaining environment overrides when testing the
+current defaults. This default does not establish a measured performance win.
 
 The standard guest image includes the current Pixman bridge and Phoc r8.
 SHM texture snapshots, direct foreign-buffer fills, and eligible small-composite
