@@ -11,7 +11,7 @@ case "${1:-}" in
     --ubsan) flags='-O1 -g -fsanitize=undefined -fno-sanitize-recover=all' ;;
     *) echo "usage: $0 [--ubsan]" >&2; exit 2 ;;
 esac
-for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/memory Assembly/service_chain; do
+for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/aot Assembly/memory Assembly/service_chain; do
     name=$(basename "$source")
     entry_hook=
     if test "$source" = Assembly/service_chain; then

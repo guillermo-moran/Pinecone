@@ -48,7 +48,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
     "$root/experiments/phase3/offsets.c" -o "$work/offsets"
 "$work/offsets" > "$work/offsets.h"
 cmp "$work/offsets.h" "$native/Assembly/offsets.h"
-for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/memory Assembly/service_chain; do
+for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/aot Assembly/memory Assembly/service_chain; do
     name=$(basename "$source")
     entry_hook=
     if test -n "$test_hooks" && test "$source" = Assembly/service_chain; then

@@ -522,11 +522,12 @@ struct ARM64VizCommand {
             ? machine.parallelVCPUCluster?.secondaryHotPCProfile ?? []
             : []
         let primaryHotPCs = (machine.vm.backend as? SoftwareARM64Backend)?
-            .nativeHotPCSnapshot(limit: 32)
+            .nativeHotPCSnapshot(limit: 256)
             .map {
                 NativeHotPCSummary(
                     pc: hex($0.pc),
                     samples: $0.samples,
+                    sampleError: $0.sampleError,
                     linkRegister: hex($0.linkRegister),
                     instructions: $0.instructions.map { hex(UInt64($0)) }
                 )
@@ -581,6 +582,7 @@ struct ARM64VizCommand {
             secondaryNativeSteps: secondaryExecutionTotals?.nativeSteps ?? 0,
             secondaryFallbackSteps: secondaryExecutionTotals?.fallbackSteps ?? 0,
             primaryAssemblyStatistics: primaryAssemblyStatistics,
+            processAOTStatistics: SoftwareARM64Backend.processAOTStatistics,
             secondaryAssemblyStatistics: secondaryAssemblyStatistics,
             entryPoint: hex(result.layout.kernelLoadAddress),
             fdtAddress: hex(result.layout.fdtLoadAddress),
@@ -2292,6 +2294,7 @@ private struct LinuxTraceSummary: Encodable {
     let secondaryNativeSteps: UInt64
     let secondaryFallbackSteps: UInt64
     let primaryAssemblyStatistics: [String: UInt64]
+    let processAOTStatistics: [String: UInt64]
     let secondaryAssemblyStatistics: [String: [String: UInt64]]
     let entryPoint: String
     let fdtAddress: String
@@ -2388,6 +2391,7 @@ private struct LinuxTraceSummary: Encodable {
 private struct NativeHotPCSummary: Encodable {
     let pc: String
     let samples: UInt64
+    let sampleError: UInt64
     let linkRegister: String
     let instructions: [String]
 }

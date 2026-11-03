@@ -3,6 +3,7 @@
 #include "ARM64VizGuestMemoryInternal.h"
 #if AVZ_ASSEMBLY_EXECUTOR_ENABLE
 #include "Assembly/gadget.h"
+#include "Assembly/aot_runtime.h"
 #if AG_SERVICE_CHAIN_ENABLE
 #include "ARM64VizAssemblyChain.h"
 #include "Assembly/boundary_profile.h"
@@ -12181,6 +12182,10 @@ typedef struct {
     uint64_t reset_epoch;
     AVZNativeBlockKey key;
     const AVZNativeSuperblock *superblock;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    const AGAOTBlock *const *aot_blocks;
+    struct AGAOTCounters *aot_counters;
+#endif
 } AVZNativeExecutionSpan;
 
 #if defined(__clang__) || defined(__GNUC__)
@@ -12272,6 +12277,9 @@ static AVZNativeBlockResult avz_native_run_threaded_decoded_block_cpu_mapped_spa
     AVZNativeInstruction callback_instruction;
     uint64_t index64 = 0;
     size_t boundary_cursor = 1;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    uint64_t aot_span_runs = 0, aot_span_steps = 0;
+#endif
 
 #define AVZ_THREADED_FINISH(next_status) \
     do { \
@@ -12642,6 +12650,41 @@ dispatch:
     }
 
 ordinary_instruction_dispatch:
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    /* Keep existing semantic accelerators first. Only exact copied-member
+     * prefixes without semantic candidates are enrolled below. Native exits
+     * retain every retired instruction and feed the original mapped dispatch,
+     * which alone accounts visits and validates dynamic successor PCs. */
+    if (instruction_pcs != NULL && block_offsets != NULL && execution_span != NULL &&
+        execution_span->aot_blocks != NULL && boundary_cursor > 0 &&
+        index64 == block_offsets[boundary_cursor - 1]) {
+        const AGAOTBlock *native = execution_span->aot_blocks[boundary_cursor - 1];
+        size_t member_end = block_offsets[boundary_cursor];
+        if (native != NULL && native->run_span != NULL && native->count <= member_end - index64) {
+            AGRun native_run;
+            if (!ag_aot_prepare_pure_span(&native_run, cpu_state, max_steps - result.steps,
+                    code_epoch_token, code_mutation_epoch,
+                    (const _Atomic uint64_t *)shared_code_epoch_token, shared_code_mutation_epoch,
+                    uses_fast_memory_context ? memory_context : NULL))
+                AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+            native->run_span(&native_run, cpu.pc);
+            aot_span_runs++;
+            aot_span_steps += native_run.result.steps;
+            result.steps += native_run.result.steps;
+            result.generic_dispatches += native_run.result.generic_dispatches;
+            index64 += native_run.result.steps;
+            if (native_run.result.status == AVZ_TP_STATUS_REVALIDATE)
+                AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+            if (native_run.result.status != AVZ_NATIVE_STATUS_OUTSIDE_BLOCK)
+                AVZ_THREADED_FINISH(native_run.result.status);
+            /* A well-formed compiled prefix always retires or exits. Never
+             * retry a zero-progress native result in this span. */
+            if (!native_run.result.steps)
+                AVZ_THREADED_FINISH(AVZ_NATIVE_STATUS_OUTSIDE_BLOCK);
+            goto dispatch;
+        }
+    }
+#endif
     instruction = &instructions[index64];
     /*
      * Keep dispatch in standard C. Label-address computed goto made this
@@ -14396,6 +14439,10 @@ op_generic:
     goto callback_step;
 
 done:
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    if (aot_span_runs)
+        ag_aot_note_span(execution_span->aot_counters, aot_span_runs, aot_span_steps);
+#endif
     return result;
 
 #undef AVZ_THREADED_FINISH
@@ -14838,7 +14885,39 @@ struct AVZNativeSuperblock {
     uint8_t code_page_count;
     uint8_t requires_cache_residency;
     uint8_t valid;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    const AGAOTBlock *aot_blocks[AVZ_NATIVE_SUPERBLOCK_MAX_BLOCKS];
+    struct AGAOTCounters *aot_counters;
+    uint8_t aot_prepared;
+#endif
 };
+
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+static void avz_native_prepare_superblock_aot(AVZNativeSuperblock *trace) {
+    if (trace->aot_prepared) return;
+    trace->aot_prepared = 1;
+    for (size_t slot = 0; slot < trace->count; slot++) {
+        size_t begin = trace->block_offsets[slot];
+        size_t count = trace->block_offsets[slot + 1] - begin;
+        if (!count || count > AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS) continue;
+        uint32_t words[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
+        for (size_t i = 0; i < count; i++) words[i] = trace->instructions[begin + i].raw;
+        const AGAOTBlock *native = ag_aot_find(words, count);
+        if (native && !native->run_span) native = NULL;
+        if (native != NULL) {
+            /* Do not replace an existing semantic acceleration opportunity,
+             * including one later in the would-be native prefix. */
+            for (size_t i = 0; i < native->count; i++)
+                if (trace->semantic_candidates[begin + i] != AVZ_NATIVE_SEMANTIC_NONE) {
+                    native = NULL;
+                    break;
+                }
+        }
+        trace->aot_blocks[slot] = native;
+        if (native && !trace->aot_counters) trace->aot_counters = ag_aot_owner_counters();
+    }
+}
+#endif
 
 static int avz_native_serial_token_matches(
     const uint64_t *token,
@@ -14931,102 +15010,87 @@ struct AVZNativeExecutionContext {
     ];
     uint8_t hot_pc_profiling_enabled;
     uint8_t superblock_context_valid;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    uint8_t aot_requested;
+#endif
     const AVZNativeDecodedBlock *last_block;
     uint64_t last_block_serial;
 };
 
 static uint64_t avz_native_mix_u64(uint64_t value);
 
-static inline void avz_native_sample_hot_pc(
-    AVZNativeExecutionContext *context,
-    uint64_t pc,
-    const AVZNativeInstruction *instructions,
-    size_t instruction_count
-) {
-    if (!context->hot_pc_profiling_enabled) {
-        return;
-    }
-    context->hot_pc_sample_clock++;
-    if ((context->hot_pc_sample_clock &
-         (AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL - 1)) != 0) {
-        return;
-    }
-
-    uint64_t hash = avz_native_mix_u64(pc >> 2);
-    uint64_t link_register = context->cpu.x[30];
+/* Snapshot only a due sample BEFORE invoking guest helpers. A callback may
+ * invalidate and reuse decoded entries or superblocks before execution returns;
+ * post-execution metadata reads cannot identify the code that actually ran. */
+typedef struct {
+    AVZNativeHotPC code;
+    uint64_t slot; /* One-based candidate block within a bounded span. */
+} AVZNativePendingHotPC;
+static uint64_t avz_native_hot_pc_next_slot(const AVZNativeExecutionContext *context) {
+    return AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL -
+        (context->hot_pc_sample_clock & (AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL - 1));
+}
+static void avz_native_hot_pc_snapshot(AVZNativePendingHotPC *pending,
+    uint64_t slot, uint64_t pc, uint64_t link_register,
+    const AVZNativeInstruction *instructions, size_t count) {
+    pending->slot = slot;
+    pending->code = (AVZNativeHotPC){.pc = pc, .link_register = link_register,
+        .link_register_votes = 1};
+    pending->code.instruction_count = (uint8_t)(count < AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS ?
+        count : AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS);
+    for (size_t i = 0; i < pending->code.instruction_count; i++)
+        pending->code.instructions[i] = instructions[i].raw;
+}
+static int avz_native_hot_pc_code_equal(const AVZNativeHotPC *entry,
+    const AVZNativeHotPC *code) {
+    return entry->instruction_count == code->instruction_count &&
+        !memcmp(entry->instructions, code->instructions,
+            code->instruction_count * sizeof(code->instructions[0]));
+}
+static void avz_native_hot_pc_assign(AVZNativeHotPC *entry,
+    const AVZNativeHotPC *code, uint64_t inherited) {
+    *entry = *code;
+    entry->samples = inherited + 1;
+    entry->sample_error = inherited;
+}
+static void avz_native_hot_pc_commit(AVZNativeExecutionContext *context,
+    const AVZNativePendingHotPC *pending, uint64_t retired_blocks) {
+    if (!context->hot_pc_profiling_enabled || !retired_blocks) return;
+    context->hot_pc_sample_clock += retired_blocks;
+    if (!pending->slot || pending->slot > retired_blocks) return;
+    const AVZNativeHotPC *code = &pending->code;
+    uint64_t hash = avz_native_mix_u64(code->pc >> 2);
     size_t base = (size_t)(hash & (AVZ_NATIVE_HOT_PC_SET_COUNT - 1)) *
         AVZ_NATIVE_HOT_PC_WAYS;
     size_t victim = base;
     for (size_t way = 0; way < AVZ_NATIVE_HOT_PC_WAYS; way++) {
         AVZNativeHotPC *entry = &context->hot_pcs[base + way];
-        if (entry->pc == pc) {
+        if (entry->samples && entry->pc == code->pc) {
+            if (!avz_native_hot_pc_code_equal(entry, code)) {
+                avz_native_hot_pc_assign(entry, code, 0);
+                return;
+            }
             entry->samples++;
-            if (entry->link_register == link_register) {
-                entry->link_register_votes++;
-            } else if (entry->link_register_votes != 0) {
-                entry->link_register_votes--;
-            } else {
-                entry->link_register = link_register;
+            if (entry->link_register == code->link_register) entry->link_register_votes++;
+            else if (entry->link_register_votes != 0) entry->link_register_votes--;
+            else {
+                entry->link_register = code->link_register;
                 entry->link_register_votes = 1;
             }
             return;
         }
         if (entry->samples == 0) {
-            entry->pc = pc;
-            entry->samples = 1;
-            entry->link_register = link_register;
-            entry->link_register_votes = 1;
-            entry->instruction_count = (uint8_t)(
-                instruction_count < 4 ? instruction_count : 4
-            );
-            entry->instruction0 = entry->instruction_count > 0
-                ? instructions[0].raw : 0;
-            entry->instruction1 = entry->instruction_count > 1
-                ? instructions[1].raw : 0;
-            entry->instruction2 = entry->instruction_count > 2
-                ? instructions[2].raw : 0;
-            entry->instruction3 = entry->instruction_count > 3
-                ? instructions[3].raw : 0;
+            avz_native_hot_pc_assign(entry, code, 0);
             return;
         }
-        if (entry->samples < context->hot_pcs[victim].samples) {
-            victim = base + way;
-        }
+        if (entry->samples < context->hot_pcs[victim].samples) victim = base + way;
     }
-
-    // Space-Saving retains frequent PCs under bounded collision pressure.
-    uint64_t inherited_samples = context->hot_pcs[victim].samples;
-    context->hot_pcs[victim].pc = pc;
-    context->hot_pcs[victim].samples = inherited_samples + 1;
-    context->hot_pcs[victim].link_register = link_register;
-    context->hot_pcs[victim].link_register_votes = 1;
-    context->hot_pcs[victim].instruction_count = (uint8_t)(
-        instruction_count < 4 ? instruction_count : 4
-    );
-    context->hot_pcs[victim].instruction0 =
-        context->hot_pcs[victim].instruction_count > 0
-            ? instructions[0].raw : 0;
-    context->hot_pcs[victim].instruction1 =
-        context->hot_pcs[victim].instruction_count > 1
-            ? instructions[1].raw : 0;
-    context->hot_pcs[victim].instruction2 =
-        context->hot_pcs[victim].instruction_count > 2
-            ? instructions[2].raw : 0;
-    context->hot_pcs[victim].instruction3 =
-        context->hot_pcs[victim].instruction_count > 3
-            ? instructions[3].raw : 0;
+    /* Export inherited collision error, never pretend it is code executions. */
+    avz_native_hot_pc_assign(&context->hot_pcs[victim], code,
+        context->hot_pcs[victim].samples);
 }
-
-/* Keep the disabled profiling guard before cross-TU metadata accessors.
- * Function arguments are otherwise evaluated before sample_hot_pc can return. */
-static inline void avz_native_sample_block_hot_pc(
-    AVZNativeExecutionContext *context, const AVZNativeDecodedBlock *block
-) {
-    if (!context->hot_pc_profiling_enabled) return;
-    avz_native_sample_hot_pc(context, avz_native_decoded_block_pc(block),
-        avz_native_decoded_block_instructions(block),
-        avz_native_decoded_block_instruction_count(block));
-}
+_Static_assert(AVZ_NATIVE_SUPERBLOCK_MAX_BLOCKS < AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL,
+    "a superblock can contain at most one pending periodic sample");
 
 static size_t avz_native_source_link_set_base(
     const AVZNativeDecodedBlock *block,
@@ -15330,7 +15394,14 @@ static void avz_native_record_direct_link(
 }
 
 AVZNativeExecutionContext *avz_native_execution_context_create(void) {
-    return calloc(1, sizeof(AVZNativeExecutionContext));
+    AVZNativeExecutionContext *context = calloc(1, sizeof(AVZNativeExecutionContext));
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    if (context) {
+        const char *requested = getenv("PINECONE_AOT");
+        context->aot_requested = requested && !strcmp(requested, "1");
+    }
+#endif
+    return context;
 }
 
 void avz_native_execution_context_set_assembly_executor(
@@ -16283,6 +16354,11 @@ static const AVZNativeSuperblock *avz_native_compose_superblock(
     AVZNativeSuperblock *composed =
         avz_native_select_superblock_slot(context, key_template);
     composed->valid = 0;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+    composed->aot_prepared = 0;
+    composed->aot_counters = NULL;
+    memset(composed->aot_blocks, 0, sizeof(composed->aot_blocks));
+#endif
     free(composed->instructions);
     composed->instructions = instructions;
     composed->instruction_pcs = instruction_pcs;
@@ -16820,7 +16896,17 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
         }
 #endif
 #endif
-        if (active_superblock != NULL && active_superblock->count >= 2) {
+        int profile_superblock = active_superblock != NULL && active_superblock->count >= 2;
+        AVZNativePendingHotPC pending_hot_pc;
+        pending_hot_pc.slot = 0;
+        if (context->hot_pc_profiling_enabled && !profile_superblock &&
+            avz_native_hot_pc_next_slot(context) == 1) {
+            avz_native_hot_pc_snapshot(&pending_hot_pc, 1,
+                avz_native_decoded_block_pc(block), context->cpu.x[30],
+                avz_native_decoded_block_instructions(block),
+                avz_native_decoded_block_instruction_count(block));
+        }
+        if (profile_superblock) {
             fused_block_limit = active_superblock->count;
             uint64_t block_budget = max_blocks - chain.blocks;
             if (fused_block_limit > block_budget) {
@@ -16833,12 +16919,30 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             if (fused_block_limit > checkpoint_block_budget) {
                 fused_block_limit = checkpoint_block_budget;
             }
+            if (context->hot_pc_profiling_enabled) {
+                uint64_t slot = avz_native_hot_pc_next_slot(context);
+                if (slot <= fused_block_limit) {
+                    uint16_t begin = active_superblock->block_offsets[slot - 1];
+                    avz_native_hot_pc_snapshot(&pending_hot_pc, slot,
+                        active_superblock->instruction_pcs[begin], context->cpu.x[30],
+                        &active_superblock->instructions[begin],
+                        active_superblock->block_offsets[slot] - begin);
+                }
+            }
             uint16_t fused_instruction_count =
                 active_superblock->block_offsets[fused_block_limit];
             execution_span.block = NULL;
             execution_span.superblock = active_superblock;
             execution_span.reset_epoch = active_superblock->reset_epoch;
             execution_span.key = active_superblock->key;
+#if AVZ_ASSEMBLY_EXECUTOR_ENABLE
+            if (assembly_enabled && context->aot_requested) {
+                AVZNativeSuperblock *trace = (AVZNativeSuperblock *)active_superblock;
+                avz_native_prepare_superblock_aot(trace);
+                execution_span.aot_blocks = trace->aot_blocks;
+                execution_span.aot_counters = trace->aot_counters;
+            }
+#endif
             block_result = avz_native_run_threaded_decoded_block_cpu_mapped_span(
                 active_superblock->instructions,
                 fused_instruction_count,
@@ -16871,27 +16975,13 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
             if (executed_blocks > fused_block_limit) {
                 executed_blocks = fused_block_limit;
             }
-            for (uint64_t slot = 0;
-                 context->hot_pc_profiling_enabled && slot < executed_blocks; slot++) {
-                avz_native_sample_hot_pc(
-                    context,
-                    active_superblock->instruction_pcs[
-                        active_superblock->block_offsets[slot]
-                    ],
-                    &active_superblock->instructions[
-                        active_superblock->block_offsets[slot]
-                    ],
-                    (size_t)(
-                        active_superblock->block_offsets[slot + 1] -
-                        active_superblock->block_offsets[slot]
-                    )
-                );
-            }
+            if (context->hot_pc_profiling_enabled)
+                avz_native_hot_pc_commit(context, &pending_hot_pc,
+                    block_result.steps ? executed_blocks : 0);
             chain.superblock_blocks += executed_blocks;
         }
 #if AVZ_ASSEMBLY_EXECUTOR_ENABLE
         else if (assembly.program) {
-            avz_native_sample_block_hot_pc(context, block);
 #if AG_SERVICE_CHAIN_ENABLE
             if (assembly_graph) {
                 uint64_t visit_budget = checkpoint_block_interval > checkpoint_blocks
@@ -16948,7 +17038,6 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
 #endif
 #if AVZ_THREADED_PROTOTYPE_ENABLE
         else if (threaded_eligible) {
-            avz_native_sample_block_hot_pc(context, block);
             block_result = avz_native_run_threaded_prototype_block(
                 context, cache, block, requested_steps,
                 uses_fast_memory_context ? memory_context : NULL);
@@ -16977,8 +17066,9 @@ static AVZNativeChainResult avz_native_execution_context_run_cached_chain_checkp
                 NULL, NULL, 0, cache, selected_code_epoch, selected_shared_epoch,
                 uses_fast_memory_context, &execution_span
             );
-            avz_native_sample_block_hot_pc(context, block);
         }
+        if (!profile_superblock && context->hot_pc_profiling_enabled)
+            avz_native_hot_pc_commit(context, &pending_hot_pc, block_result.steps ? 1 : 0);
         chain.steps += block_result.steps;
         int native_irq_due = assembly_chain_irq;
         if (uses_fast_memory_context &&

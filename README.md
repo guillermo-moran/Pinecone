@@ -465,6 +465,9 @@ Useful Xcode launch environment variables:
 | --- | --- |
 | `PINECONE_VERBOSE_BOOT=1` | Detailed kernel output and early console |
 | `PINECONE_ASSEMBLY_EXECUTOR=0` | Use the C executor instead of the iOS assembly default; the CLI stays C by default and accepts `=1` to enable assembly |
+| `PINECONE_AOT=1` | Opt into experimental signed native blocks alongside the assembly interpreter; see [hybrid AOT](docs/hybrid-aot.md) for coverage and measured limitations |
+| `PINECONE_AOT_CAPTURE=/absolute/path/blocks.jsonl` | Capture assembly block preparations for offline AOT generation; disable during timing runs |
+| `PINECONE_WASM_PROTOTYPE=1` | Open the isolated runtime ARM64-to-Wasm execution prototype; does not change either guest boot backend |
 | `PINECONE_GUEST_MEMORY_MB` | Guest RAM override, clamped to 128-1024 MiB |
 | `PINECONE_SIMULATOR_AUTORUN_COMMAND` | Replace Phosh autostart in Simulator; use `true` for shell-only work |
 | `PINECONE_SIMULATOR_DUMP_UART=1` | Capture guest UART diagnostics |
@@ -474,6 +477,10 @@ Useful Xcode launch environment variables:
 
 Remove stale threaded/chaining overrides before comparing current defaults.
 Profiling and competing VMs can materially change results.
+
+The [WebKit/Wasm prototype](docs/webkit-wasm-prototype.md) executes runtime-translated
+guest blocks through WebKit, with a native reference comparison and a separate
+iOS prototype screen. On macOS, run `swift run wasm-prototype --self-test`.
 
 Performance work follows [roadmap.md](roadmap.md): measure unlock, input-to-frame,
 and cold/warm application launch separately; preserve baseline configuration;

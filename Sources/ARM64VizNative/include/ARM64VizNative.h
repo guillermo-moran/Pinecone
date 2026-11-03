@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "ARM64VizVirGL.h"
+#include "ARM64VizAOT.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -343,10 +344,10 @@ typedef struct {
     uint64_t samples;
     uint64_t link_register;
     uint64_t link_register_votes;
-    uint32_t instruction0;
-    uint32_t instruction1;
-    uint32_t instruction2;
-    uint32_t instruction3;
+    /* Samples are block-visit samples, not retired-instruction counts.
+     * Space-Saving collision error: lower bound = samples - sample_error. */
+    uint64_t sample_error;
+    uint32_t instructions[AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS];
     uint8_t instruction_count;
 } AVZNativeHotPC;
 

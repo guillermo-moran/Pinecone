@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pinecone WebKit execution probe</title>
+<style>body{font:14px system-ui;color:#d7eee8;background:#10201c;padding:16px}</style>
+<p id="status">Starting WebAssembly worker…</p>
+<script>
+const worker = new Worker('worker.js');
+worker.onmessage = ({data}) => {
+  document.getElementById('status').textContent = data.kind === 'ready'
+    ? 'WebAssembly worker ready. Guest execution stays in this process.'
+    : data.kind === 'result' ? 'Translated guest execution finished.' : data.kind;
+  window.webkit.messageHandlers.pineconeWasm.postMessage(data);
+};
+worker.onerror = e => window.webkit.messageHandlers.pineconeWasm.postMessage({kind:'fatal', error:e.message});
+window.pineconeRun = job => worker.postMessage(job);
+</script>

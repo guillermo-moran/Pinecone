@@ -34,7 +34,7 @@ shasum -a 256 "$root/scripts/assembly-guard-benchmark.c" "$0" \
 clang -std=c11 -I "$native/include" "$root/experiments/phase3/offsets.c" -o "$work/offsets"
 "$work/offsets" > "$work/offsets.h"
 cmp "$work/offsets.h" "$native/Assembly/offsets.h"
-for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/memory; do
+for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/aot Assembly/memory; do
     name=$(basename "$source")
     clang -std=c11 -O3 -DAG_ENABLE=1 -DAVZ_ASSEMBLY_EXECUTOR_ENABLE=1 \
         -DAVZ_THREADED_PROTOTYPE_ENABLE=1 -I "$native/include" \
@@ -48,7 +48,7 @@ clang -std=c11 -O3 -Wall -Wextra -Werror -DAG_ENABLE=1 \
     -DAVZ_ASSEMBLY_EXECUTOR_ENABLE=1 -DAVZ_THREADED_PROTOTYPE_ENABLE=1 \
     -I "$native/include" "$root/scripts/assembly-guard-benchmark.c" \
     "$work/ARM64VizBlockCache.o" "$work/ARM64VizGuestMemory.o" \
-    "$work/ARM64VizThreadedPrototype.o" "$work/gadget.o" "$work/memory.o" \
+    "$work/ARM64VizThreadedPrototype.o" "$work/gadget.o" "$work/aot.o" "$work/memory.o" \
     "$work/reference.o" "$work/assembly.o" -pthread -lm -o "$work/assembly-guard-benchmark"
 xcrun llvm-objdump --disassemble --no-show-raw-insn "$work/gadget.o" > "$work/entries.txt"
 shasum -a 256 "$work/assembly-guard-benchmark" >&2

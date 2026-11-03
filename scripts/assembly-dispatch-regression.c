@@ -474,6 +474,150 @@ static void publication(void) {
     finish(&f);
     puts("PASS concurrent atomic reader, exact 256 slice publications and opt-out retention");
 }
+static void hot_profile_snapshot_lifetime(void) {
+    const uint32_t words[] = {0x91000400, 0x14000001};
+    Fixture f; init(&f, words, 2);
+    avz_native_execution_context_set_hot_pc_profiling(f.context, 1);
+    f.context->hot_pc_sample_clock = AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL - 1;
+    AVZNativeInstruction mutable_code[16] = {0};
+    for (size_t i = 0; i < 16; i++) mutable_code[i].raw = 0x91000400 + (uint32_t)i;
+    AVZNativePendingHotPC pending;
+    avz_native_hot_pc_snapshot(&pending, 1, BASE, 0x12345678, mutable_code, 16);
+    /* A helper may overwrite/reuse the entire decoded entry and change LR.
+     * Only the pre-execution value is a valid attribution for this sample. */
+    memset(mutable_code, 0, sizeof(mutable_code));
+    f.context->cpu.x[30] = 0xdeadbeef;
+    avz_native_hot_pc_commit(f.context, &pending, 0);
+    CHECK(f.context->hot_pc_sample_clock == AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL - 1);
+    AVZNativeHotPC exported;
+    CHECK(!avz_native_execution_context_copy_hot_pcs(f.context, &exported, 1));
+    avz_native_hot_pc_commit(f.context, &pending, 1);
+    CHECK(avz_native_execution_context_copy_hot_pcs(f.context, &exported, 1) == 1);
+    CHECK(exported.pc == BASE && exported.link_register == 0x12345678);
+    CHECK(exported.instruction_count == 16 && exported.instructions[0] == 0x91000400 &&
+        exported.instructions[15] == 0x9100040f);
+    /* A pending sample of a later superblock member must not be committed
+     * when a helper exits the span before that member executes. */
+    avz_native_execution_context_reset_hot_pc_profile(f.context);
+    f.context->hot_pc_sample_clock = AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL - 2;
+    avz_native_hot_pc_snapshot(&pending, 2, NEXT, 0x1234, mutable_code, 1);
+    avz_native_hot_pc_commit(f.context, &pending, 1);
+    CHECK(!avz_native_execution_context_copy_hot_pcs(f.context, &exported, 1));
+    finish(&f);
+    const uint32_t memory_code[] = {0xf9400140, 0x14000001}; /* ldr x0,[x10]; b next */
+    init(&f, memory_code, 2);
+    f.clear = 1;
+    f.context->cpu.x[30] = 0xabcde;
+    avz_native_execution_context_set_hot_pc_profiling(f.context, 1);
+    f.context->hot_pc_sample_clock = AVZ_NATIVE_HOT_PC_SAMPLE_INTERVAL - 1;
+    CHECK(run(&f, 16, 1, 1, 64).steps == 1 && f.calls == 1);
+    CHECK(avz_native_execution_context_copy_hot_pcs(f.context, &exported, 1) == 1);
+    CHECK(exported.pc == BASE && exported.link_register == 0xabcde &&
+        exported.instruction_count == 2 && exported.instructions[0] == memory_code[0] &&
+        exported.instructions[1] == memory_code[1]);
+    finish(&f);
+    puts("PASS hot profiler pre-execution metadata/LR snapshot, zero-step exclusion and partial-span attribution");
+}
+static unsigned span_callback_mutation;
+static int span_device_read(void *opaque, uint64_t address, uint8_t width, uint64_t *value) {
+    Fixture *f = opaque;
+    CHECK(address == DEVICE && width == 8);
+    f->calls++;
+    if (span_callback_mutation) {
+        unsigned mode = span_callback_mutation;
+        span_callback_mutation = 0;
+        if (mode == 2) avz_native_block_cache_clear(f->cache);
+        /* Replace the next copied member while the C-span callback is live.
+         * Either tracked SMC or a full cache reset must end the old span. */
+        CHECK(avz_native_fast_memory_write(f->memory, NEXT, 4, 0x91000821));
+    }
+    *value = 73;
+    return 1;
+}
+static void aot_span_callback_invalidation(void) {
+    const char *prior = getenv("PINECONE_AOT");
+    char *saved = prior ? strdup(prior) : NULL;
+    CHECK(!setenv("PINECONE_AOT", "1", 1));
+    for (unsigned mode = 1; mode <= 2; mode++) {
+        const uint32_t code[] = {0x91000400, 0xd503201f, 0xf9400143, branch(BASE + 12, NEXT)};
+        const uint32_t tail[] = {0x91000421, branch(NEXT + 4, BASE)};
+        Fixture f; init(&f, code, 4);
+        memcpy(avz_guest_memory_bytes(f.ram) + NEXT, tail, sizeof(tail));
+        avz_native_memory_fast_path_destroy(f.memory);
+        f.memory = avz_native_memory_fast_path_create(avz_guest_memory_bytes(f.ram), 0,
+            RAM_SIZE, f.cache, &f, translate, span_device_read, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL);
+        CHECK(f.memory && avz_native_memory_fast_path_set_guest_memory(f.memory, f.ram));
+        avz_native_memory_fast_path_set_instruction_translator(f.memory, translate);
+        avz_native_memory_fast_path_set_detailed_statistics_enabled(f.memory, 0);
+        span_callback_mutation = 0;
+        AVZNativeChainResult warm = run(&f, 120, 120, 120, 120);
+        CHECK(warm.steps == 120 && warm.superblock_dispatches);
+        AVZNativeBlockKey key = {.pc = BASE, .current_el = 1};
+        key = avz_native_canonical_block_key(&key);
+        /* Loads terminate resident decoded members. Train the exact three
+         * observed edges explicitly so the copied trace contains the NEXT
+         * instructions that the callback will replace, rather than ending at
+         * the unchanged branch member immediately after the load. */
+        const uint64_t pcs[] = {BASE, BASE + 12, NEXT};
+        const AVZNativeDecodedBlock *members[3];
+        uint64_t serials[3];
+        for (size_t slot = 0; slot < 3; slot++) {
+            AVZNativeBlockKey member_key = key;
+            member_key.pc = pcs[slot];
+            uint32_t status, raw;
+            members[slot] = avz_native_block_cache_get_or_decode(f.cache, &member_key,
+                avz_native_fast_fetch_instruction, f.memory, &status, &raw);
+            CHECK(members[slot] && status == AVZ_NATIVE_BLOCK_DECODE_OK);
+            serials[slot] = avz_native_decoded_block_serial(f.cache, members[slot]);
+        }
+        for (size_t slot = 0; slot < 3; slot++) {
+            size_t next = (slot + 1) % 3;
+            avz_native_decoded_block_record_successor(f.cache, members[slot], serials[slot],
+                members[next], serials[next]);
+        }
+        const AVZNativeSuperblock *trace = avz_native_compose_superblock(f.context,
+            f.cache, &key, members[0], serials[0]);
+        CHECK(trace);
+        CHECK(trace->count >= 3 && trace->instruction_pcs[trace->block_offsets[2]] == NEXT);
+        avz_native_prepare_superblock_aot((AVZNativeSuperblock *)trace);
+        CHECK(trace->aot_blocks[0] && trace->aot_blocks[0]->count == 2);
+        AVZNativeExecutionSpan span = {.cache = f.cache, .key = trace->key,
+            .superblock = trace, .reset_epoch = trace->reset_epoch,
+            .aot_blocks = trace->aot_blocks, .aot_counters = trace->aot_counters};
+        f.context->cpu = (AVZNativeCPU){.pc = BASE, .pstate = 5};
+        f.context->cpu.x[10] = DEVICE;
+        f.calls = 0;
+        span_callback_mutation = mode;
+        AVZNativeAOTStatistics before = avz_native_aot_statistics();
+        AVZNativeBlockResult r = avz_native_run_threaded_decoded_block_cpu_mapped_span(
+            trace->instructions, trace->instruction_count, trace->instruction_pcs[0],
+            64, &f.context->cpu, avz_native_fast_memory_read, avz_native_fast_memory_write,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, f.memory,
+            trace->semantic_hints, trace->semantic_candidates, trace->instruction_pcs,
+            trace->block_offsets, trace->count, f.cache, trace->code_mutation_epoch,
+            trace->shared_code_mutation_epoch, 1, &span);
+        AVZNativeAOTStatistics after = avz_native_aot_statistics();
+        if (r.status != AVZ_NATIVE_STATUS_OUTSIDE_BLOCK || r.steps != 3 || r.mapped_blocks != 1)
+            fprintf(stderr, "span callback mode=%u status=%u steps=%llu mapped=%llu pc=%llx calls=%llu\n",
+                mode, r.status, (unsigned long long)r.steps, (unsigned long long)r.mapped_blocks,
+                (unsigned long long)f.context->cpu.pc, (unsigned long long)f.calls);
+        CHECK(r.status == AVZ_NATIVE_STATUS_OUTSIDE_BLOCK && r.steps == 3 && r.mapped_blocks == 1);
+        CHECK(after.span_steps - before.span_steps == 2 && after.span_runs - before.span_runs == 1);
+        CHECK(f.calls == 1 && f.context->cpu.pc == BASE + 12);
+        CHECK(f.context->cpu.x[0] == 1 && f.context->cpu.x[1] == 0 && f.context->cpu.x[3] == 73);
+        CHECK(!trace->valid || trace->reset_epoch != avz_native_block_cache_reset_epoch(f.cache));
+        /* A fresh selection must see replacement instructions, never the
+         * stale +1 cached in the copied successor member. */
+        f.context->cpu.pc = NEXT;
+        CHECK(run(&f, 1, 1, 1, 1).steps == 1);
+        CHECK(f.context->cpu.x[1] == 2);
+        finish(&f);
+    }
+    if (saved) { CHECK(!setenv("PINECONE_AOT", saved, 1)); free(saved); }
+    else CHECK(!unsetenv("PINECONE_AOT"));
+    puts("PASS native C-span prefix stops after tracked-SMC/reset memory callback; fresh successor replacement executes");
+}
 int main(void) {
     CHECK(ag_available());
     const MemoryRunner runners[] = {ag_run_memory, ag_run_memory_coalesced};
@@ -483,6 +627,7 @@ int main(void) {
         helpers_and_deadlines(); publication();
         puts(i ? "PASS experimental coalesced dispatcher suite" : "PASS production uncoalesced dispatcher suite");
     }
-    guard_coalescing(); concurrent_alias_guard();
+    guard_coalescing(); concurrent_alias_guard(); hot_profile_snapshot_lifetime();
+    aot_span_callback_invalidation();
     return 0;
 }

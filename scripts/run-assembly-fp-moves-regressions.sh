@@ -12,7 +12,7 @@ esac
 test "$(uname -sm)" = 'Darwin arm64'
 fixture=${PINECONE_ASSEMBLY_FIXTURE:-assembly-fp-moves-regression}
 case "$fixture" in assembly-fp-moves-regression|assembly-simd-logic-regression) ;; *) exit 2 ;; esac
-for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/memory; do
+for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/aot Assembly/memory; do
     name=$(basename "$source")
     clang -std=c11 $flags -DAG_ENABLE=1 -DAVZ_ASSEMBLY_EXECUTOR_ENABLE=1 \
         -DAVZ_THREADED_PROTOTYPE_ENABLE=1 -I "$native/include" \

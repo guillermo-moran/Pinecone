@@ -3,13 +3,17 @@ import CoreGraphics
 import Foundation
 import SwiftUI
 import UIKit
+import WebKit
 
 struct ContentView: View {
     @EnvironmentObject private var model: MobileOSHostModel
 
     var body: some View {
         Group {
-            if model.selectedBootTarget == nil {
+            if ProcessInfo.processInfo.environment["PINECONE_WASM_PROTOTYPE"] == "1" ||
+                Bundle.main.bundleIdentifier?.hasSuffix(".wasm-prototype") == true {
+                WasmPrototypeView()
+            } else if model.selectedBootTarget == nil {
                 GuestBootPicker()
             } else {
                 LinuxConsoleView()
@@ -21,6 +25,7 @@ struct ContentView: View {
 
 private struct GuestBootPicker: View {
     @EnvironmentObject private var model: MobileOSHostModel
+    @State private var wasmPrototypePresented = false
 
     var body: some View {
         ZStack {
@@ -59,6 +64,8 @@ private struct GuestBootPicker: View {
                     Text("Android support is an early bring-up path. Use a virtio_arm64only build; phone OTA and recovery images are not compatible.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    Button("WebKit / Wasm execution prototype") { wasmPrototypePresented = true }
+                        .buttonStyle(.bordered)
                 }
                 .frame(maxWidth: 680, alignment: .leading)
                 .padding(32)
@@ -66,6 +73,7 @@ private struct GuestBootPicker: View {
             }
         }
         .foregroundStyle(.white)
+        .sheet(isPresented: $wasmPrototypePresented) { WasmPrototypeView() }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .task {
@@ -978,4 +986,98 @@ private enum TerminalTextRenderer {
 
         return lines.map { String($0) }.joined(separator: "\n")
     }
+}
+
+@MainActor
+private struct WasmPrototypeView: View {
+    @State private var host = WebKitWasmPrototype()
+    @State private var status = "Ready"
+    @State private var output = "Run a translated ARM64 arithmetic/load/store loop in WebKit, then compare its registers and RAM against the native interpreter."
+    @State private var running = false
+    @State private var started = false
+    @State private var summary = ""
+    @State private var executionTask: Task<Void, Never>?
+    @State private var runID: UUID?
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("ARM64 → WebAssembly → WebKit")
+                    .font(.headline)
+                Text("Isolated execution experiment. Android boot is not connected to this backend.")
+                    .font(.caption).foregroundStyle(.secondary)
+                WasmPrototypeWebSurface(host:host).frame(height:100)
+                    .clipShape(RoundedRectangle(cornerRadius:10))
+                HStack {
+                    Button("Run comparison", action: run).disabled(running)
+                    Button("Stop") {
+                        runID = nil; executionTask?.cancel(); host.cancel(); running = false; status = "Stopped"
+                    }
+                        .disabled(!running)
+                    Spacer()
+                    Text(status).font(.caption)
+                }.buttonStyle(.bordered)
+                if !summary.isEmpty { Text(summary).font(.system(.caption, design:.monospaced)) }
+                ScrollView {
+                    Text(output).font(.system(.caption, design:.monospaced))
+                        .frame(maxWidth:.infinity, alignment:.leading).textSelection(.enabled)
+                }
+            }
+            .padding().navigationTitle("WebKit / Wasm prototype")
+            .navigationBarTitleDisplayMode(.inline)
+            .task {
+                if !started && (ProcessInfo.processInfo.environment["PINECONE_WASM_PROTOTYPE"] == "1" ||
+                    Bundle.main.bundleIdentifier?.hasSuffix(".wasm-prototype") == true) {
+                    started = true; run()
+                }
+            }
+            .onDisappear { runID = nil; executionTask?.cancel(); host.cancel() }
+        }
+    }
+    private func run() {
+        executionTask?.cancel()
+        let id = UUID(); runID = id
+        running = true; status = "Executing…"; summary = ""
+        executionTask = Task { @MainActor in
+            do {
+                let program = try ARM64WasmProgram.sample()
+                let registers = WasmPrototypeReference.sampleRegisters()
+                let requested = ProcessInfo.processInfo.environment["PINECONE_WASM_PROTOTYPE_BLOCKS"].flatMap(UInt32.init)
+                let blocks: UInt32 = min(requested ?? 2_000_000, 100_000_000)
+                let reference = try await Task.detached {
+                    try WasmPrototypeReference.execute(program, blocks:blocks, registers:registers)
+                }.value
+                try Task.checkCancellation()
+                let report = try await host.run(program, blocks:blocks, registers:registers)
+                guard runID == id else { return }
+                struct Comparison: Encodable {
+                    let matched: Bool
+                    let reference: WasmPrototypeReferenceResult
+                    let webKit: WasmPrototypeReport
+                }
+                let result = Comparison(matched:reference.matches(report), reference:reference, webKit:report)
+                let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]
+                let data = try encoder.encode(result)
+                output = String(decoding:data, as:UTF8.self)
+                status = result.matched ? "Results match" : "Mismatch"
+                let times = report.executionMilliseconds.sorted()
+                let middle = times[times.count / 2]
+                summary = String(format:"Native reference: %.2f ms\nWebKit median: %.2f ms\n%llu guest instructions per round",
+                    reference.milliseconds, middle, UInt64(blocks) * UInt64(program.words.count))
+                if let documents = FileManager.default.urls(for:.documentDirectory, in:.userDomainMask).first {
+                    try data.write(to:documents.appendingPathComponent("wasm-prototype-report.json"), options:.atomic)
+                }
+            } catch {
+                guard runID == id else { return }
+                status = error is CancellationError ? "Stopped" : "Failed"; output = String(describing:error)
+            }
+            running = false
+        }
+    }
+}
+
+private struct WasmPrototypeWebSurface: UIViewRepresentable {
+    let host: WebKitWasmPrototype
+    func makeUIView(context: Context) -> WKWebView { host.webView }
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
 }

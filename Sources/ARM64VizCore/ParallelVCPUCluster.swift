@@ -286,9 +286,9 @@ public final class ParallelVCPUCluster: @unchecked Sendable {
                     let now = DispatchTime.now().uptimeNanoseconds
                     if profilingEnabled && now &- lastProfileTimestamp >= 1_000_000_000 {
                         lastProfileTimestamp = now
-                        profile = (vm.backend as? SoftwareARM64Backend)?.nativeHotPCSnapshot(limit: 32).map {
+                        profile = (vm.backend as? SoftwareARM64Backend)?.nativeHotPCSnapshot(limit: 256).map {
                             ["vcpu": String(id), "pc": "0x" + String($0.pc, radix: 16),
-                             "samples": String($0.samples), "lr": "0x" + String($0.linkRegister, radix: 16),
+                             "samples": String($0.samples), "sampleError": String($0.sampleError), "lr": "0x" + String($0.linkRegister, radix: 16),
                              "instructions": $0.instructions.map { String(format: "%08x", $0) }.joined(separator: " ")]
                         }
                     }

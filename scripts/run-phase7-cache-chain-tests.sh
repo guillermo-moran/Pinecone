@@ -19,7 +19,7 @@ printf 'compiler: %s\nSDK: %s\n' "$cc" "$sdk"
 "$cc" --version
 work=$(mktemp -d "${TMPDIR:-/tmp}/pinecone-cache-chain.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
-for source in ARM64VizNative ARM64VizGuestMemory Assembly/gadget Assembly/memory Assembly/service_chain; do
+for source in ARM64VizNative ARM64VizGuestMemory Assembly/gadget Assembly/aot Assembly/memory Assembly/service_chain; do
     name=$(basename "$source")
     "$cc" -isysroot "$sdk" -std=c11 $flags -DAG_ENABLE=1 -DAG_SERVICE_CHAIN_ENABLE=1 \
         -DAVZ_ASSEMBLY_EXECUTOR_ENABLE=1 -DAVZ_THREADED_PROTOTYPE_ENABLE=0 \

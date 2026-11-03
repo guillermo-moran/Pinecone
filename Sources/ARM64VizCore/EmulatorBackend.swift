@@ -141,6 +141,14 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
                 "boundedVisits": chains.bounded_visits, "boundedSteps": chains.bounded_steps]
     }
 
+    /// Process totals across all vCPUs/VMs; do not sum per-backend snapshots.
+    public static var processAOTStatistics: [String: UInt64] {
+        let c = avz_native_aot_statistics()
+        return ["compiledBlocks": c.compiled_blocks, "bindings": c.bindings,
+                "runs": c.runs, "steps": c.steps,
+                "spanRuns": c.span_runs, "spanSteps": c.span_steps]
+    }
+
     /// Configure before starting the vCPU; no executor default is changed.
     public func setNativeAssemblyChainingEnabled(_ enabled: Bool) {
         avz_native_execution_context_set_assembly_chaining(nativeExecutionContext, enabled ? 1 : 0)
@@ -363,7 +371,7 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
 
     public func nativeHotPCSnapshot(
         limit: Int = 8
-    ) -> [(pc: GuestAddress, samples: UInt64, linkRegister: GuestAddress, instructions: [UInt32])] {
+    ) -> [(pc: GuestAddress, samples: UInt64, sampleError: UInt64, linkRegister: GuestAddress, instructions: [UInt32])] {
         guard let nativeExecutionContext, limit > 0 else {
             return []
         }
@@ -379,16 +387,14 @@ public final class SoftwareARM64Backend: VirtualMachineBackend {
             )
         }
         return entries.prefix(count).map { entry in
-            let available = min(Int(entry.instruction_count), 4)
-            let words = [
-                entry.instruction0,
-                entry.instruction1,
-                entry.instruction2,
-                entry.instruction3
-            ]
+            let available = min(Int(entry.instruction_count), Int(AVZ_NATIVE_BLOCK_MAX_INSTRUCTIONS))
+            let words = withUnsafeBytes(of: entry.instructions) {
+                Array($0.bindMemory(to: UInt32.self).prefix(available))
+            }
             return (
                 pc: GuestAddress(entry.pc),
                 samples: entry.samples,
+                sampleError: entry.sample_error,
                 linkRegister: GuestAddress(entry.link_register),
                 instructions: Array(words.prefix(available))
             )

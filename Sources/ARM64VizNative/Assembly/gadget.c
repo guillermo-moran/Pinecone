@@ -1,4 +1,5 @@
 #include "gadget_internal.h"
+#include "aot_runtime.h"
 /* Canonical precompiled assembly executor, shared by VM and offline tests. */
 #include <stdlib.h>
 
@@ -75,6 +76,9 @@ AGProgram *ag_create(const uint32_t *words, size_t count, uint64_t base) {
     AGProgram *p = calloc(1, sizeof(*p) + (count + 1) * sizeof(AGOperation));
     if (!p) return NULL;
     p->targets = (AGTargetRange){base, count, p->operations};
+    p->aot = ag_aot_find(words, count);
+    if (p->aot) p->aot_counters = ag_aot_owner_counters();
+    ag_aot_capture(words, count, base);
     p->capability = 1;
     p->operations[count].handler = ag_outside;
     for (size_t i = 0; i < count; i++) {
@@ -361,7 +365,26 @@ static inline __attribute__((always_inline)) AVZNativeBlockResult run_memory(
         run.chain = NULL;
         if (run.memory.shared && run.memory.translation_epoch != run.memory.observed_translation)
             run.result.status = AVZ_TP_STATUS_REVALIDATE;
-        else ag_enter(&run);
+        else if (p->aot && cpu->pc == p->targets.base) {
+            p->aot->run(&run, p->targets.base);
+            ag_aot_note_run(p->aot_counters, run.result.steps);
+            /* A validated native prefix can end before the original block.
+             * Continue through the existing assembly entry under the same pin,
+             * original proofs, memory view and remaining instruction budget.
+             * ag_enter starts fresh retirement accounting; preserve the prefix.
+             * Revalidation/MAX/fault exits never resume. */
+            uint64_t delta = cpu->pc - p->targets.base;
+            if (run.result.status == AVZ_NATIVE_STATUS_OUTSIDE_BLOCK && run.budget &&
+                cpu->pc >= p->targets.base && !(delta & 3u) && delta / 4 < p->targets.count) {
+                uint64_t prefix_steps = run.result.steps;
+                uint64_t prefix_dispatches = run.result.generic_dispatches;
+                run.result = (AVZNativeBlockResult){0};
+                run.operation = lookup(p, cpu->pc);
+                ag_enter(&run);
+                run.result.steps += prefix_steps;
+                run.result.generic_dispatches += prefix_dispatches;
+            }
+        } else ag_enter(&run);
         if (--owned->active_runs == 0 && owned->retired) free(owned);
     }
     return run.result;

@@ -21,15 +21,15 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		0C274EA8835F23ACEEF5CC8B /* rootfs.ext4.sha256 */ = {isa = PBXFileReference; path = rootfs.ext4.sha256; sourceTree = "<group>"; };
+		0C274EA8835F23ACEEF5CC8B /* rootfs.ext4.sha256 */ = {isa = PBXFileReference; lastKnownFileType = text; path = rootfs.ext4.sha256; sourceTree = "<group>"; };
 		335C90A880A12B1504E53825 /* arm64viz */ = {isa = PBXFileReference; lastKnownFileType = folder; name = arm64viz; path = ../../..; sourceTree = SOURCE_ROOT; };
 		49A999D2DC1723A0A54AF0EC /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		6031B3F9DB3C409383BB7921 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		6FEDED036DC86C38AFD5E249 /* PineconeMetalGraphicsAccelerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PineconeMetalGraphicsAccelerator.swift; sourceTree = "<group>"; };
-		75E32F58ABBA3AA329470C7A /* initramfs-minimal-ttyinit.cpio */ = {isa = PBXFileReference; path = "initramfs-minimal-ttyinit.cpio"; sourceTree = "<group>"; };
-		8058E225562743A074060043 /* MobileOSHost.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = MobileOSHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		942BA3A83D3B012158298AD8 /* Image */ = {isa = PBXFileReference; path = Image; sourceTree = "<group>"; };
-		C0215C91AA40F568F9DCD279 /* rootfs.ext4 */ = {isa = PBXFileReference; path = rootfs.ext4; sourceTree = "<group>"; };
+		75E32F58ABBA3AA329470C7A /* initramfs-minimal-ttyinit.cpio */ = {isa = PBXFileReference; lastKnownFileType = file; path = "initramfs-minimal-ttyinit.cpio"; sourceTree = "<group>"; };
+		8058E225562743A074060043 /* Pinecone.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Pinecone.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		942BA3A83D3B012158298AD8 /* Image */ = {isa = PBXFileReference; lastKnownFileType = file; path = Image; sourceTree = "<group>"; };
+		C0215C91AA40F568F9DCD279 /* rootfs.ext4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = rootfs.ext4; sourceTree = "<group>"; };
 		D1FDA047CF469DEA2FDA55D6 /* MobileOSHostModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileOSHostModel.swift; sourceTree = "<group>"; };
 		D6CCF29983394EF8C729111D /* GuestDisplaySurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuestDisplaySurface.swift; sourceTree = "<group>"; };
 		E06DFAFCEC27CD260D45334C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -59,7 +59,7 @@
 		3C137314EDAE74A1B702BADF /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				8058E225562743A074060043 /* MobileOSHost.app */,
+				8058E225562743A074060043 /* Pinecone.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -121,7 +121,7 @@
 				AF1D82503BD19E36F56FAEB0 /* ARM64VizCore */,
 			);
 			productName = MobileOSHost;
-			productReference = 8058E225562743A074060043 /* MobileOSHost.app */;
+			productReference = 8058E225562743A074060043 /* Pinecone.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -134,7 +134,6 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					163F6493F52E63216200398F = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -223,7 +222,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 25M9266LN7;
 				INFOPLIST_FILE = Sources/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -302,7 +301,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 25M9266LN7;
 				INFOPLIST_FILE = Sources/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (

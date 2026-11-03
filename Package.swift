@@ -9,7 +9,8 @@ let package = Package(
     ],
     products: [
         .library(name: "ARM64VizCore", targets: ["ARM64VizCore"]),
-        .executable(name: "arm64viz", targets: ["arm64viz"])
+        .executable(name: "arm64viz", targets: ["arm64viz"]),
+        .executable(name: "wasm-prototype", targets: ["WasmPrototypeCommand"])
     ],
     targets: [
         .target(
@@ -26,6 +27,7 @@ let package = Package(
         .target(
             name: "ARM64VizCore",
             dependencies: ["ARM64VizNative"],
+            resources: [.copy("WasmPrototype")],
             swiftSettings: [
                 .unsafeFlags([
                     "-O",
@@ -45,6 +47,7 @@ let package = Package(
         .testTarget(
             name: "ARM64VizCoreTests",
             dependencies: ["ARM64VizCore", "ARM64VizNative"]
-        )
+        ),
+        .executableTarget(name: "WasmPrototypeCommand", dependencies: ["ARM64VizCore"])
     ]
 )

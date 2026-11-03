@@ -2,6 +2,73 @@ import XCTest
 @testable import ARM64VizCore
 
 final class NativeAssemblyIntegrationTests: XCTestCase {
+    func testAOTExecutesInsideComposedCSpansWithoutLosingComposition() throws {
+        guard ProcessInfo.processInfo.environment["PINECONE_AOT"] == "1" else {
+            throw XCTSkip("Run with PINECONE_AOT=1 to exercise native C-span prefixes")
+        }
+        let reference = try makeVM(assembly: false)
+        let candidate = try makeVM(assembly: true)
+        guard candidate.1.nativeAssemblyStatistics["enabled"] == 1 else {
+            throw XCTSkip("Hybrid AOT requires Darwin arm64")
+        }
+        // Warm the existing mixed ADD/B + MUL/B composed trace. The native
+        // prefix must run inside it, rather than replacing composition with
+        // repeated standalone assembly dispatches.
+        _ = try reference.0.run(maxSteps: 8192)
+        _ = try candidate.0.run(maxSteps: 8192)
+        let before = SoftwareARM64Backend.processAOTStatistics["spanSteps", default: 0]
+        let composedBefore = candidate.1.nativeSuperblockDispatches
+        for budget in [1, 3, 4096, 8192] {
+            let expected = try reference.0.run(maxSteps: budget)
+            let actual = try candidate.0.run(maxSteps: budget)
+            XCTAssertEqual(actual.steps, expected.steps)
+            XCTAssertEqual(actual.stopReason, expected.stopReason)
+            XCTAssertEqual(candidate.0.cpu.x, reference.0.cpu.x)
+            XCTAssertEqual(candidate.0.cpu.pc, reference.0.cpu.pc)
+            XCTAssertEqual(candidate.0.cpu.pstate, reference.0.cpu.pstate)
+        }
+        XCTAssertGreaterThan(SoftwareARM64Backend.processAOTStatistics["spanSteps", default: 0], before)
+        XCTAssertGreaterThan(candidate.1.nativeSuperblockDispatches, composedBefore)
+        for vm in [reference.0, candidate.0] {
+            XCTAssertTrue(try vm.writeGuestRAMFast(0x1000, width: .word, value: 0x91000800))
+        }
+        _ = try reference.0.run(maxSteps: 4096)
+        _ = try candidate.0.run(maxSteps: 4096)
+        XCTAssertEqual(candidate.0.cpu.x, reference.0.cpu.x)
+        XCTAssertEqual(candidate.0.cpu.pc, reference.0.cpu.pc)
+        XCTAssertEqual(candidate.1.swiftFallbackSingleInstructionSteps, 0)
+    }
+
+    func testAOTDispatchMatchesInterpreterAcrossBudgetsAndCodeMutation() throws {
+        guard ProcessInfo.processInfo.environment["PINECONE_AOT"] == "1" else {
+            throw XCTSkip("Run with PINECONE_AOT=1 to exercise the signed AOT corpus")
+        }
+        let reference = try makeVM(assembly: false)
+        let candidate = try makeVM(assembly: true)
+        guard candidate.1.nativeAssemblyStatistics["enabled"] == 1 else {
+            throw XCTSkip("Hybrid AOT requires the Darwin arm64 assembly executor")
+        }
+        let before = SoftwareARM64Backend.processAOTStatistics["steps", default: 0]
+        for budget in [1, 2, 17, 1000, 3] {
+            let expected = try reference.0.run(maxSteps: budget)
+            let actual = try candidate.0.run(maxSteps: budget)
+            XCTAssertEqual(actual.steps, expected.steps)
+            XCTAssertEqual(actual.stopReason, expected.stopReason)
+            XCTAssertEqual(candidate.0.cpu.x, reference.0.cpu.x)
+            XCTAssertEqual(candidate.0.cpu.pc, reference.0.cpu.pc)
+            XCTAssertEqual(candidate.0.cpu.pstate, reference.0.cpu.pstate)
+        }
+        XCTAssertGreaterThan(SoftwareARM64Backend.processAOTStatistics["steps", default: 0], before)
+        for vm in [reference.0, candidate.0] {
+            XCTAssertTrue(try vm.writeGuestRAMFast(0x1000, width: .word, value: 0x91000800))
+        }
+        _ = try reference.0.run(maxSteps: 1024)
+        _ = try candidate.0.run(maxSteps: 1024)
+        XCTAssertEqual(candidate.0.cpu.x, reference.0.cpu.x)
+        XCTAssertEqual(candidate.0.cpu.pc, reference.0.cpu.pc)
+        XCTAssertEqual(candidate.1.swiftFallbackSingleInstructionSteps, 0)
+    }
+
     func testPlatformDefaultAndEnvironmentOverride() {
         let backend = SoftwareARM64Backend()
         let override = ProcessInfo.processInfo.environment["PINECONE_ASSEMBLY_EXECUTOR"]

@@ -1,0 +1,200 @@
+# Hybrid assembly interpreter and native AOT prototype
+
+The custom engine can execute an exact-matching guest block as a native function
+compiled into the app. Everything else continues through the existing assembly
+interpreter and native C fallback. No runtime executable allocation, hypervisor,
+or QEMU is involved. AOT is experimental and disabled by default.
+
+## Enable and observe
+
+Set `PINECONE_ASSEMBLY_EXECUTOR=1 PINECONE_AOT=1` before creating a VM. On iOS the
+assembly executor is already the default, but AOT still requires its explicit
+flag. `PINECONE_AOT=0` disables binding for newly prepared programs. Configure
+flags before starting vCPUs; changing environment variables during execution is
+unsupported. Changing the flag does not unbind already prepared programs.
+
+`SoftwareARM64Backend.processAOTStatistics` reports compiled blocks, bindings,
+runs and retired instructions. The CLI includes these in `processAOTStatistics`.
+`spanRuns`/`spanSteps` identify native work inside composed C spans separately.
+These monotonic totals cover the entire process, including all secondary vCPUs;
+do not sum them across VM/backend snapshots. Runs include rejected guard checks;
+steps count only retired instructions. AOT work also remains included in the
+ordinary assembly execution accounting.
+
+## Supported native translation
+
+The offline generator emits native functions for arithmetic with NZCV flags,
+shifted/extended arithmetic, logical register/immediate operations, conditional
+selects, ADR/ADRP, bitfield/extract, move-wide instructions, NOP, and terminal
+direct/conditional branches outside the translated prefix. ARM64 ADDS/SUBS/ANDS
+use inline native instructions plus MRS NZCV; other hosts have a portable C
+fallback. Budget and retirement counts stay local until native exit. The
+regular compiler produces signed host machine code.
+There is no instruction-kind switch or assembly-handler dispatch inside a
+generated block. It is native AOT, rather than serialized interpreter templates.
+
+The longest exact supported prefix can run natively before an assembly memory
+tail. The tail resumes under the same program pin, original proofs, memory view
+and remaining budget. Revalidation, faults and exhausted budgets never resume.
+Native prefixes also execute inside the existing composed C superblocks. Static
+descriptors, including misses, are cached per copied member and reset with that
+trace. Native code updates the CPU/PC and exact retirement count; the original
+mapped dispatcher validates successors, counts member visits, and executes C
+tails. Existing semantic accelerators retain priority. The C-span path can use
+bitfield/extract and extended arithmetic even when the standalone assembly
+executor does not support those handlers. Privileged operations, indirect/
+intra-prefix branches and unknown encodings remain interpreted.
+Instruction-word comparison binds compiled functions independently of guest
+virtual addresses. A fingerprint accelerates lookup but is never accepted as
+proof of equality. Different code bytes cannot reuse a binding. Current
+code-page/context generations remain runtime guards, rather than persisted
+proofs. Generated code relocates PC-relative branches using the current base.
+
+The standalone assembly entry validates local/shared guards plus memory epochs
+at entry and every instruction retirement. A separate pure-register `run_span`
+entry validates them at entry and every exit, including partial-budget exits.
+This matches or tightens the existing copied C member's validity window: no
+memory access, helper, privileged instruction or native loop runs inside the
+prefix. An independent opcode whitelist keeps future translations from gaining
+this eligibility automatically. The original callback and next-member checks
+remain active. Budget exhaustion and revalidation precedence are preserved.
+Existing dispatcher checkpoints retain responsibility for interrupt delivery
+and scheduling. There is no AOT chaining;
+resuming inside a partially executed block uses the assembly interpreter.
+Process counters use aligned origin-thread shards to reduce multi-vCPU cache
+line contention. Updates remain atomic for safe program migration and shared
+origins; overflow origins share a saturating final shard.
+
+The checked-in corpus has 251 native blocks/prefixes selected from sampled
+execution of the tested Android image, plus regression fixtures. Selection uses
+750-million-instruction kernel and two-billion-instruction full-resource runs on
+one vCPU. The latter reached Android userspace without errors using COW copies
+of the system and fresh userdata disks. Both runs used the custom interpreter.
+These bounded runs are not launcher/full-boot benchmarks.
+
+## Capture and regenerate
+
+Set `PINECONE_AOT_CAPTURE=/absolute/writable/path/blocks.jsonl` when creating a VM
+to append block-discovery records during assembly preparation. This diagnostic
+does file I/O and must be disabled during timing comparisons. Multiple vCPUs
+append complete records; write failures do not stop the guest. Corrupted/partial
+records are reported by the generator and must be removed before regeneration.
+This capture measures preparations rather than execution frequency. For useful
+candidate selection, enable `PINECONE_HOT_PC_PROFILE=1` in CLI traces and merge
+their JSON reports:
+
+```sh
+python3 scripts/select-aot-profile.py kernel-report.json userspace-report.json \
+  --output .build/aot-execution-candidates.json
+```
+
+The profiler stores complete blocks, snapshots selected code/entry LR before
+callbacks can clear the cache, and excludes zero-retirement attempts. Periodic
+sampling can alias loops. Space-Saving sample-error bounds are subtracted for
+conservative weights; these weights are not exact instruction counts. A mapped
+member rejected before retirement can still count as entered when earlier
+members made progress. Keep
+chaining off during selection: graph visits currently have outer-entry
+attribution. Superblock members share the span's entry LR.
+
+Reproduce the checked-in native functions:
+
+```sh
+python3 scripts/generate-aot.py scripts/aot-android-boot-blocks.json \
+  Sources/ARM64VizNative/Assembly/aot_generated.inc --max-blocks 512
+```
+
+Select a new experimental corpus from a capture:
+
+```sh
+python3 scripts/generate-aot.py .build/aot-execution-candidates.json \
+  Sources/ARM64VizNative/Assembly/aot_generated.inc \
+  --prefixes --max-blocks 512 \
+  --seed scripts/aot-smoke-blocks.json \
+  --manifest scripts/aot-android-boot-blocks.json
+```
+
+Rebuild/sign the app after regeneration. Downloaded instruction data cannot add
+new native AOT functions to an already signed app. App updates can add functions;
+unknown and modified guest code remain supported by the interpreter.
+
+## Validation
+
+```sh
+python3 scripts/tests/test_generate_aot.py
+sh scripts/run-aot-regressions.sh
+sh scripts/run-aot-regressions.sh --ubsan
+python3 scripts/tests/test_generate_aot.py \
+  --write-corpus .build/aot-differential-corpus.json
+PINECONE_AOT_CORPUS="$PWD/.build/aot-differential-corpus.json" \
+  sh scripts/run-aot-regressions.sh --ubsan
+PINECONE_ASSEMBLY_EXECUTOR=1 PINECONE_AOT=1 swift test --disable-sandbox
+```
+
+Native differential tests compare against the authoritative decoded C executor,
+including randomized state, 32-bit truncation, SP/ZR, instruction budgets,
+relocated addresses, all four explicit guard slots, independent memory epochs,
+code mismatch and partial-block fallback. The generated matrix covers every
+accepted move-wide width/opcode/halfword and arithmetic immediate width/opcode/
+shift, plus forward/backward conditional branches. VM integration checks the
+production dispatcher, mixed AOT/interpreter execution and guest code mutation.
+
+Further acceleration needs larger compiled regions and guarded memory support
+so short native prefixes do not repeatedly cross the C/native boundary. The
+current implementation establishes the handoff, execution profiling and offline
+build pipeline; it does not resolve startup ANRs or demonstrate a faster full
+Android boot.
+
+Expanded validation passed 783 Swift tests (two expected skips), 308,736 selected
+corpus comparisons and 5,414,400 dual-entry instruction-matrix comparisons under
+UBSan for each of native and portable flag implementations. The production corpus count
+includes 79,616 direct-native comparisons outside standalone assembly eligibility;
+the earlier single-entry matrix includes 778,752 such comparisons. Direct function tests alone do not
+demonstrate production coverage; separate integration tests verify native work
+inside composed C spans while retaining composition, exact budgets, and SMC.
+Tests include mixed-prefix RAM access, faults and callback retirement
+while pinned. AddressSanitizer on this host stalled in its own allocator/shadow
+initialization before main; it was stopped and is not a completed check.
+
+A historical four-run, single-vCPU, 25-million-instruction kernel prefix ended at the same
+PC (`0x4024f950`) without errors in both modes. Each AOT-enabled process executed
+only **two** instructions through AOT. Elapsed times varied from 433 to 1,023 ms
+across the runs; that provides no evidence of an AOT speedup. Tiny dispatch
+microbenchmarks likewise give mixed results. Broader coverage and matched
+longer workloads are required before considering a default change. These were
+measurements of the original 128-function prototype, before expanded execution
+profiling, native flags, local accounting and prefix continuation.
+
+## Expanded full-resource measurement
+
+Final ABBA runs used one vCPU, 2 GiB RAM, two billion instructions,
+`--timer-scale 1`, the tested boot/vendor images and fresh APFS COW copies of the
+system/fresh userdata disks for every run. Profiling, capture, assembly chaining
+and bounded chaining were off. All four runs reached EL0/userspace without an
+emulator error; they were stopped by the instruction budget, not at a launcher
+milestone. Guest boot warnings remain in UART output. Different userspace PCs
+and trace counts also mean this is a bounded workload comparison rather than
+proof of identical full-boot work.
+
+| Mode | Elapsed times | Native AOT instructions |
+| --- | --- | --- |
+| Assembly/C baseline | 31.978 s, 31.621 s | 0 |
+| Hybrid AOT | 33.893 s, 32.934 s | 290,099,711; 280,493,723 |
+
+Mean elapsed time increased from 31.7995 s to 33.4135 s, about **5.1% slower**.
+Coverage is materially greater than the original two-instruction result, but
+this implementation is not a demonstrated Android acceleration and remains
+opt-in. Around 144–146 million native calls inside C spans retired only about
+277–286 million instructions; amortizing those frequent boundaries is the next
+performance target. Final setup already avoids a full `AGRun` clear and unused
+RAM/TLB metadata, and publishes span totals with two atomic updates per span.
+
+Raw reports are `.build/aot-final-2b-{0-0,1-1,2-1,3-0}.json` and the compact
+summary is `.build/aot-final-2b-benchmark.json` (local ignored evidence). All
+temporary benchmark/profiling disk clones were removed. The original images,
+simulator installation and live guest were not modified.
+
+Final validation also includes the Release iOS Simulator app build, physical
+ARM64 compilation of the native AOT/interpreter sources, and adversarial mapped
+span callback tests under UBSan. No physical-device AOT boot or installation
+was performed.

@@ -32,6 +32,8 @@ typedef struct {
 } AGTargetRange;
 struct AGProgram {
     AGTargetRange targets;
+    const struct AGAOTBlock *aot;
+    struct AGAOTCounters *aot_counters;
     uint32_t active_runs, retired, capability;
     AGOperation operations[];
 };

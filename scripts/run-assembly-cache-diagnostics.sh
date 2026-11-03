@@ -11,7 +11,7 @@ case "${1:-}" in
     *) echo "usage: $0 [--ubsan]" >&2; exit 2 ;;
 esac
 test "$(uname -sm)" = 'Darwin arm64'
-for source in ARM64VizNative ARM64VizGuestMemory Assembly/gadget Assembly/memory; do
+for source in ARM64VizNative ARM64VizGuestMemory Assembly/gadget Assembly/aot Assembly/memory; do
     name=$(basename "$source")
     clang -std=c11 $flags -DAG_ENABLE=1 -DAVZ_ASSEMBLY_EXECUTOR_ENABLE=1 \
         -DAVZ_THREADED_PROTOTYPE_ENABLE=0 -I "$native/include" \

@@ -35,6 +35,8 @@ for unit in gadget chain chain_tests memory memory_tests harness; do
     clang -std=c11 $flags -Wall -Wextra -Werror -DAG_ENABLE=1 \
         -I "$native/include" -I "$work" -c "$src/$unit.c" -o "$work/$unit.o"
 done
+clang -std=c11 $flags -Wall -Wextra -Werror -DAG_ENABLE=1 \
+    -I "$native/include" -c "$native/Assembly/aot.c" -o "$work/aot.o"
 clang -arch arm64 -g -I "$work" -c "$src/gadget_arm64.S" -o "$work/gadget_arm64.o"
 clang -arch arm64 -g -I "$work" -c "$src/abi_probe.S" -o "$work/abi_probe.o"
 xcrun llvm-objdump --disassemble --reloc --no-show-raw-insn "$work/gadget_arm64.o" > "$work/dispatch.txt"
@@ -49,7 +51,7 @@ grep -Eq '[[:space:]]br[[:space:]]+x9' "$work/dispatch.txt"
 xcrun dwarfdump --eh-frame "$work/gadget_arm64.o" > "$work/unwind.txt"
 grep -q FDE "$work/unwind.txt"
 link() {
-    clang $flags "$work/harness.o" "$work/gadget.o" "$work/chain.o" "$work/chain_tests.o" "$work/memory.o" "$work/memory_tests.o" "$work/gadget_arm64.o" "$work/abi_probe.o" \
+    clang $flags "$work/harness.o" "$work/gadget.o" "$work/aot.o" "$work/chain.o" "$work/chain_tests.o" "$work/memory.o" "$work/memory_tests.o" "$work/gadget_arm64.o" "$work/abi_probe.o" \
         "$work/ARM64VizNative.o" "$work/ARM64VizBlockCache.o" "$work/ARM64VizGuestMemory.o" \
         "$work/ARM64VizThreadedPrototype.o" -pthread -lm -o "$work/test"
     entry_address=$(nm -n "$work/test" | awk '$NF == "_ag_enter" { print $1 }')

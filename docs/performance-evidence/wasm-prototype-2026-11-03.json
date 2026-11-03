@@ -1,0 +1,47 @@
+{
+  "date": "2026-11-03",
+  "workload": "Runtime-translated ARM64 ADD/STR/LDR/EOR/B loop",
+  "guestInstructionsPerRound": 500000000,
+  "memoryModel": "Flat 64 KiB RAM; no MMU in either timing path",
+  "iosSimulator": {
+    "matched": true,
+    "nativeReferenceMilliseconds": 4231.038708,
+    "webKitMilliseconds": [
+      1048,
+      1065,
+      1043
+    ],
+    "capabilities": {
+      "crossOriginIsolated": false,
+      "sharedMemory": false,
+      "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+      "wasm": true
+    }
+  },
+  "macOS": {
+    "matched": true,
+    "nativeReferenceMilliseconds": 3726.177417,
+    "webKitMilliseconds": [
+      998.0000000000001,
+      1004.0000000000001,
+      992.9999999999998
+    ]
+  },
+  "jitEvidence": {
+    "platform": "iOS Simulator",
+    "sample": ".build/wasm-ios-webcontent-30182.sample.txt",
+    "symbols": [
+      "JSC::Wasm::BBQPlan::work()",
+      "JSC::Wasm::BBQJITImpl::BBQJIT::addI64Add(...)",
+      "JSC::Wasm::OMGPlan::work()",
+      "JSC::Wasm::OMGIRGenerator::addBranch(...)"
+    ],
+    "workerObservedExecutingGeneratedAddresses": true
+  },
+  "limits": [
+    "Microbenchmark; not an Android boot measurement",
+    "Physical iPhone not tested",
+    "Single worker; no shared-memory vCPUs",
+    "No MMU, interrupts, devices or graphics backend"
+  ]
+}

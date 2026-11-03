@@ -13,7 +13,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 clang -std=c11 -I "$native/include" "$root/experiments/phase3/offsets.c" -o "$work/offsets"
 "$work/offsets" > "$work/offsets.h"
 cmp "$work/offsets.h" "$native/Assembly/offsets.h"
-for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/memory; do
+for source in ARM64VizBlockCache ARM64VizGuestMemory ARM64VizThreadedPrototype Assembly/gadget Assembly/aot Assembly/memory; do
     name=$(basename "$source")
     clang -std=c11 $flags -DAG_ENABLE=1 -DAVZ_ASSEMBLY_EXECUTOR_ENABLE=1 \
         -DAVZ_THREADED_PROTOTYPE_ENABLE=1 -I "$native/include" \
